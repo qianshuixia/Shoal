@@ -181,6 +181,7 @@ export interface Snapshot {
   settings: Settings;
   git: Record<string, GitInfo | null>; // by project id; null = not a git repo. Derived, not stored in state.json
   quota: Partial<Record<AgentKind, QuotaInfo>>; // from <stateDir>/quota.json
+  telemetry?: TelemetrySummary; // derived live token / cache / speed telemetry from usage.ts
 }
 
 // Nine muted colors that stay distinguishable on a dark background.
@@ -248,6 +249,21 @@ export interface UsageCounts {
 }
 
 export const usageTotal = (c: UsageCounts) => c.input + c.output + c.cacheRead + c.cacheWrite;
+export const usageCacheHitRate = (c: UsageCounts): number | null => {
+  const inputSide = c.input + c.cacheRead + c.cacheWrite;
+  return inputSide > 0 ? c.cacheRead / inputSide : null;
+};
+
+// Live per-task / today telemetry derived from CLI transcripts.
+export interface TaskMetrics extends UsageCounts {
+  tps: number | null; // recent output generation speed (tokens/s)
+  updatedAt: number; // ms epoch of last recorded model response
+}
+
+export interface TelemetrySummary {
+  byTask: Record<string, TaskMetrics>;
+  today: UsageCounts & { tps: number | null; updatedAt: number };
+}
 
 export interface UsageRow extends UsageCounts {
   key: string; // vendor / model / agent / task id / project id; '' = unknown
@@ -416,6 +432,7 @@ export type ServerMsg =
   | { t: 'settings'; settings: Settings }
   | { t: 'git'; projectId: string; git: GitInfo | null } // sent only when the value changed
   | { t: 'quota'; agent: AgentKind; quota: QuotaInfo } // sent only when the windows changed
+  | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per session right after snapshot
   | { t: 'out'; id: string; d: string };

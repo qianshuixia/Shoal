@@ -63,6 +63,13 @@ test.describe('Token 统计与缩放', () => {
     expect(r.byModel.find((m) => m.label === 'gpt-test')).toMatchObject({ vendor: 'OpenAI', input: 10, output: 5, requests: 1 });
     expect(r.byTask.find((t) => t.key === task.id)).toMatchObject({ label: '统计任务甲', project: project.name, deleted: false, requests: 2 });
 
+    // Live telemetry pills in topbar & pane header reflect tokens and cache hit rate without switching tabs.
+    await expect(page.getByTestId('top-telemetry')).toContainText('1.19K');
+    await expect(page.getByTestId('top-telemetry')).toContainText('86%');
+    await expect(page.getByTestId('pane-metrics')).toContainText('1.19K');
+    await expect(page.getByTestId('pane-metrics')).toContainText('86%');
+    await page.screenshot({ path: path.join(OUT, 'telemetry-pills.png') });
+
     // Stats tab: the workbench is hidden, not unmounted.
     await page.getByTestId('tab-stats').click();
     await expect(page.getByTestId('stats-view')).toBeVisible();

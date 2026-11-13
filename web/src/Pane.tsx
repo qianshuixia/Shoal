@@ -1,12 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
-import type { Card, Project, QuotaInfo, SessionInfo, Task } from '../../shared/protocol.ts';
+import type { Card, Project, QuotaInfo, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
 import { AGENT_LABEL, canResume } from '../../shared/protocol.ts';
 import { attach, fitEntry, focusOnly } from './terms.ts';
-import { EditableTitle, PencilIcon, StatusTag } from './bits.tsx';
+import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
-import { liveWindows, QUOTA_WARN, quotaTitle } from './quota.ts';
+import { liveWindows } from './quota.ts';
 
 interface Props {
   index: number;
@@ -18,6 +18,7 @@ interface Props {
   dual: boolean;
   now: number;
   quota?: QuotaInfo;
+  metrics?: TaskMetrics;
   onFocus(): void;
   onRename(title: string): void;
   onResume(fresh: boolean): void;
@@ -178,7 +179,7 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const reviewToggleRef = useRef<HTMLButtonElement>(null);
   const [editing, setEditing] = useState(false);
@@ -254,15 +255,10 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
               <PencilIcon />
             </button>
           )}
-          <span className="pane-agent">{paneAgent ?? '?'}</span>
+          <span className="pane-spacer" aria-hidden="true" />
+          {metrics && <TelemetryPill counts={metrics} tps={metrics.tps} label="本任务累计用量" compact testId="pane-metrics" />}
           {paneAgent && quota && paneWindows.length > 0 && (
-            <span className="quota pane-quota" data-testid="pane-quota" data-agent={paneAgent} title={quotaTitle(paneAgent, quota, paneWindows, now)}>
-              {paneWindows.map((w) => (
-                <span key={w.label} className={`quota-win ${w.usedPercent >= QUOTA_WARN ? 'warn' : ''} ${w.usedPercent >= 100 ? 'full' : ''}`} data-testid="pane-quota-window" data-label={w.label}>
-                  {w.label} {Math.round(w.usedPercent)}%
-                </span>
-              ))}
-            </span>
+            <QuotaPill agent={paneAgent} quota={quota} windows={paneWindows} now={now} compact />
           )}
           {session && !(task?.phase === 'approved' && session.status === 'needs_you') && <StatusTag status={session.status} since={session.statusSince} now={now} />}
           {reviewing && (

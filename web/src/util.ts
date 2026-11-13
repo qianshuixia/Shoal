@@ -1,4 +1,5 @@
-import type { SessionStatus } from '../../shared/protocol.ts';
+import type { SessionStatus, UsageCounts } from '../../shared/protocol.ts';
+import { usageCacheHitRate } from '../../shared/protocol.ts';
 
 export const STATUS_LABEL: Record<SessionStatus, string> = {
   starting: '启动中',
@@ -7,6 +8,16 @@ export const STATUS_LABEL: Record<SessionStatus, string> = {
   needs_you: '需要你',
   exited: '已退出',
 };
+
+export function fmtTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const [d, s] = n < 1e6 ? [1e3, 'K'] : n < 1e9 ? [1e6, 'M'] : [1e9, 'B'];
+  const v = n / d;
+  return (v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0)) + s;
+}
+
+export const hitRate = usageCacheHitRate;
+export const fmtPct = (v: number | null) => (v === null ? '—' : `${(v * 100).toFixed(v > 0 && v < 0.1 ? 1 : 0)}%`);
 
 export function waitText(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));

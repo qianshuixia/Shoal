@@ -156,10 +156,24 @@ export function createApp(cfg: AppConfig) {
     if (info) broadcast({ t: 'quota', agent: session.agent, quota: info });
   }
 
-  const snapshot = (): Snapshot => ({
-    projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
-    git: Object.fromEntries(gitMap), quota: quota.all(),
-  });
+  const snapshot = (): Snapshot => {
+    const telemetry = cfg.usage.telemetry();
+    lastTelemetryJson = JSON.stringify(telemetry);
+    return {
+      projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
+      git: Object.fromEntries(gitMap), quota: quota.all(), telemetry,
+    };
+  };
+
+  let lastTelemetryJson = '';
+  function refreshTelemetry(force = false) {
+    if (!clients.size) return;
+    const telemetry = cfg.usage.telemetry(force);
+    const next = JSON.stringify(telemetry);
+    if (next === lastTelemetryJson) return;
+    lastTelemetryJson = next;
+    broadcast({ t: 'telemetry', telemetry });
+  }
 
   const sizeOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
     !!saved && JSON.stringify({ ...saved, cols: next.cols, rows: next.rows }) === JSON.stringify(next);
@@ -726,6 +740,7 @@ export function createApp(cfg: AppConfig) {
       autoRename(b as HookBody);
       updateLastPrompt(b as HookBody);
       if (b.event === 'Stop') onStop(b as HookBody);
+      if (b.event === 'Stop' || b.event === 'PostInvocation') refreshTelemetry(true);
     }
     send(res, 204);
   }
@@ -769,10 +784,14 @@ export function createApp(cfg: AppConfig) {
   server.keepAliveTimeout = 60_000;
   server.headersTimeout = 65_000;
 
-  // Poll git only while somebody is looking; unref so the timer never keeps the process alive.
+  // Poll git and live usage only while somebody is looking; unref so timers never keep the process alive.
   const gitTimer = setInterval(() => { if (clients.size) void refreshAllGit(); }, 10_000);
   gitTimer.unref();
-  server.on('close', () => { clearInterval(archiveTimer); clearInterval(gitTimer); });
+  const usageTimer = setInterval(() => {
+    if (clients.size && sessions.list().some(s => s.status === 'working')) refreshTelemetry();
+  }, 4_000);
+  usageTimer.unref();
+  server.on('close', () => { clearInterval(archiveTimer); clearInterval(gitTimer); clearInterval(usageTimer); });
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     const pathname = new URL(req.url ?? '/', 'http://x').pathname;

@@ -3,6 +3,7 @@ import { usePrivacy } from './privacy.ts';
 import type { AgentKind, UsageCounts, UsageReport, UsageRow } from '../../shared/protocol.ts';
 import { AGENT_LABEL, usageTotal } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
+import { fmtPct, fmtTokens, hitRate } from './util.ts';
 
 type Preset = 'today' | '7d' | '30d' | 'all' | 'custom';
 type Group = 'byTask' | 'byModel' | 'byVendor' | 'byAgent' | 'byProject';
@@ -39,16 +40,9 @@ function rangeOf(p: Preset, start: string, end: string, now: number): { from: nu
   return { from: null, to: null };
 }
 
-export function fmt(n: number): string {
-  if (n < 1000) return String(n);
-  const [d, s] = n < 1e6 ? [1e3, 'K'] : n < 1e9 ? [1e6, 'M'] : [1e9, 'B'];
-  const v = n / d;
-  return (v < 10 ? v.toFixed(2) : v < 100 ? v.toFixed(1) : v.toFixed(0)) + s;
-}
+export const fmt = fmtTokens;
 const full = (n: number) => n.toLocaleString('en-US');
-const inputSide = (c: UsageCounts) => c.input + c.cacheRead + c.cacheWrite;
-const hitRate = (c: UsageCounts) => (inputSide(c) ? c.cacheRead / inputSide(c) : null);
-const pct = (v: number | null) => (v === null ? '—' : `${(v * 100).toFixed(v > 0 && v < 0.1 ? 1 : 0)}%`);
+const pct = fmtPct;
 const clock = (t: number) => new Date(t).toLocaleTimeString('zh-CN', { hour12: false });
 const day = (t: number) => { const d = new Date(t); return `${d.getMonth() + 1}/${d.getDate()}`; };
 

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AgentKind, Project, SessionInfo, Task, UsageCounts, UsageReport, UsageRow } from '../shared/protocol.ts';
+import type { AgentKind, Project, SessionInfo, Task, TaskMetrics, TelemetrySummary, UsageCounts, UsageReport, UsageRow } from '../shared/protocol.ts';
 import { AGENT_LABEL, usageTotal, vendorOf } from '../shared/protocol.ts';
 
 // Token usage of workbench sessions, read from the CLIs' own transcripts:
@@ -35,6 +35,12 @@ interface FileState {
   model?: string; // codex: model of the latest turn_context
   records?: boolean; // codex: has token_usage_record lines, so token_count events are duplicates
   lastTotal?: number; // codex token_count: cumulative total of the last counted event
+  lastPromptAt?: number; // ms epoch of preceding user prompt / tool result for step speed
+}
+
+interface TaskSpeedState {
+  samples: [number, number][]; // recent [outputTokens, durationMs] pairs (capped at 5)
+  updatedAt: number; // ms epoch of last recorded response
 }
 
 interface UsageFile {
@@ -46,6 +52,7 @@ interface UsageFile {
   tasks: Record<string, { title: string; projectId: string }>;
   projects: Record<string, string>;
   buckets: Record<string, UsageCounts>; // `${hourStart}|${agent}|${model}|${taskId}`
+  taskSpeed?: Record<string, TaskSpeedState>;
 }
 
 export interface UsageHit {
@@ -53,6 +60,38 @@ export interface UsageHit {
   key?: string; // dedupe key (claude message id, codex response id, agy step)
   model?: string;
   c: UsageCounts;
+  coarseTime?: boolean; // agy created_at has 1s granularity
+}
+
+const MAX_SPEED_SAMPLES = 5;
+const MAX_STEP_MS = 600_000;
+
+export function parsePromptAt(v: Obj): number | null {
+  if (v.type === 'user') {
+    const t = Date.parse(str(v.timestamp));
+    return Number.isFinite(t) ? t : null;
+  }
+  const p = isObj(v.payload) ? v.payload : null;
+  if (
+    (v.type === 'response_item' && p && (p.type === 'function_call_output' || p.type === 'custom_tool_call_output' || (p.type === 'message' && p.role === 'user'))) ||
+    (v.type === 'event_msg' && p && (p.type === 'user_message' || p.type === 'task_started'))
+  ) {
+    const t = Date.parse(str(v.timestamp));
+    return Number.isFinite(t) ? t : null;
+  }
+  if (v.type === 'USER_INPUT' || v.type === 'GENERIC') {
+    const t = Date.parse(str(v.created_at));
+    return Number.isFinite(t) ? t : null;
+  }
+  return null;
+}
+
+function calcTps(samples: [number, number][] | undefined): number | null {
+  if (!samples?.length) return null;
+  let out = 0;
+  let ms = 0;
+  for (const [o, d] of samples) { out += o; ms += d; }
+  return ms > 0 ? Math.round((out / (ms / 1000)) * 10) / 10 : null;
 }
 
 const HOUR = 3_600_000;
@@ -109,7 +148,7 @@ export function parseUsageLine(v: Obj, file: FileState, fileKey: string): UsageH
   if (v.type === 'PLANNER_RESPONSE' && (num(v.input_tokens) || num(v.output_tokens))) {
     // input_tokens excludes cache reads (cache_read_tokens is often larger than it).
     const c: UsageCounts = { ...zero(), input: num(v.input_tokens), cacheRead: num(v.cache_read_tokens), output: num(v.output_tokens), requests: 1 };
-    return { t: Date.parse(str(v.created_at)), key: `a:${fileKey}:${String(v.step_index)}`, c };
+    return { t: Date.parse(str(v.created_at)), key: `a:${fileKey}:${String(v.step_index)}`, c, coarseTime: true };
   }
   return null;
 }
@@ -271,10 +310,21 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
     if (!r) return { changed: false, complete: false };
     if (r.next === fs0.offset) return { changed: false, complete: r.complete };
     for (const line of r.text.split('\n')) {
-      if (!line.includes('_tokens"') && !line.includes('"turn_context"')) continue;
+      const relevant = line.includes('_tokens"')
+        || line.includes('"turn_context"')
+        || line.includes('"user"')
+        || line.includes('"USER_INPUT"')
+        || line.includes('"GENERIC"')
+        || line.includes('"function_call_output"')
+        || line.includes('"custom_tool_call_output"')
+        || line.includes('"user_message"')
+        || line.includes('"task_started"');
+      if (!relevant) continue;
       let v: unknown;
       try { v = JSON.parse(line); } catch { continue; }
       if (!isObj(v)) continue;
+      const pt = parsePromptAt(v);
+      if (pt !== null) { fs0.lastPromptAt = pt; continue; }
       const hit = parseUsageLine(v, fs0, f);
       if (!hit || !Number.isFinite(hit.t) || usageTotal(hit.c) === 0) continue;
       if (hit.key && seen.has(hit.key)) continue;
@@ -285,6 +335,21 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       const model = hit.model ?? modelAt(s, hit.t) ?? '';
       const k = `${Math.floor(hit.t / HOUR) * HOUR}|${s.agent}|${model}|${s.taskId ?? ''}`;
       add((st.buckets[k] ??= zero()), hit.c);
+      if (s.taskId) {
+        const ts = ((st.taskSpeed ??= {})[s.taskId] ??= { samples: [], updatedAt: 0 });
+        ts.updatedAt = Math.max(ts.updatedAt, hit.t);
+        if (fs0.lastPromptAt !== undefined && hit.c.output >= 5) {
+          const rawDt = hit.t - fs0.lastPromptAt;
+          const dt = hit.coarseTime
+            ? (rawDt >= 0 && rawDt <= MAX_STEP_MS ? Math.max(rawDt, 1000) : null)
+            : (rawDt >= 200 && rawDt <= MAX_STEP_MS ? rawDt : null);
+          if (dt !== null) {
+            ts.samples.push([hit.c.output, dt]);
+            if (ts.samples.length > MAX_SPEED_SAMPLES) ts.samples.shift();
+          }
+        }
+      }
+      fs0.lastPromptAt = hit.t;
     }
     fs0.offset = r.next;
     return { changed: true, complete: r.complete };
@@ -398,7 +463,44 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
     };
   }
 
-  return { scan, report };
+  function telemetry(force = false): TelemetrySummary {
+    if (force || now() - lastScan >= SCAN_MIN_MS) scan();
+    const liveTaskIds = new Set(o.source.tasks().map(t => t.id));
+    const d = new Date(now());
+    d.setHours(0, 0, 0, 0);
+    const todayStart = d.getTime();
+    const today = { ...zero(), tps: null as number | null, updatedAt: 0 };
+    const byTask: Record<string, TaskMetrics> = {};
+
+    for (const [k, c] of Object.entries(st.buckets)) {
+      const [h, , , taskId] = k.split('|');
+      const hour = Number(h);
+      if (hour >= todayStart) add(today, c);
+      if (taskId && liveTaskIds.has(taskId)) {
+        const m = (byTask[taskId] ??= { ...zero(), tps: null, updatedAt: 0 });
+        add(m, c);
+      }
+    }
+
+    let latestTpsAt = 0;
+    for (const [taskId, ts] of Object.entries(st.taskSpeed ?? {})) {
+      const tps = calcTps(ts.samples);
+      if (byTask[taskId]) {
+        byTask[taskId].tps = tps;
+        byTask[taskId].updatedAt = ts.updatedAt;
+      }
+      if (ts.updatedAt >= todayStart) {
+        today.updatedAt = Math.max(today.updatedAt, ts.updatedAt);
+        if (tps !== null && ts.updatedAt >= latestTpsAt) {
+          latestTpsAt = ts.updatedAt;
+          today.tps = tps;
+        }
+      }
+    }
+    return { byTask, today };
+  }
+
+  return { scan, report, telemetry };
 }
 
 export type Usage = ReturnType<typeof createUsage>;

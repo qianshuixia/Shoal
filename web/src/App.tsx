@@ -11,9 +11,9 @@ import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspect
 import { matchProjectFileLink } from './linkParse.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
 import { FeedbackDialog, ForwardDialog, ProjectDialog, SettingsDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
-import { EditableTitle, PencilIcon, StatusTag } from './bits.tsx';
+import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
-import { liveWindows, QUOTA_AGENTS, QUOTA_WARN, quotaTitle } from './quota.ts';
+import { liveWindows, QUOTA_AGENTS } from './quota.ts';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
 
@@ -307,6 +307,9 @@ export function App() {
         break;
       case 'quota':
         setData((d) => ({ ...d, quota: { ...d.quota, [msg.agent]: msg.quota } }));
+        break;
+      case 'telemetry':
+        setData((d) => ({ ...d, telemetry: msg.telemetry }));
         break;
       case 'card':
         setData((d) => ({ ...d, cards: upsert(d.cards, msg.card) }));
@@ -625,9 +628,8 @@ export function App() {
     });
 
   const focusedSessionId = panes[layout === 2 ? focusedPane : 0];
-  const focusedProjectId = focusedSessionId
-    ? tasksById.get(sessionsById.get(focusedSessionId)?.taskId ?? '')?.projectId
-    : undefined;
+  const focusedTaskId = focusedSessionId ? sessionsById.get(focusedSessionId)?.taskId : undefined;
+  const focusedProjectId = focusedTaskId ? tasksById.get(focusedTaskId)?.projectId : undefined;
   const visibleIds = panes.slice(0, paneCount(layout));
   const sortedProjects = sortProjects(data.projects, order);
   const activeInspectProject = (pinnedInspectProjectId ? projectsById.get(pinnedInspectProjectId) : undefined)
@@ -682,17 +684,17 @@ export function App() {
           const q = data.quota[a];
           const ws = liveWindows(q, now);
           if (!q || !ws.length) return null;
-          return (
-            <span key={a} className="quota" data-testid="quota" data-agent={a} title={quotaTitle(a, q, ws, now)}>
-              <AgentIcon agent={a} />
-              {ws.map((w) => (
-                <span key={w.label} className={`quota-win ${w.usedPercent >= QUOTA_WARN ? 'warn' : ''} ${w.usedPercent >= 100 ? 'full' : ''}`} data-testid="quota-window" data-label={w.label}>
-                  {w.label} {Math.round(w.usedPercent)}%
-                </span>
-              ))}
-            </span>
-          );
+          return <QuotaPill key={a} agent={a} quota={q} windows={ws} now={now} />;
         })}
+        {data.telemetry?.today && (
+          <TelemetryPill
+            counts={data.telemetry.today}
+            tps={(focusedTaskId ? data.telemetry.byTask[focusedTaskId]?.tps : null) ?? data.telemetry.today.tps}
+            label="今日用量统计（点击查看详情）"
+            testId="top-telemetry"
+            onClick={() => setView(view === 'stats' ? 'work' : 'stats')}
+          />
+        )}
         <div className="top-right">
           {/* Stepper, not a slider: the slider's rem width changed under the cursor while dragging. */}
           <div className="zoom" title="界面缩放，每次 5%：Ctrl+滚轮、Ctrl+= / Ctrl+-（终端里的 Ctrl+- 留给 CLI），Ctrl+0 恢复 100%；也可以点 −/+" onWheel={(e) => e.deltaY && zoomBy(e.deltaY < 0 ? 1 : -1)}>
@@ -852,6 +854,7 @@ export function App() {
               dual={layout === 2}
               now={now}
               quota={paneAgent ? data.quota[paneAgent] : undefined}
+              metrics={task ? data.telemetry?.byTask[task.id] : undefined}
               onFocus={() => {
                 if (layout === 2 && focusedPane !== i) setFocusedPane(i);
                 else if (layout === 'inspect') setFocusTick((n) => n + 1);

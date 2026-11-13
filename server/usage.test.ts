@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createUsage, EVENTS_ROTATE_BYTES } from './usage.ts';
 import type { UsageSource } from './usage.ts';
-import { usageTotal, vendorOf } from '../shared/protocol.ts';
+import { usageCacheHitRate, usageTotal, vendorOf } from '../shared/protocol.ts';
 import type { AgentKind, Project, SessionInfo, Task } from '../shared/protocol.ts';
 
 let dir: string;
@@ -271,5 +271,38 @@ describe('usage', () => {
     expect(vendorOf('o4-mini', 'codex')).toBe('OpenAI');
     expect(vendorOf('', 'agy')).toBe('Google');
     expect(vendorOf('my-model', 'claude')).toBe('Anthropic');
+  });
+
+  it('computes live per-task telemetry (tokens, cache hit rate, and tok/s speed) and survives restart', () => {
+    // Use local today timestamps relative to T0 and set `now` to T0 + 10m so todayStart aligns.
+    const d0 = new Date(T0);
+    d0.setHours(0, 0, 0, 0);
+    const nowAt = d0.getTime() + 12 * 3_600_000;
+    addTask('t1', '测速度', 's1', 'claude', nowAt - 60_000);
+    const cf = write('claude/speed.jsonl', lines(
+      { type: 'user', timestamp: iso(nowAt - 10_000), message: { content: 'go' } },
+      claudeLine('m1', nowAt - 8_000, { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 200 }),
+      { type: 'user', timestamp: iso(nowAt - 6_000), message: { content: 'next' } },
+      claudeLine('m2', nowAt - 4_000, { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 400 }),
+    ));
+    hook('s1', 'claude', nowAt - 55_000, { transcript_path: cf });
+
+    addTask('t2', 'agy 速度', 's2', 'agy', nowAt - 60_000);
+    const af = write('agy/speed.jsonl', lines(
+      { step_index: 1, type: 'USER_INPUT', created_at: iso(nowAt - 2_000), content: 'hi' },
+      // Same-second response clamps to 1s so coarse 1s timestamps never explode to Infinity.
+      { step_index: 2, type: 'PLANNER_RESPONSE', created_at: iso(nowAt - 2_000), input_tokens: 50, cache_read_tokens: 450, output_tokens: 120 },
+    ));
+    hook('s2', 'agy', nowAt - 55_000, { transcriptPath: af, modelName: 'gemini-4-carbon-medium', conversationId: 'c2' });
+
+    const tel = createUsage({ stateDir: dir, source, now: () => nowAt }).telemetry();
+    expect(tel.byTask.t1).toMatchObject({ input: 200, cacheRead: 1800, output: 600, requests: 2, tps: 150 });
+    expect(usageCacheHitRate(tel.byTask.t1)).toBeCloseTo(0.9, 4);
+    expect(tel.byTask.t2).toMatchObject({ input: 50, cacheRead: 450, output: 120, requests: 1, tps: 120 });
+    expect(tel.today).toMatchObject({ input: 250, cacheRead: 2250, output: 720, requests: 3, tps: 120 });
+
+    const restarted = createUsage({ stateDir: dir, source, now: () => nowAt }).telemetry();
+    expect(restarted.byTask.t1.tps).toBe(150);
+    expect(restarted.today.requests).toBe(3);
   });
 });
