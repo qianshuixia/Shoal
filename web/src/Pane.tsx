@@ -1,11 +1,12 @@
-import { useLayoutEffect, useRef, useState } from 'react';
-import type { CSSProperties, DragEvent } from 'react';
-import type { Card, FeedbackBody, Project, SessionInfo, Task } from '../../shared/protocol.ts';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { CSSProperties, DragEvent, RefObject } from 'react';
+import type { Card, Project, QuotaInfo, SessionInfo, Task } from '../../shared/protocol.ts';
 import { AGENT_LABEL, canResume } from '../../shared/protocol.ts';
-import { attach, fitEntry } from './terms.ts';
+import { attach, fitEntry, focusOnly } from './terms.ts';
 import { EditableTitle, PencilIcon, StatusTag } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
+import { liveWindows, QUOTA_WARN, quotaTitle } from './quota.ts';
 
 interface Props {
   index: number;
@@ -16,12 +17,13 @@ interface Props {
   focused: boolean;
   dual: boolean;
   now: number;
+  quota?: QuotaInfo;
   onFocus(): void;
   onRename(title: string): void;
   onResume(fresh: boolean): void;
   card?: Card; // latest result card of the task
   onApprove(): void;
-  onFeedback(text: string, mode: FeedbackBody['mode']): Promise<boolean>; // true = sent
+  onFeedback(): void; // open the new-session feedback dialog
   onSwitch(): void; // open the switch-agent dialog
   onForward(): void; // open the forward dialog for the result card
   handoff?: Card; // latest handoff card of the task
@@ -30,68 +32,100 @@ interface Props {
 
 export const SESSION_DRAG_TYPE = 'application/x-wb-session';
 
-// 待验收: the agent's last reply as a one-line summary, expandable; approve it or write feedback back.
-function ReviewBar({ card, onApprove, onFeedback, onForward }: Pick<Props, 'onApprove' | 'onFeedback' | 'onForward'> & { card: Card }) {
+// Floating popover anchored below the header's 待验收 split pill: never alters .pane-body height or triggers PTY resize.
+function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForward }: {
+  card: Card;
+  toggleRef: RefObject<HTMLButtonElement | null>;
+  onClose(): void;
+  onEscape(): void;
+  onFeedback(): void;
+  onForward(): void;
+}) {
   const [open, setOpen] = useState(false);
-  const [writing, setWriting] = useState(false);
-  const [text, setText] = useState('');
-  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
   const privacy = usePrivacy();
   const summary = card.body.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
-  const blank = !text.trim();
 
-  const send = async (mode: FeedbackBody['mode']) => {
-    if (blank || busy) return;
-    setBusy(true);
-    const ok = await onFeedback(text, mode);
-    setBusy(false);
-    if (ok) {
-      setWriting(false);
-      setText('');
-    }
-  };
-  const cancel = () => {
-    setWriting(false);
-    setText('');
+  useEffect(() => {
+    ref.current?.querySelector<HTMLButtonElement>('.review-item')?.focus();
+    const away = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (t && !ref.current?.contains(t) && !toggleRef.current?.contains(t)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        onEscape();
+      }
+    };
+    document.addEventListener('mousedown', away);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', away);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [onClose, onEscape, toggleRef]);
+
+  const move = (dir: number) => {
+    const items = [...(ref.current?.querySelectorAll<HTMLButtonElement>('.review-item') ?? [])];
+    if (!items.length) return;
+    const i = items.indexOf(document.activeElement as HTMLButtonElement);
+    items[(i + dir + items.length) % items.length]?.focus();
   };
 
   return (
-    <div className="review-bar" data-testid="review-bar">
-      <div className="review-line">
-        <span className="review-label">待验收</span>
-        <span className="review-summary" data-testid="review-summary" data-private="" title={privacy ? undefined : summary}>{summary}</span>
-        <button className="btn" data-testid="review-expand" aria-expanded={open} onClick={() => setOpen((v) => !v)}>{open ? '收起' : '展开'}</button>
-        {!writing && <button className="btn" data-testid="review-feedback" onClick={() => setWriting(true)}>写反馈</button>}
-        <button className="btn" data-testid="review-forward" onClick={onForward}>转发</button>
-        <button className="btn primary" data-testid="review-approve" onClick={onApprove}>通过</button>
+    <div
+      className="review-popover"
+      data-testid="review-popover"
+      ref={ref}
+      onKeyDown={(e) => {
+        if (e.key === 'ArrowDown') { e.preventDefault(); move(1); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
+      }}
+    >
+      <div className="review-menu">
+        <button
+          type="button"
+          className="review-item"
+          data-testid="review-feedback"
+          onClick={() => {
+            onClose();
+            onFeedback();
+          }}
+        >
+          <span className="review-item-title">新会话继续…</span>
+          <span className="review-item-desc">带上任务需求、本轮结果和新要求重开会话</span>
+        </button>
+        <button
+          type="button"
+          className="review-item"
+          data-testid="review-forward"
+          onClick={() => {
+            onClose();
+            onForward();
+          }}
+        >
+          <span className="review-item-title">转发结果…</span>
+          <span className="review-item-desc">把本轮回复发给其他任务或新建任务</span>
+        </button>
       </div>
-      {open && <div className="review-body" data-testid="review-body" data-private="">{card.body}</div>}
-      {writing && (
-        <div className="review-write">
-          <textarea
-            data-testid="feedback-input"
-            autoFocus
-            rows={3}
-            value={text}
-            placeholder="写下要改的地方"
-            onChange={(e) => setText(e.target.value)}
-            onKeyUp={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              e.stopPropagation();
-              if (e.key === 'Escape') cancel();
-              else if (e.key === 'Enter' && e.ctrlKey) {
-                e.preventDefault();
-                void send('new');
-              }
-            }}
-          />
-          <div className="review-actions">
-            <button className="btn primary" data-testid="feedback-new" disabled={blank || busy} title="Ctrl+Enter" onClick={() => void send('new')}>新会话继续</button>
-            <button className="btn" data-testid="feedback-same" disabled={blank || busy} onClick={() => void send('same')}>发到原会话</button>
-            <button className="btn" data-testid="feedback-cancel" onClick={cancel}>取消</button>
-          </div>
+      <div className="review-card-foot">
+        <div className="review-card-head">
+          <span className="review-summary" data-testid="review-summary" data-private="" title={privacy ? undefined : summary}>
+            {summary || '（空回复）'}
+          </span>
+          <button
+            type="button"
+            className="ghost review-expand-btn"
+            data-testid="review-expand"
+            aria-expanded={open}
+            onClick={() => setOpen((v) => !v)}
+          >
+            {open ? '收起原文' : '查看原文'}
+          </button>
         </div>
-      )}
+        {open && <div className="review-body" data-testid="review-body" data-private="">{card.body}</div>}
+      </div>
     </div>
   );
 }
@@ -100,15 +134,36 @@ function ReviewBar({ card, onApprove, onFeedback, onForward }: Pick<Props, 'onAp
 const limitText = (l: NonNullable<SessionInfo['limit']>) =>
   `额度用完：${l.message}${l.resetsAt ? `，${new Date(l.resetsAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })} 重置` : ''}`;
 
-// Shown on the session that took over from another agent: one line, expandable to the whole handoff card.
+// Shown on the session that took over from another agent: one line; its expanded body floats over the terminal so expanding never resizes the PTY.
 function HandoffBar({ card }: { card: Card }) {
   const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
   const from = card.meta?.from;
+
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', away);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', away);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
   return (
-    <div className="handoff-bar" data-testid="pane-handoff">
+    <div className="handoff-bar" data-testid="pane-handoff" ref={ref}>
       <div className="handoff-line">
         <span>由 {from ? AGENT_LABEL[from] : '另一个 agent'} 交接（{card.meta?.generated === false ? '按记录摘录' : '自动整理'}）</span>
-        <button className="btn" data-testid="pane-handoff-expand" aria-expanded={open} onClick={() => setOpen((v) => !v)}>{open ? '收起' : '展开'}</button>
+        <button type="button" className="btn" data-testid="pane-handoff-expand" aria-expanded={open} onClick={() => setOpen((v) => !v)}>{open ? '收起' : '展开'}</button>
       </div>
       {open && <div className="handoff-body" data-testid="pane-handoff-body" data-private="">{card.body}</div>}
     </div>
@@ -123,9 +178,16 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
+  const reviewToggleRef = useRef<HTMLButtonElement>(null);
   const [editing, setEditing] = useState(false);
+  // Secondary review actions live in a floating popover anchored to the header; Approve sits directly in the header.
+  const [openCard, setOpenCard] = useState<string | null>(null);
+  const reviewing = task?.phase === 'review' && !!card;
+  const reviewOpen = reviewing && openCard === card.id;
+  const paneAgent = task?.agent ?? session?.agent;
+  const paneWindows = paneAgent ? liveWindows(quota, now) : [];
 
   // Show this session's terminal in the pane and keep it fitted to the pane size.
   useLayoutEffect(() => {
@@ -192,10 +254,63 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
               <PencilIcon />
             </button>
           )}
-          <span className="pane-agent">{task?.agent ?? session?.agent ?? '?'}</span>
+          <span className="pane-agent">{paneAgent ?? '?'}</span>
+          {paneAgent && quota && paneWindows.length > 0 && (
+            <span className="quota pane-quota" data-testid="pane-quota" data-agent={paneAgent} title={quotaTitle(paneAgent, quota, paneWindows, now)}>
+              {paneWindows.map((w) => (
+                <span key={w.label} className={`quota-win ${w.usedPercent >= QUOTA_WARN ? 'warn' : ''} ${w.usedPercent >= 100 ? 'full' : ''}`} data-testid="pane-quota-window" data-label={w.label}>
+                  {w.label} {Math.round(w.usedPercent)}%
+                </span>
+              ))}
+            </span>
+          )}
           {session && !(task?.phase === 'approved' && session.status === 'needs_you') && <StatusTag status={session.status} since={session.statusSince} now={now} />}
+          {reviewing && (
+            <span className="review-split">
+              <button
+                type="button"
+                className="review-pass"
+                data-testid="review-approve"
+                title="验收通过（移出待验收队列，会话保留）"
+                onClick={() => {
+                  setOpenCard(null);
+                  onApprove();
+                }}
+              >
+                <svg className="pass-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6.5" /></svg>
+                通过
+              </button>
+              <button
+                type="button"
+                ref={reviewToggleRef}
+                className={`review-more ${reviewOpen ? 'on' : ''}`}
+                data-testid="review-toggle"
+                aria-label="更多待验收操作"
+                aria-haspopup="true"
+                aria-expanded={reviewOpen}
+                title="新会话继续、转发结果或查看本轮卡片原文"
+                onClick={() => setOpenCard(reviewOpen ? null : card.id)}
+              >
+                <svg className="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
+              </button>
+            </span>
+          )}
           {task && <button className="btn pane-switch" data-testid="pane-switch" title="让另一个 agent 接手这个任务" onClick={onSwitch}>换 agent</button>}
         </div>
+      )}
+      {reviewOpen && (
+        <ReviewPopover
+          key={card.id}
+          card={card}
+          toggleRef={reviewToggleRef}
+          onClose={() => setOpenCard(null)}
+          onEscape={() => {
+            setOpenCard(null);
+            if (!dual || focused) focusOnly(sessionId);
+          }}
+          onFeedback={onFeedback}
+          onForward={onForward}
+        />
       )}
       {session?.limit && (
         <div className="limit-bar" data-testid="pane-limit">
@@ -204,11 +319,12 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
         </div>
       )}
       {handoff && handoff.sessionId === sessionId && <HandoffBar key={handoff.id} card={handoff} />}
-      <div className="pane-body" ref={bodyRef} />
-      {task?.phase === 'review' && card && <ReviewBar key={task.id} card={card} onApprove={onApprove} onFeedback={onFeedback} onForward={onForward} />}
-      {!!session?.queued && (
-        <div className="pane-queued" data-testid="pane-queued">消息排队中，agent 空闲后自动发送</div>
-      )}
+      <div className="pane-stage">
+        <div className="pane-body" ref={bodyRef} />
+        {!!session?.queued && (
+          <div className="pane-queued" data-testid="pane-queued">消息排队中，agent 空闲后自动发送</div>
+        )}
+      </div>
       {session?.status === 'exited' && task && (
         <div className="pane-exited" data-testid="pane-exited">
           <span>会话已退出{session.exitCode ? `（退出码 ${session.exitCode}）` : ''}</span>

@@ -6,15 +6,31 @@ import os from 'node:os';
 import type { AgentKind } from '../shared/protocol.ts';
 
 // Hook commands go through shells that quote badly (agy uses `cmd /c`), so a path with spaces falls back to its
-// 8.3 short form when the volume has one.
-function shortPath(p: string): string {
+// 8.3 short form when the volume has one. Shorten only the directory when the filename has no spaces: `%~sI` on a >8-char
+// filename like `statusline.mjs` produces `STATUS~1.MJS`, and Node's ESM loader rejects uppercase `.MJS`.
+export function shortPath(p: string): string {
   if (!p.includes(' ') || process.platform !== 'win32') return p;
+  // Verbatim: Node would otherwise escape the quotes as \" and cmd reads them literally.
+  // execFileSync honours windowsVerbatimArguments (it is a spawnSync option) though its typings leave it out.
+  const opts = { encoding: 'utf8' as const, windowsHide: true, windowsVerbatimArguments: true };
+  const shorten = (target: string) =>
+    execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${target}") do @echo %~sI`], opts).trim();
   try {
-    // Verbatim: Node would otherwise escape the quotes as \" and cmd reads them literally.
-    // execFileSync honours windowsVerbatimArguments (it is a spawnSync option) though its typings leave it out.
-    const opts = { encoding: 'utf8' as const, windowsHide: true, windowsVerbatimArguments: true };
-    const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], opts).trim();
-    return out && fs.existsSync(out) ? out : p;
+    const base = path.basename(p);
+    if (!base.includes(' ')) {
+      const dir = shorten(path.dirname(p));
+      const kept = dir ? path.join(dir, base) : '';
+      if (kept && !kept.includes(' ') && fs.existsSync(kept)) return kept;
+    }
+    const out = shorten(p);
+    if (!out || !fs.existsSync(out)) return p;
+    const origExt = path.extname(p);
+    const outExt = path.extname(out);
+    if (origExt && outExt && origExt.toLowerCase() === outExt.toLowerCase() && origExt !== outExt) {
+      const fixed = out.slice(0, -outExt.length) + origExt;
+      if (fs.existsSync(fixed)) return fixed;
+    }
+    return out;
   } catch {
     return p;
   }
@@ -22,6 +38,7 @@ function shortPath(p: string): string {
 
 export const ROOT = path.resolve(import.meta.dirname, '..');
 export const NOTIFY = shortPath(path.join(ROOT, 'hooks', 'notify.mjs')).replaceAll('\\', '/');
+const STATUSLINE = shortPath(path.join(ROOT, 'hooks', 'statusline.mjs')).replaceAll('\\', '/');
 // The desktop app's hooks run on its bundled Node: the user's machine may have none on PATH. A checkout keeps `node`.
 export const NODE = process.env.WORKBENCH_BUNDLED === '1' ? shortPath(process.execPath).replaceAll('\\', '/') : 'node';
 const nodeCmd = NODE.includes(' ') ? `"${NODE}"` : NODE;
@@ -38,8 +55,8 @@ const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PermissionReq
 const AGY_EVENTS = ['SessionStart', 'PreInvocation', 'PostInvocation', 'Stop'];
 
 const hookCmd = (agent: string, ev: string) => `${nodeCmd} "${NOTIFY}" ${agent} ${ev}`;
-// agy runs hook commands through `cmd /c`, which breaks quoted paths.
-const agyUsable = () => !NOTIFY.includes(' ') && !NODE.includes(' ');
+// agy runs hook and statusLine commands through `cmd /c`, which breaks quoted paths.
+const agyUsable = () => !NOTIFY.includes(' ') && !STATUSLINE.includes(' ') && !NODE.includes(' ');
 
 // Claude saves a conversation as <config>/projects/<cwd slug>/<uuid>.jsonl once a prompt is sent; read-only check.
 export function claudeConversationExists(id: string): boolean {
@@ -51,6 +68,45 @@ export function claudeConversationExists(id: string): boolean {
     return false;
   }
   return slugs.some(d => fs.existsSync(path.join(dir, d, `${id}.jsonl`)));
+}
+
+// The status line command claude would run without our --settings: the first of the project's local and shared settings
+// and the user's settings that has a command-type statusLine (undefined when none). Never throws.
+export function userStatusLine(cwd: string): string | undefined {
+  const files = [
+    path.join(cwd, '.claude', 'settings.local.json'),
+    path.join(cwd, '.claude', 'settings.json'),
+    path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'settings.json'),
+  ];
+  for (const f of files) {
+    try {
+      const sl = JSON.parse(fs.readFileSync(f, 'utf8'))?.statusLine;
+      if (sl?.type === 'command' && typeof sl.command === 'string' && sl.command.trim()) return sl.command;
+    } catch { /* missing or unreadable */ }
+  }
+  return undefined;
+}
+
+// The status line command agy would run without our --settings (from ~/.gemini/antigravity-cli/settings.json, or
+// AGY_CONFIG_DIR in tests). When the user has none, stack_with_default stays true so agy keeps its built-in status line.
+export function agyUserStatusLine(): { command?: string; stackWithDefault: boolean; padding: number } {
+  const file = path.join(process.env.AGY_CONFIG_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli'), 'settings.json');
+  try {
+    const sl = JSON.parse(fs.readFileSync(file, 'utf8'))?.statusLine;
+    if (sl && typeof sl === 'object' && !Array.isArray(sl)) {
+      const cmd = sl.enabled !== false && (sl.type === undefined || sl.type === 'command') && typeof sl.command === 'string' && sl.command.trim()
+        ? sl.command.trim().replace(/^~(?=[/\\])/, os.homedir())
+        : undefined;
+      if (cmd) {
+        return {
+          command: cmd,
+          stackWithDefault: sl.stack_with_default === true,
+          padding: typeof sl.padding === 'number' && Number.isFinite(sl.padding) ? sl.padding : 0,
+        };
+      }
+    }
+  } catch { /* missing or unreadable */ }
+  return { stackWithDefault: true, padding: 0 };
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -78,10 +134,13 @@ export function availableAgents(): AgentKind[] {
 export function writeHookFiles(stateDir: string): void {
   const hooks: Record<string, unknown> = {};
   for (const ev of CLAUDE_EVENTS) hooks[ev] = [{ hooks: [{ type: 'command', command: hookCmd('claude', ev), timeout: 5 }] }];
-  fs.writeFileSync(path.join(stateDir, 'claude-hooks.json'), JSON.stringify({ hooks }, null, 2));
+  // Claude reports its subscription rate limits only to the status line command. This one replaces the user's own
+  // (--settings wins), so it runs that for us: see userStatusLine and hooks/statusline.mjs.
+  const statusLine = { type: 'command', command: `${nodeCmd} "${STATUSLINE}" claude` };
+  fs.writeFileSync(path.join(stateDir, 'claude-hooks.json'), JSON.stringify({ hooks, statusLine }, null, 2));
 
   if (!agyUsable()) {
-    console.warn(`[agents] WARNING: hook command path contains a space (${NODE} ${NOTIFY}); agy hooks cannot be quoted, agy is disabled`);
+    console.warn(`[agents] WARNING: hook command path contains a space (${NODE} ${NOTIFY} ${STATUSLINE}); agy hooks cannot be quoted, agy is disabled`);
     return;
   }
   const agy: Record<string, unknown> = {};
@@ -89,6 +148,15 @@ export function writeHookFiles(stateDir: string): void {
   const dir = path.join(stateDir, 'agy-hooks', '.agents');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'hooks.json'), JSON.stringify({ workbench: agy }, null, 2));
+  const agySl = agyUserStatusLine();
+  const agyStatusLine = {
+    type: 'command',
+    command: `${NODE} ${STATUSLINE} agy`,
+    enabled: true,
+    stack_with_default: agySl.stackWithDefault,
+    padding: agySl.padding,
+  };
+  fs.writeFileSync(path.join(stateDir, 'agy-settings.json'), JSON.stringify({ statusLine: agyStatusLine }, null, 2));
 }
 
 export function preparePrompt(prompt: string, sessionId: string, stateDir: string): string {
@@ -138,7 +206,7 @@ export function buildLaunch(opts: { agent: AgentKind; sessionId: string; prompt:
     }
     case 'agy': {
       const args = resume ? ['--conversation', resume] : [];
-      args.push('--add-dir', path.join(stateDir, 'agy-hooks'), FULL_ACCESS.agy);
+      args.push('--settings', path.join(stateDir, 'agy-settings.json').replaceAll('\\', '/'), '--add-dir', path.join(stateDir, 'agy-hooks'), FULL_ACCESS.agy);
       if (prompt) args.push('-i', prompt);
       return { file: agyExe(), args, nativeSessionId: resume ?? null };
     }

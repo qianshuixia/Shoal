@@ -11,7 +11,7 @@
 // 4b. The CLI switched conversation itself (/resume) -> the workbench follows the new native id and resumes that one.
 // 5. Resume while running / unknown task -> 409 / 404, nothing spawned.
 // 6. Rename is only discoverable by double-click -> pencil buttons on the row (hover) and in the pane header.
-// 7. Exited rows look disabled -> the agent icon keeps full opacity.
+// 7. The agent icon outshines the state on idle rows -> dimmed on a stopped row, full again on hover.
 import { test, expect, type Page } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -61,6 +61,9 @@ test('退出的任务：续接上次会话、新开会话，留在原窗格，�
   await expect(row(page, s1.id).getByTestId('task-resume')).toBeVisible();
   // The prompt's hook may be lost in the exit, leaving it 待验收; any other status is gone.
   await expect(row(page, s1.id).getByTestId('status').filter({ hasNotText: '待验收' })).toHaveCount(0);
+  await page.mouse.move(0, 0);
+  await expect(row(page, s1.id).getByTestId('agent-icon')).toHaveCSS('opacity', '0.45');
+  await row(page, s1.id).hover();
   await expect(row(page, s1.id).getByTestId('agent-icon')).toHaveCSS('opacity', '1');
   await expect(pane(page, 1).getByTestId('pane-exited')).toBeVisible();
   await expect(pane(page, 1).getByTestId('pane-resume')).toBeVisible();

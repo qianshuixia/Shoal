@@ -100,7 +100,10 @@ function Modal({ title, testId, onClose, onSubmit, children }: {
         ref={ref}
         onKeyDown={(e) => {
           if (e.key === 'Escape') onClose();
-          else if (e.key === 'Enter' && e.ctrlKey) onSubmit();
+          else if (e.key === 'Enter' && e.ctrlKey) {
+            e.preventDefault();
+            onSubmit();
+          }
         }}
       >
         <h3>{title}</h3>
@@ -383,6 +386,44 @@ export function ForwardDialog({ source, card, sourceAgent, projects, tasks, agen
         <span className="actions-hint"><kbd>Ctrl</kbd><kbd>Enter</kbd> 转发</span>
         <button onClick={onClose}>取消</button>
         <button className="primary" data-testid="forward-submit" disabled={busy} onClick={submit}>转发</button>
+      </div>
+    </Modal>
+  );
+}
+
+export function FeedbackDialog({ task, onClose, onFeedback }: {
+  task: Task;
+  onClose(): void;
+  onFeedback(text: string): Promise<boolean>;
+}) {
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const blank = !text.trim();
+
+  const submit = async () => {
+    if (blank || busy) return;
+    setBusy(true);
+    const ok = await onFeedback(text);
+    setBusy(false);
+    if (ok) onClose();
+  };
+
+  return (
+    <Modal title={<>新会话继续：<span data-private="">{task.title}</span></>} testId="feedback-dialog" onClose={onClose} onSubmit={() => void submit()}>
+      <div className="hint">在这个面板里开新会话继续（原会话会被结束），初始消息会带上任务需求、上一轮结果和你写的要求。要接着和当前会话对话，直接在终端里打字即可。</div>
+      <label>接下来要做的事
+        <textarea
+          data-testid="feedback-input"
+          rows={4}
+          value={text}
+          placeholder="写下接下来要做的事…"
+          onChange={(e) => setText(e.target.value)}
+        />
+      </label>
+      <div className="actions">
+        <span className="actions-hint"><kbd>Ctrl</kbd><kbd>Enter</kbd> 开新会话</span>
+        <button type="button" data-testid="feedback-cancel" onClick={onClose}>取消</button>
+        <button type="button" className="primary" data-testid="feedback-new" disabled={blank || busy} onClick={() => void submit()}>开新会话</button>
       </div>
     </Modal>
   );

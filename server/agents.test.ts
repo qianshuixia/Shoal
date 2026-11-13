@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NODE, NOTIFY } from './agents.ts';
+import { agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
 import { pickColor } from './store.ts';
 import { TASK_COLORS } from '../shared/protocol.ts';
 
@@ -63,8 +64,10 @@ describe('buildLaunch', () => {
     expect(build('fake', 'x').args.join(' ')).not.toContain('--dangerously');
   });
 
-  it('agy uses -i for the prompt', () => {
-    expect(build('agy', 'hi').args.slice(-2)).toEqual(['-i', 'hi']);
+  it('agy uses -i for the prompt and passes --settings for statusLine', () => {
+    const a = build('agy', 'hi');
+    expect(a.args.slice(-2)).toEqual(['-i', 'hi']);
+    expect(a.args.slice(0, 2)).toEqual(['--settings', expect.stringMatching(/agy-settings\.json$/)]);
     expect(build('agy', '').args).not.toContain('-i');
   });
 
@@ -77,16 +80,70 @@ describe('buildLaunch', () => {
   });
 });
 
-describe('agy hook file', () => {
-  it('commands contain no quotes', async () => {
+describe('agy hook and settings files', () => {
+  it('commands contain no quotes and agy-settings.json stacks under the default status line', async () => {
     const { writeHookFiles } = await import('./agents.ts');
-    writeHookFiles(stateDir);
+    const prev = process.env.AGY_CONFIG_DIR;
+    process.env.AGY_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-agy-cfg-'));
+    try {
+      writeHookFiles(stateDir);
+    } finally {
+      if (prev === undefined) delete process.env.AGY_CONFIG_DIR; else process.env.AGY_CONFIG_DIR = prev;
+    }
     const file = path.join(stateDir, 'agy-hooks', '.agents', 'hooks.json');
     if (!fs.existsSync(file)) return; // repo path contains a space: agy disabled
     const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
     const cmds = Object.values(cfg.workbench).flatMap(v => (v as { command: string }[]).map(h => h.command));
     expect(cmds).toHaveLength(4);
     for (const c of cmds) expect(c).not.toMatch(/["']/);
+    const settings = JSON.parse(fs.readFileSync(path.join(stateDir, 'agy-settings.json'), 'utf8'));
+    expect(settings.statusLine).toEqual({
+      type: 'command',
+      command: expect.stringMatching(/statusline\.mjs agy$/),
+      enabled: true,
+      stack_with_default: true,
+      padding: 0,
+    });
+    expect(settings.statusLine.command).not.toMatch(/["']/);
+  });
+
+  it.runIf(process.platform === 'win32')('shortPath keeps lowercase .mjs so Node ESM loader accepts paths under spaced dirs', () => {
+    const spaced = fs.mkdtempSync(path.join(os.tmpdir(), 'wb space dir '));
+    const hooksDir = path.join(spaced, 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const statusline = path.join(hooksDir, 'statusline.mjs');
+    const spacedFile = path.join(hooksDir, 'my statusline.mjs');
+    fs.writeFileSync(statusline, 'process.stdout.write("ok");\n');
+    fs.writeFileSync(spacedFile, 'process.stdout.write("ok");\n');
+    try {
+      const s1 = shortPath(statusline);
+      if (!s1.includes(' ')) {
+        expect(path.basename(s1)).toBe('statusline.mjs');
+        expect(execFileSync(process.execPath, [s1], { encoding: 'utf8' })).toBe('ok');
+      }
+      const s2 = shortPath(spacedFile);
+      if (!s2.includes(' ')) {
+        expect(path.extname(s2)).toBe('.mjs');
+        expect(execFileSync(process.execPath, [s2], { encoding: 'utf8' })).toBe('ok');
+      }
+    } finally {
+      fs.rmSync(spaced, { recursive: true, force: true });
+    }
+  });
+
+  it('agyUserStatusLine reads ~/.gemini/antigravity-cli/settings.json and expands leading ~', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-agy-sl-'));
+    const prev = process.env.AGY_CONFIG_DIR;
+    process.env.AGY_CONFIG_DIR = dir;
+    try {
+      expect(agyUserStatusLine()).toEqual({ stackWithDefault: true, padding: 0 });
+      fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ statusLine: { command: '~/my-sl.sh', stack_with_default: false, padding: 1 } }));
+      expect(agyUserStatusLine()).toEqual({ command: `${os.homedir()}/my-sl.sh`, stackWithDefault: false, padding: 1 });
+      fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ statusLine: { command: '~/my-sl.sh', enabled: false } }));
+      expect(agyUserStatusLine()).toEqual({ stackWithDefault: true, padding: 0 });
+    } finally {
+      if (prev === undefined) delete process.env.AGY_CONFIG_DIR; else process.env.AGY_CONFIG_DIR = prev;
+    }
   });
 });
 
@@ -172,5 +229,38 @@ describe('claudeResumeId', () => {
     const odd = path.join(slug, 'notes.jsonl');
     fs.writeFileSync(odd, '');
     expect(withConfig(() => claudeResumeId(OLD, odd))).toBeUndefined();
+  });
+});
+
+describe('claude status line', () => {
+  it('claude-hooks.json carries a statusLine command running hooks/statusline.mjs next to the hooks', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-test-'));
+    writeHookFiles(dir);
+    const cfg = JSON.parse(fs.readFileSync(path.join(dir, 'claude-hooks.json'), 'utf8'));
+    expect(cfg.statusLine).toEqual({ type: 'command', command: expect.stringMatching(/statusline\.mjs" claude$/) });
+    expect(Object.keys(cfg.hooks)).toContain('Stop');
+  });
+
+  it('userStatusLine picks local, then project, then user settings, and ignores non-command lines', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-sl-'));
+    const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-sl-cfg-'));
+    const old = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = cfgDir;
+    try {
+      expect(userStatusLine(cwd)).toBeUndefined();
+      const write = (f: string, v: unknown) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, typeof v === 'string' ? v : JSON.stringify(v)); };
+      write(path.join(cfgDir, 'settings.json'), { statusLine: { type: 'command', command: 'user-sl' } });
+      expect(userStatusLine(cwd)).toBe('user-sl');
+      write(path.join(cwd, '.claude', 'settings.json'), { statusLine: { type: 'command', command: 'project-sl' } });
+      expect(userStatusLine(cwd)).toBe('project-sl');
+      write(path.join(cwd, '.claude', 'settings.local.json'), '{broken');
+      expect(userStatusLine(cwd)).toBe('project-sl');
+      write(path.join(cwd, '.claude', 'settings.local.json'), { statusLine: { type: 'static', command: 'x' } });
+      expect(userStatusLine(cwd)).toBe('project-sl');
+      write(path.join(cwd, '.claude', 'settings.local.json'), { statusLine: { type: 'command', command: 'local-sl' } });
+      expect(userStatusLine(cwd)).toBe('local-sl');
+    } finally {
+      if (old === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = old;
+    }
   });
 });

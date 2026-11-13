@@ -15,7 +15,7 @@ import { test, expect, type Page } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { forwardText } from '../shared/protocol.ts';
-import { createFakeTask, createProject, expectStatus, fakeLines, pane, removeAllTasks, row, token } from './helpers.ts';
+import { createFakeTask, createProject, expectStatus, openReview, fakeLines, pane, removeAllTasks, row, token } from './helpers.ts';
 
 const OUT = path.resolve('.tmp/ui-review-impl');
 fs.mkdirSync(OUT, { recursive: true });
@@ -75,6 +75,7 @@ test('a message forwarded to a fresh (就绪) task is delivered once', async ({ 
   await expectStatus(page, dst.session.id, 'idle');
   await row(page, src.session.id).click();
   await expect(taskRow(page, src.task.id)).toHaveAttribute('data-phase', 'review');
+  await openReview(page);
   await pane(page, 0).getByTestId('review-forward').click();
   const dlg = page.getByTestId('forward-dialog');
   await dlg.getByTestId('forward-target').selectOption(`task:${dst.task.id}`);

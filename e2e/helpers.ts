@@ -36,6 +36,15 @@ export const row = (page: Page, sessionId: string) =>
 export const pane = (page: Page, index: number) =>
   page.locator(`[data-testid="pane"][data-pane-index="${index}"]`);
 
+/** Opens the floating 待验收 popover of a pane and returns it. */
+export async function openReview(page: Page, index = 0) {
+  const p = pane(page, index);
+  const pop = p.getByTestId('review-popover');
+  if (!(await pop.count())) await p.getByTestId('review-toggle').click();
+  await expect(pop).toBeVisible();
+  return pop;
+}
+
 export async function expectStatus(page: Page, sessionId: string, status: SessionStatus, timeout = 15_000) {
   await expect(row(page, sessionId)).toHaveAttribute('data-status', status, { timeout });
 }

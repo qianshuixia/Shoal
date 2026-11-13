@@ -4,6 +4,8 @@
 // `fullscreen` (alternate screen + mouse reporting), `flood N` (prints N KB),`exit N`, `usage <model> <message id> <input> <output> <cache read> <cache write>`
 // (writes a Claude-format usage line to the transcript), `/resume <id>` (switches to conversation <id> like claude's in-CLI
 // /resume: not a prompt, prints `RESUMED <id>`, sends SessionStart source=resume with the new id); anything else is a 300 ms turn.
+// `limits <5h %> <7d %> [5h reset in seconds]` (pipes a claude-style status line with rate_limits through hooks/statusline.mjs, then ends the turn).
+// `agylimits <5h %> <7d %> [5h reset in seconds]` (pipes an agy-style status line with Gemini `quota` buckets through hooks/statusline.mjs).
 // Keeps its own transcript (one JSON line per turn) at <tmp>/shoal-fake/<native id>.jsonl and reports it as transcript_path.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -11,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const NOTIFY = path.resolve(import.meta.dirname, '..', '..', 'hooks', 'notify.mjs');
+const STATUSLINE = path.resolve(import.meta.dirname, '..', '..', 'hooks', 'statusline.mjs');
 const sid = process.env.WORKBENCH_SESSION_ID ?? 'no-session';
 // `--resume <id>` reopens a conversation and keeps its native id, like the real CLIs.
 const resumeId = process.argv[2] === '--resume' ? process.argv[3] : undefined;
@@ -33,6 +36,17 @@ function hook(event, extra = {}) {
     p.on('exit', done);
     p.stdin.on('error', () => {});
     p.stdin.end(body);
+  }));
+}
+
+// Like claude's status line command: queued behind the hooks, fed the status JSON on stdin.
+function statusLine(status) {
+  hooks = hooks.then(() => new Promise((done) => {
+    const p = spawn(process.execPath, [STATUSLINE, 'fake'], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
+    p.on('error', done);
+    p.on('exit', done);
+    p.stdin.on('error', () => {});
+    p.stdin.end(JSON.stringify({ session_id: nativeId, ...status }));
   }));
 }
 
@@ -84,6 +98,24 @@ function submit() {
       hook('StopFailure', { error: 'rate_limit', last_assistant_message: msg });
       out('\r\n> ');
     }, 300);
+  } else if (cmd === 'limits') {
+    const now = Math.floor(Date.now() / 1000);
+    statusLine({ rate_limits: {
+      five_hour: { used_percentage: Number(arg), resets_at: now + (Number(rest[1]) || 7200) },
+      seven_day: { used_percentage: Number(rest[0]), resets_at: now + 5 * 86400 },
+    } });
+    workTimer = setTimeout(() => finishTurn(text), 300);
+  } else if (cmd === 'agylimits') {
+    const nowMs = Date.now();
+    const s5 = Number(rest[1]) || 7200;
+    const s7 = 5 * 86400;
+    const rem5 = (100 - Number(arg)) / 100;
+    const rem7 = (100 - Number(rest[0])) / 100;
+    statusLine({ quota: {
+      'gemini-5h': { ...(rem5 > 0 ? { remaining_fraction: rem5 } : {}), reset_time: new Date(nowMs + s5 * 1000).toISOString(), reset_in_seconds: s5 },
+      'gemini-weekly': { ...(rem7 > 0 ? { remaining_fraction: rem7 } : {}), reset_time: new Date(nowMs + s7 * 1000).toISOString(), reset_in_seconds: s7 },
+    } });
+    workTimer = setTimeout(() => finishTurn(text), 300);
   } else if (cmd === 'link') {
     out(`\x1b]8;;${arg}\x07${rest.join(' ') || arg}\x1b]8;;\x07`);
     mode = 'idle';

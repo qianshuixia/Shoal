@@ -6,6 +6,8 @@
 //    -> no archive toggle inside any project; one folded 已归档 section at the bottom, grouped by project.
 // 3. The archive fold is forgotten on reload -> open state survives reload.
 // 4. The task count clutters an expanded project -> shown only while collapsed.
+// 4b. Working is hard to spot -> bright title, a ring leaving the dot (none under reduced motion), and a folded
+//     project shows "N 工作中".
 // 5. Sidebar width: dragging does nothing, escapes its bounds, or is lost on reload
 //    -> follows the pointer, clamps to 13..32rem, survives reload, double-click resets to 17rem.
 import { test, expect, type Page } from '@playwright/test';
@@ -41,6 +43,24 @@ test('rows: running, approved, stopped; archive at the bottom; count only when c
   await expect(titles).toHaveText(['还在跑的', '后建的', '已通过的', '已停止的']);
 
   await expect(group(page, project.id).locator('.group-count')).toHaveCount(0);
+
+  // Working reads at a glance: bright title, a ring leaving the dot (still under reduced motion), and a folded
+  // project counts its working tasks ahead of its other chips.
+  await expectStatus(page, busy.session.id, 'working');
+  const busyRow = row(page, busy.session.id);
+  const ring = () => busyRow.getByTestId('row-glyph').evaluate((el) => getComputedStyle(el, '::after').animationName);
+  await expect(busyRow.locator('.task-title')).toHaveCSS('color', 'rgb(243, 244, 246)');
+  expect(await ring()).toBe('ping');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  expect(await ring()).toBe('none');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.screenshot({ path: path.join(OUT, 'working.png') });
+  await group(page, project.id).getByTestId('project-toggle').click();
+  await expect(group(page, project.id).getByTestId('group-live')).toHaveText('1 工作中');
+  // 后建的 has finished its turn by now (在等你 or 待验收): that chip follows the working mark.
+  await expect(group(page, project.id).locator('[data-testid="group-live"] + :is(.group-needs, .group-review)')).toHaveCount(1);
+  await page.screenshot({ path: path.join(OUT, 'working-folded.png') });
+  await group(page, project.id).getByTestId('project-toggle').click();
 
   // Archive the running one (confirm) and the stopped one.
   page.on('dialog', (d) => void d.accept());

@@ -18,7 +18,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Card, FeedbackResult, Snapshot } from '../shared/protocol.ts';
-import { FAKE_LOG, createFakeTask, createProject, expectStatus, fakeLines, pane, removeAllTasks, row, state, termText, token } from './helpers.ts';
+import { FAKE_LOG, createFakeTask, createProject, expectStatus, openReview, fakeLines, pane, removeAllTasks, row, state, termText, token } from './helpers.ts';
 
 const OUT = path.resolve('.tmp/m2');
 fs.mkdirSync(OUT, { recursive: true });
@@ -57,30 +57,56 @@ test.describe('待验收闭环', () => {
     await expect(page.getByTestId('review-count')).toHaveText('1');
     await expect(page.getByTestId('needs-you-count')).toHaveText('0');
     await expectStatus(page, other.id, 'working');
-    const bar = pane(page, 0).getByTestId('review-bar');
-    await expect(bar).toBeVisible();
-    await expect(bar.getByTestId('review-summary')).toHaveText('reply: build the login page');
+    // Approve sits right in the header; secondary actions float in a popover so .pane-body and the PTY size never move.
+    const pop = pane(page, 0).getByTestId('review-popover');
+    const chip = pane(page, 0).getByTestId('review-toggle');
+    const approveBtn = pane(page, 0).getByTestId('review-approve');
+    await expect(approveBtn).toBeVisible();
+    await expect(chip).toHaveAttribute('aria-expanded', 'false');
+    await expect(pop).toHaveCount(0);
+    const termHeight = async () => (await pane(page, 0).locator('.pane-body').boundingBox())!.height;
+    const termSize = () => page.evaluate((id) => (window as any).__wbTermSize(id), s1.id);
+    const baseHeight = await termHeight();
+    const baseSize = await termSize();
+    await chip.click();
+    await expect(chip).toHaveAttribute('aria-expanded', 'true');
+    await expect(pop).toBeVisible();
+    expect(await termHeight()).toBe(baseHeight);
+    expect(await termSize()).toEqual(baseSize);
+    // Escape closes the popover and hands focus back to the terminal without resizing.
+    await page.keyboard.press('Escape');
+    await expect(pop).toHaveCount(0);
+    expect(await termHeight()).toBe(baseHeight);
+    await chip.click();
+    await expect(pop.getByTestId('review-summary')).toHaveText('reply: build the login page');
     let st = await state(request);
     expect(cardsOf(st, task.id).map((c) => [c.kind, c.sessionId, c.body])).toEqual([['result', s1.id, 'reply: build the login page']]);
-    await bar.getByTestId('review-expand').click();
-    await expect(bar.getByTestId('review-body')).toHaveText('reply: build the login page');
+    await pop.getByTestId('review-expand').click();
+    await expect(pop.getByTestId('review-body')).toHaveText('reply: build the login page');
+    expect(await termHeight()).toBe(baseHeight);
+    expect(await termSize()).toEqual(baseSize);
     await page.screenshot({ path: path.join(OUT, 'review-bar.png') });
 
-    // The queue button opens it from elsewhere.
+    // The queue button opens it from elsewhere (clicking outside closes the popover).
     await row(page, other.id).click();
     await expect(pane(page, 0)).toHaveAttribute('data-session-id', other.id);
     await page.getByTestId('review-queue').click();
     await expect(pane(page, 0)).toHaveAttribute('data-session-id', s1.id);
 
-    // 2. Feedback -> new session; typing in the textarea never reaches the terminal.
-    await bar.getByTestId('review-feedback').click();
-    await expect(bar.getByTestId('feedback-new')).toBeDisabled();
-    const input = bar.getByTestId('feedback-input');
+    // 2. Feedback dialog -> new session; typing in the modal textarea never reaches the terminal.
+    await openReview(page);
+    await pop.getByTestId('review-feedback').click();
+    await expect(pop).toHaveCount(0);
+    const dlg = page.getByTestId('feedback-dialog');
+    await expect(dlg).toBeVisible();
+    await expect(dlg.getByTestId('feedback-new')).toBeDisabled();
+    const input = dlg.getByTestId('feedback-input');
     await input.fill('按钮改成蓝色');
     await input.press('Shift+Enter');
     await input.pressSequentially('第二行：加上忘记密码');
     await page.screenshot({ path: path.join(OUT, 'feedback-form.png') });
-    await bar.getByTestId('feedback-new').click();
+    await dlg.getByTestId('feedback-new').click();
+    await expect(dlg).toHaveCount(0);
     const s2 = await newSessionOf(request, task.id, s1.id);
     await expect(pane(page, 0)).toHaveAttribute('data-session-id', s2);
     expect(fakeLines(s1.id)).toEqual(['build the login page']);
@@ -95,19 +121,26 @@ test.describe('待验收闭环', () => {
     const fb = cardsOf(st, task.id).filter((c) => c.kind === 'feedback');
     expect(fb.map((c) => [c.sessionId, c.body])).toEqual([[s2, '按钮改成蓝色\n第二行：加上忘记密码']]);
 
-    // The new session's turn ends -> back in 待验收 with the new card.
+    // The new session's turn ends -> back in 待验收 with the new card, popover closed by default.
     await expectStatus(page, s2, 'needs_you');
     await expectPhase(page, task.id, 'review');
+    await expect(pop).toHaveCount(0);
+    await openReview(page);
     await expect(pane(page, 0).getByTestId('review-summary')).toHaveText('reply: 继续任务「做个登录页」。上一个会话已经结束，下面是你需要的上下文。');
+    await page.keyboard.press('Escape');
+    await expect(pop).toHaveCount(0);
     await expect(page.getByTestId('review-count')).toHaveText('1');
 
-    // 5. 通过 -> 已通过: out of 待验收, still in the list, not counted in 需要你; the session is untouched.
+    // 5. One-click 通过 directly in the pane header (without opening the popover) -> 已通过; terminal height unchanged.
+    const beforeApproveH = await termHeight();
     await pane(page, 0).getByTestId('review-approve').click();
     await expect(page.getByTestId('review-count')).toHaveText('0');
     await expectPhase(page, task.id, 'approved');
     await expect(taskRow(page, task.id).getByTestId('status')).toHaveText('已通过');
     await expect(page.getByTestId('needs-you-count')).toHaveText('0');
-    await expect(pane(page, 0).getByTestId('review-bar')).toHaveCount(0);
+    await expect(pane(page, 0).getByTestId('review-approve')).toHaveCount(0);
+    await expect(pane(page, 0).getByTestId('review-popover')).toHaveCount(0);
+    expect(await termHeight()).toBe(beforeApproveH);
     const group = page.locator(`[data-testid="project-group"][data-project-id="${project.id}"]`);
     await expect(group.getByTestId('archived-toggle')).toHaveCount(0);
     expect((await taskOf(request, task.id)).phase).toBe('approved');
@@ -175,7 +208,8 @@ test.describe('待验收闭环', () => {
     await expectPhase(page, task.id, 'active');
     await expect(page.getByTestId('review-count')).toHaveText('0');
 
-    // 3. Feedback while busy -> queued, nothing pasted yet.
+    // 3. Feedback while busy -> queued badge floats without shrinking .pane-body, nothing pasted yet.
+    const workingHeight = (await pane(page, 0).locator('.pane-body').boundingBox())!.height;
     const text = '改一下：\n第二行 with "quotes" and 中文';
     const res = await request.post(`/api/tasks/${task.id}/feedback`, { data: { text, mode: 'same' } });
     expect(res.ok(), await res.text()).toBeTruthy();
@@ -183,15 +217,17 @@ test.describe('待验收闭环', () => {
     expect(r.session.id).toBe(s1.id);
     expect(r.card.kind).toBe('feedback');
     await expect(pane(page, 0).getByTestId('pane-queued')).toBeVisible();
+    expect((await pane(page, 0).locator('.pane-body').boundingBox())!.height).toBe(workingHeight);
     await page.screenshot({ path: path.join(OUT, 'queued.png') });
     expect(fakeLines(s1.id)).toEqual(['first', 'sleep 3']);
 
-    // Delivered after the turn ends and 5 s after the last keystroke, as one submission.
+    // Delivered after the turn ends and 5 s after the last keystroke, as one submission; .pane-body stays the same height.
     await expect.poll(() => fakeLines(s1.id), { timeout: 20_000 }).toEqual(['first', 'sleep 3', text]);
     const entry = fs.readFileSync(FAKE_LOG, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
       .filter((e: { sessionId: string }) => e.sessionId === s1.id).at(-1) as { at: number };
     expect(entry.at - typedAt).toBeGreaterThanOrEqual(4900);
     await expect(pane(page, 0).getByTestId('pane-queued')).toHaveCount(0);
+    expect((await pane(page, 0).locator('.pane-body').boundingBox())!.height).toBe(workingHeight);
     expect((await state(request)).sessions.find((s) => s.id === s1.id)?.queued ?? 0).toBe(0);
     await expectPhase(page, task.id, 'review');
     await page.waitForTimeout(3000);
@@ -211,12 +247,11 @@ test.describe('待验收闭环', () => {
     await expectPhase(page, task.id, 'review');
     const native1 = (await state(request)).sessions.find((s) => s.id === s1.id)!.nativeSessionId;
 
-    // 4. UI: 写反馈 -> 发到原会话 resumes the conversation and pastes once it is idle.
-    const bar = pane(page, 0).getByTestId('review-bar');
-    await bar.getByTestId('review-feedback').click();
-    await bar.getByTestId('feedback-input').fill('再检查一遍');
-    await bar.getByTestId('feedback-same').click();
+    // 4. mode 'same' (API only since the button was dropped) resumes the conversation and pastes once it is idle.
+    const same = await request.post(`/api/tasks/${task.id}/feedback`, { data: { text: '再检查一遍', mode: 'same', cols: 120, rows: 30 } });
+    expect(same.ok(), await same.text()).toBeTruthy();
     const s2 = await newSessionOf(request, task.id, s1.id);
+    await row(page, s2).click();
     await expect(pane(page, 0)).toHaveAttribute('data-session-id', s2);
     await expect.poll(() => termText(page, s2)).toContain(`RESUMED ${native1}`);
     await expect.poll(() => fakeLines(s2), { timeout: 20_000 }).toEqual(['再检查一遍']);
@@ -288,6 +323,7 @@ test('待验收重启：强杀后卡片、阶段和反馈记录都还在，续�
     await expectPhase(page, a.task.id, 'review');
     await expect(page.getByTestId('review-count')).toHaveText('1');
     await taskRow(page, a.task.id).click();
+    await openReview(page);
     await expect(pane(page, 0).getByTestId('review-summary')).toHaveText('reply: alpha');
 
     // Feedback into the old conversation after the restart.

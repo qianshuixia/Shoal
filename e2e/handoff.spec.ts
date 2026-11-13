@@ -17,7 +17,7 @@ import { test, expect, type APIRequestContext, type Page } from '@playwright/tes
 import fs from 'node:fs';
 import path from 'node:path';
 import { forwardText, type Card, type Snapshot, type SwitchResult } from '../shared/protocol.ts';
-import { createFakeTask, createProject, expectStatus, fakeLines, pane, removeAllTasks, row, state, token } from './helpers.ts';
+import { createFakeTask, createProject, expectStatus, openReview, fakeLines, pane, removeAllTasks, row, state, token } from './helpers.ts';
 
 const OUT = path.resolve('.tmp/m3');
 fs.mkdirSync(OUT, { recursive: true });
@@ -108,9 +108,15 @@ test.describe('换 agent 和转发', () => {
     await expect(limitBar).toBeHidden();
     const strip = p0.getByTestId('pane-handoff');
     await expect(strip).toContainText('由 Fake 交接（自动整理）');
+    const handoffBaseH = (await p0.locator('.pane-body').boundingBox())!.height;
     await strip.getByTestId('pane-handoff-expand').click();
     await expect(p0.getByTestId('pane-handoff-body')).toContainText('FAKE-HANDOFF');
+    // Expanding the handoff body floats over the terminal instead of resizing .pane-body.
+    expect((await p0.locator('.pane-body').boundingBox())!.height).toBe(handoffBaseH);
     await page.screenshot({ path: path.join(OUT, 'handoff-strip.png') });
+    await page.keyboard.press('Escape');
+    await expect(p0.getByTestId('pane-handoff-body')).toHaveCount(0);
+    expect((await p0.locator('.pane-body').boundingBox())!.height).toBe(handoffBaseH);
 
     // The new session's turn ends normally -> back in 待验收; the old banner never comes back.
     await expectStatus(page, s2, 'needs_you');
@@ -202,6 +208,7 @@ test.describe('换 agent 和转发', () => {
     await expectStatus(page, dst.session.id, 'working');
 
     const p0 = pane(page, 0);
+    await openReview(page);
     await p0.getByTestId('review-forward').click();
     const dlg = page.getByTestId('forward-dialog');
     await expect(dlg).toBeVisible();
@@ -249,6 +256,7 @@ test.describe('换 agent 和转发', () => {
     await reviewed(page, src.task.id);
     const before = new Set((await state(request)).tasks.map((t) => t.id));
 
+    await openReview(page);
     await pane(page, 0).getByTestId('review-forward').click();
     const dlg = page.getByTestId('forward-dialog');
     await dlg.getByTestId('forward-target').selectOption(`new:${project.id}`);

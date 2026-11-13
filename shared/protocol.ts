@@ -33,6 +33,15 @@ export interface Task {
   createdAt: number;
   phase: TaskPhase; // missing in state saved before M2: loaded as 'active'
   phaseSince: number; // ms epoch of the last phase change (待验收 sorts by it)
+  lastPrompt?: string; // one-line preview of the latest prompt typed into the current session (see promptPreview); shown under the title
+}
+
+// Git state of a project directory, polled by the server. Derived: never persisted.
+// branch: current branch, or the short commit id when detached. dirty: changed + untracked entries.
+export interface GitInfo {
+  branch: string;
+  detached: boolean;
+  dirty: number;
 }
 
 // result: the agent's last reply when a turn ended (Stop hook). feedback: what the user wrote back.
@@ -73,6 +82,20 @@ export interface SessionInfo {
   limit?: { message: string; resetsAt: number | null; at: number };
 }
 
+// Subscription quota windows of one agent's account (claude: 5-hour and 7-day, codex: from its rollout's rate_limits,
+// agy: Gemini 5-hour and weekly buckets from its statusLine quota). Per agent kind, not per session; the latest
+// observation wins. Fed by the 'RateLimits' hook event (see below) and, for codex, read from the transcript on Stop.
+// Persisted to <stateDir>/quota.json. Agents without data have no entry.
+export interface QuotaWindow {
+  label: string; // '5h' / '7d', or generic ('60m', '2d')
+  usedPercent: number; // 0-100
+  resetsAt: number; // ms epoch; a window whose reset has passed is stale
+}
+export interface QuotaInfo {
+  windows: QuotaWindow[];
+  at: number; // ms epoch when observed
+}
+
 // Workbench-wide settings, stored in the state file.
 export interface Settings {
   aiTitles: boolean; // replace a task's first-line title with one written by a short headless call of its agent
@@ -86,6 +109,8 @@ export interface Snapshot {
   cards: Card[];
   agents: AgentKind[]; // agents that can be launched on this machine
   settings: Settings;
+  git: Record<string, GitInfo | null>; // by project id; null = not a git repo. Derived, not stored in state.json
+  quota: Partial<Record<AgentKind, QuotaInfo>>; // from <stateDir>/quota.json
 }
 
 // Nine muted colors that stay distinguishable on a dark background.
@@ -127,7 +152,12 @@ export const TASK_COLORS = [
 // POST   /api/open  { target } -> { action, path }  (a terminal link: file: URI or X:\ path, optional #L12 / :12:3 suffix; opens it in VS Code,
 //                                                Explorer or the default viewer, never executes it; 400 UNC / remote host / relative / other
 //                                                scheme, 404 missing file)
-// POST   /hook  Authorization: Bearer <token>  HookBody -> 204  (called by hooks/notify.mjs)
+// POST   /hook  Authorization: Bearer <token>  HookBody -> 204  (called by hooks/notify.mjs, and by hooks/statusline.mjs with the
+//                                                synthetic event 'RateLimits', payload { rate_limits } in claude's status line format
+//                                                ({ five_hour?, seven_day? }, each { used_percentage: 0-100, resets_at: unix seconds })
+//                                                or { quota } in agy's status line format ({ 'gemini-5h'?, 'gemini-weekly'?, ... },
+//                                                each { remaining_fraction?: 0-1, reset_time?: ISO string, reset_in_seconds?: number }).
+//                                                It updates the quota only: no effect on session status, log-based features or titles)
 
 // Token counts in one shape for all CLIs. input excludes cache reads/writes; output includes reasoning (reasoning is a subset).
 export interface UsageCounts {
@@ -306,6 +336,8 @@ export type ServerMsg =
   | { t: 'project-removed'; id: string } // sent after a task-removed for each of its tasks
   | { t: 'card'; card: Card }
   | { t: 'settings'; settings: Settings }
+  | { t: 'git'; projectId: string; git: GitInfo | null } // sent only when the value changed
+  | { t: 'quota'; agent: AgentKind; quota: QuotaInfo } // sent only when the windows changed
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per session right after snapshot
   | { t: 'out'; id: string; d: string };

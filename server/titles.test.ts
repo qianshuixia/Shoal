@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cleanTitle, titleFromPrompt, titleFromReply, titlePrompt, TITLE_PROMPT_HEAD } from './titles.ts';
+import { cleanTitle, promptPreview, titleFromPrompt, titleFromReply, titlePrompt, TITLE_PROMPT_HEAD } from './titles.ts';
 
 describe('titleFromPrompt', () => {
   it('uses the first non-empty line with whitespace collapsed', () => {
@@ -71,5 +71,22 @@ describe('titleFromReply', () => {
     expect(titleFromReply('')).toBe('');
     expect(titleFromReply('  \n \t ')).toBe('');
     expect(titleFromReply('""')).toBe('');
+  });
+});
+
+describe('promptPreview', () => {
+  it('joins all lines into one with whitespace collapsed', () => {
+    expect(promptPreview('  修复登录\n\n  再加测试\r\nok ')).toBe('修复登录 再加测试 ok');
+  });
+  it('drops image placeholders and absolute paths', () => {
+    expect(promptPreview('看 [Image #1] 和 "C:\\a b\\c.png" 以及 D:\\x\\y 的问题')).toBe('看 和 以及 的问题');
+  });
+  it('cuts at 120 code points', () => {
+    expect(promptPreview('字'.repeat(130))).toBe('字'.repeat(120) + '…');
+    expect(promptPreview('字'.repeat(120))).toBe('字'.repeat(120));
+  });
+  it('returns an empty string when nothing is left', () => {
+    expect(promptPreview('')).toBe('');
+    expect(promptPreview(' \n [Image #2] \n')).toBe('');
   });
 });

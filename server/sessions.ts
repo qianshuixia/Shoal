@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import pty from 'node-pty';
 import type { AgentKind, HookBody, ServerMsg, SessionInfo } from '../shared/protocol.ts';
-import { buildLaunch } from './agents.ts';
+import { agyUserStatusLine, buildLaunch, userStatusLine } from './agents.ts';
 import { detectLimit, readResetsAt } from './quota.ts';
 import { isStatusHook, isWorkingHook, reduceStatus } from './status.ts';
 import type { StatusEvent } from './status.ts';
@@ -177,6 +177,9 @@ export class SessionManager {
       WORKBENCH_PORT: String(this.cfg.port),
       WORKBENCH_HOOK_TOKEN: this.cfg.token,
     });
+    // Our status line (for the rate limits) replaces the user's own; the relay script runs theirs.
+    const userSl = o.agent === 'claude' ? userStatusLine(o.cwd) : o.agent === 'agy' ? agyUserStatusLine().command : undefined;
+    if (userSl) env.WORKBENCH_USER_STATUSLINE = userSl;
     const cols = clamp(o.cols ?? 120, 20, 500);
     const rows = clamp(o.rows ?? 36, 5, 200);
     const proc = pty.spawn(launch.file, launch.args, { name: 'xterm-256color', cols, rows, cwd: o.cwd, env });

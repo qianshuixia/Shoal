@@ -8,7 +8,7 @@ import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
   AgentKind, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, Project,
-  RenameTaskBody, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
+  GitInfo, RenameTaskBody, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
 } from '../shared/protocol.ts';
 import { canResume, feedbackPrompt, forwardText } from '../shared/protocol.ts';
 import { clipboardFiles } from './clipboard.ts';
@@ -17,14 +17,15 @@ import { capBody, lastReply } from './cards.ts';
 import { availableAgents, claudeResumeId, ROOT } from './agents.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
-import { detectLimit } from './quota.ts';
+import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, readCodexQuota } from './quota.ts';
 import { findEditor, OpenError, openAction, resolveOpenTarget, runOpen } from './open.ts';
 import { readTranscript } from './transcript.ts';
 import type { SessionManager } from './sessions.ts';
 import { pickColor } from './store.ts';
 import type { Store } from './store.ts';
 import type { Usage } from './usage.ts';
-import { titleFromPrompt, titleFromReply, titlePrompt } from './titles.ts';
+import { titleFromPrompt, titleFromReply, titlePrompt, promptPreview } from './titles.ts';
+import { gitInfo } from './git.ts';
 
 const MAX_BODY = 1024 * 1024;
 const DIST = path.join(ROOT, 'web', 'dist');
@@ -102,8 +103,49 @@ export function createApp(cfg: AppConfig) {
   const allowed = new Set([`http://127.0.0.1:${cfg.port}`, `http://localhost:${cfg.port}`]);
   if (process.env.WORKBENCH_DEV === '1') for (const o of ['http://127.0.0.1:5173', 'http://localhost:5173']) allowed.add(o);
 
+  // Git state per project: derived, memory only. Polled while a client is watching.
+  const gitMap = new Map<string, GitInfo | null>();
+  const gitBusy = new Set<string>();
+  const sameGit = (a: GitInfo | null | undefined, b: GitInfo | null) => a !== undefined && JSON.stringify(a) === JSON.stringify(b);
+  async function refreshGit(projectId: string): Promise<void> {
+    if (gitBusy.has(projectId)) return; // never overlap runs for one project
+    const project = store.getProject(projectId);
+    if (!project) return;
+    gitBusy.add(projectId);
+    try {
+      const info = await gitInfo(project.path);
+      if (!store.getProject(projectId)) return; // removed meanwhile
+      if (sameGit(gitMap.get(projectId), info)) return;
+      gitMap.set(projectId, info);
+      broadcast({ t: 'git', projectId, git: info });
+    } finally {
+      gitBusy.delete(projectId);
+    }
+  }
+  async function refreshAllGit(): Promise<void> {
+    for (const p of store.projects()) await refreshGit(p.id); // one at a time: git status on big repos is not free
+  }
+
+  // Subscription quota per agent kind: kept in <stateDir>/quota.json, broadcast when the windows change.
+  const quota = createQuotaStore(path.join(cfg.stateDir, 'quota.json'));
+  function observeQuota(body: HookBody): void {
+    const session = sessions.list().find(s => s.id === body.sessionId);
+    if (!session) return;
+    let windows = null;
+    if (body.event === 'RateLimits') {
+      const p = body.payload as Record<string, unknown> | null;
+      if (session.agent === 'agy') windows = parseAgyQuota(p?.quota, body.at);
+      else if (session.agent === 'claude' || session.agent === 'fake') windows = p?.quota ? parseAgyQuota(p.quota, body.at) : parseClaudeRateLimits(p?.rate_limits);
+    } else if (body.event === 'Stop' && session.agent === 'codex' && session.transcriptPath) {
+      windows = readCodexQuota(session.transcriptPath);
+    }
+    const info = windows && quota.set(session.agent, windows);
+    if (info) broadcast({ t: 'quota', agent: session.agent, quota: info });
+  }
+
   const snapshot = (): Snapshot => ({
     projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
+    git: Object.fromEntries(gitMap), quota: quota.all(),
   });
 
   const sizeOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
@@ -144,6 +186,7 @@ export function createApp(cfg: AppConfig) {
     const project: Project = { id: crypto.randomUUID(), name, path: abs, createdAt: Date.now() };
     store.addProject(project);
     broadcast({ t: 'project', project });
+    void refreshGit(project.id);
     return project;
   }
 
@@ -154,6 +197,7 @@ export function createApp(cfg: AppConfig) {
     const agent = body.agent as AgentKind;
     if (!availableAgents().includes(agent)) throw new HttpError(400, `智能体不可用：${String(body.agent)}`);
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+    const lastPrompt = promptPreview(prompt);
     let title = typeof body.title === 'string' ? body.title.trim() : '';
     let titleAuto = false;
     let fromPrompt = false;
@@ -168,7 +212,7 @@ export function createApp(cfg: AppConfig) {
     const task: Task = {
       id: crypto.randomUUID(), projectId: project.id, title, titleAuto, prompt, color: pickColor(store.tasks()),
       agent, sessionId: null, createdAt: Date.now(),
-      phase: 'active', phaseSince: Date.now(),
+      phase: 'active', phaseSince: Date.now(), ...(lastPrompt && { lastPrompt }),
     };
     let session;
     try {
@@ -406,6 +450,22 @@ export function createApp(cfg: AppConfig) {
     if (detectLimit(session.agent, 'Stop', (body.payload ?? {}) as Record<string, unknown>)) return; // out of quota, not a result
     addCard(task, session.id, 'result', lastReply(session.agent, body.payload) ?? '（没有拿到这一轮的最后回复，请看终端）');
     setPhase(task, 'review');
+    void refreshGit(task.projectId); // the turn probably changed files
+  }
+
+  // The latest prompt of the task's current session, as a second line under the title.
+  function updateLastPrompt(body: HookBody) {
+    const p = (body.payload ?? {}) as Record<string, unknown>;
+    const text = body.event === 'UserPromptSubmit' ? p.prompt : body.event === 'PreInvocation' ? p.lastUserInput : undefined;
+    if (typeof text !== 'string' || text.trimStart().startsWith('/')) return;
+    const preview = promptPreview(text);
+    if (!preview) return;
+    const session = sessions.list().find(s => s.id === body.sessionId);
+    const old = session ? store.getTask(session.taskId) : undefined;
+    if (!old || old.sessionId !== body.sessionId || old.lastPrompt === preview) return;
+    const task: Task = { ...old, lastPrompt: preview };
+    store.updateTask(task);
+    broadcast({ t: 'task', task });
   }
 
   // The first-line title is already showing; a short headless call of the task's agent writes a better one.
@@ -585,6 +645,7 @@ export function createApp(cfg: AppConfig) {
       const mine = store.tasks().filter(t => t.projectId === project.id);
       for (const t of mine) if (t.sessionId) sessions.remove(t.sessionId);
       store.removeProject(project.id);
+      gitMap.delete(project.id);
       for (const t of mine) broadcast({ t: 'task-removed', id: t.id });
       broadcast({ t: 'project-removed', id: project.id });
       return send(res, 200, { ok: true });
@@ -601,7 +662,9 @@ export function createApp(cfg: AppConfig) {
     const b = parseJson(await readBody(req)) as Partial<HookBody>;
     if (typeof b.sessionId !== 'string' || typeof b.event !== 'string') throw new HttpError(400, 'bad hook body');
     if (sessions.hook(b as HookBody)) { // unknown sessions are logged and ignored
+      observeQuota(b as HookBody);
       autoRename(b as HookBody);
+      updateLastPrompt(b as HookBody);
       if (b.event === 'Stop') onStop(b as HookBody);
     }
     send(res, 204);
@@ -643,7 +706,10 @@ export function createApp(cfg: AppConfig) {
     });
   });
 
-  server.on('close', () => clearInterval(archiveTimer));
+  // Poll git only while somebody is looking; unref so the timer never keeps the process alive.
+  const gitTimer = setInterval(() => { if (clients.size) void refreshAllGit(); }, 10_000);
+  gitTimer.unref();
+  server.on('close', () => { clearInterval(archiveTimer); clearInterval(gitTimer); });
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     const pathname = new URL(req.url ?? '/', 'http://x').pathname;
@@ -658,6 +724,7 @@ export function createApp(cfg: AppConfig) {
 
   wss.on('connection', ws => {
     clients.add(ws);
+    void refreshAllGit(); // fill in (or freshen) git state for a client that just opened
     ws.on('close', () => clients.delete(ws));
     ws.on('error', () => clients.delete(ws));
     ws.send(JSON.stringify({ t: 'snapshot', state: snapshot() } satisfies ServerMsg));

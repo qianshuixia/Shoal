@@ -95,6 +95,10 @@ kbd {
 .needs.on { background: var(--signal-bg); color: var(--signal); font-weight: 600; }
 .needs.on:hover:not(:disabled) { background: rgba(227, 182, 103, .2); }
 .needs.on .needs-dot { opacity: 1; }
+.quota { display: inline-flex; align-items: center; gap: 0.375rem; font-size: 0.75rem; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.quota-win + .quota-win::before { content: '·'; margin-right: 0.375rem; font-weight: 400; }
+.quota-win.warn { color: var(--signal); }
+.quota-win.full { font-weight: 600; }
 .top-right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
 .layout-icon { display: inline-block; width: 0.8125rem; height: 0.625rem; margin-right: 0.375rem; vertical-align: -1px; border: 1.5px solid currentColor; border-radius: 0.125rem; }
 .layout-icon.l2 { background: linear-gradient(currentColor, currentColor) center / 1.5px 100% no-repeat; }
@@ -128,10 +132,21 @@ kbd {
 .chev { flex: none; width: 0.875rem; height: 0.875rem; color: var(--text-3); transition: transform .15s; }
 .group-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
 .group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.group-branch {
+  flex: 0 100 auto; min-width: 0; display: inline-flex; align-items: center; gap: 0.25rem; padding: 0 0.4375rem; border-radius: 999px;
+  font-size: 0.6875rem; font-weight: 400; white-space: nowrap; color: var(--text-3); box-shadow: inset 0 0 0 1px var(--line);
+}
+.branch-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.branch-dirty { flex: none; opacity: .8; }
+.group-name { flex: 0 1 auto; }
 .group-count { margin-left: auto; color: var(--text-3); font-size: 0.75rem; }
 .group-needs { margin-left: auto; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.7188rem; white-space: nowrap; color: var(--signal); background: var(--signal-bg); }
 .group-review { margin-left: auto; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.7188rem; white-space: nowrap; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2); }
 .group-needs + .group-review { margin-left: 0.25rem; }
+/* Folded project with running tasks: "● N 工作中" ahead of the other marks. */
+.group-live { margin-left: auto; display: inline-flex; align-items: center; gap: 0.3125rem; font-size: 0.75rem; font-weight: 400; white-space: nowrap; color: var(--work); }
+.group-live::before { content: ""; width: 0.375rem; height: 0.375rem; border-radius: 50%; background: var(--work); }
+.group-live + .group-needs, .group-live + .group-review, .group-live + .group-count { margin-left: 0.5rem; }
 .group-empty { padding: 0.25rem 0.5rem 0.375rem 1.75rem; color: var(--text-3); font-size: 0.75rem; }
 
 .quick { position: relative; }
@@ -163,11 +178,23 @@ kbd {
 .task-row.in-pane { background: color-mix(in srgb, var(--c) 9%, var(--side)); color: var(--text-2); }
 .task-row.in-pane.pane-focused { background: color-mix(in srgb, var(--c) 18%, var(--side)); color: var(--text); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 30%, transparent); }
 .task-row.in-pane:hover { background: color-mix(in srgb, var(--c) 22%, var(--side)); }
+/* A row with a preview wraps it onto a second line. The ::before keeps the first line exactly as tall as a plain row
+   (its negative margin cancels the flex gap), so glyph, status, actions and agent icon stay level with the title. */
+.task-row.has-preview { height: auto; flex-wrap: wrap; row-gap: 0; padding-bottom: 0.3125rem; }
+.task-row.has-preview::before { content: ""; width: 0; height: 1.875rem; margin-right: -0.5rem; }
+.task-preview {
+  flex: 0 0 calc(100% - 1rem); margin-left: 1rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 0.75rem; line-height: 1rem; color: var(--text-3); text-align: left;
+}
+.task-row.in-pane .task-preview { flex-basis: calc(100% - 1.6875rem); margin-left: 1.6875rem; }
 /* Row layout: state glyph at the left edge, then the task-color swatch (only on rows shown in a pane), title, status, and the agent icon last, in its brand colors. */
 .task-swatch { width: 0.1875rem; height: 0.875rem; flex: none; border-radius: 0.125rem; background: var(--c); }
 .row-glyph { flex: none; box-sizing: border-box; width: 0.5rem; height: 0.5rem; border-radius: 50%; }
 .row-glyph.g-needs { background: var(--signal); }
-.row-glyph.g-working { background: var(--work); animation: breathe 2.4s ease-in-out infinite; }
+.row-glyph.g-working { position: relative; background: var(--work); }
+/* A ring leaving the dot: a change of shape is seen from the corner of the eye, a change of opacity is not. */
+.row-glyph.g-working::after { content: ""; position: absolute; inset: 0; border-radius: 50%; box-shadow: 0 0 0 0 var(--ring); animation: ping 1.8s cubic-bezier(.2, .6, .3, 1) infinite; }
+@keyframes ping { 70%, 100% { box-shadow: 0 0 0 0.4rem transparent; } }
 .row-glyph.g-review { border: 1.5px solid var(--text-2); }
 .row-glyph.g-idle { border: 1.5px solid var(--line-2); }
 .row-glyph.g-approved { border-radius: 0; width: 0.5rem; height: 0.3125rem; border-left: 1.5px solid var(--text-3); border-bottom: 1.5px solid var(--text-3); transform: translateY(-1px) rotate(-45deg) scale(.9); }
@@ -178,6 +205,11 @@ kbd {
 .task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-row .status { min-width: 3.25rem; text-align: right; }
 .task-row[data-status="exited"] .task-title { color: var(--text-3); }
+/* Keyed on the glyph the row shows, not data-status: a 待验收 / 已通过 row keeps a live session but is not "working". */
+.task-row:has(> .g-working) .task-title { color: var(--text); }
+/* The agent mark keeps its brand colours only on rows that are alive; elsewhere it would outshine the state. */
+.task-row:not(:has(> .g-working, > .g-needs)) .agent-icon { opacity: .45; filter: saturate(.35); }
+.task-row:hover .agent-icon { opacity: 1; filter: none; }
 /* Rename / close take the status slot on hover instead of reserving width. */
 .task-row { padding-right: 0.375rem; }
 .row-actions { display: none; flex: none; gap: 0.125rem; }
@@ -206,10 +238,9 @@ kbd {
 
 .status { flex: none; font-size: 0.75rem; white-space: nowrap; color: var(--text-3); }
 .status.st-idle { color: var(--text-2); }
-.status.st-working { color: var(--work); animation: breathe 2.4s ease-in-out infinite; }
+.status.st-working { color: var(--work); font-weight: 500; }
 .status.st-review { padding: 0 0.4375rem; border-radius: 999px; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2); }
 .status.st-needs_you { padding: 0 0.4375rem; border-radius: 999px; color: var(--signal); background: var(--signal-bg); font-weight: 600; }
-@keyframes breathe { 50% { opacity: .55; } }
 
 /* Panes */
 .main { display: grid; gap: 0.5rem; padding: 0.5rem; min-width: 0; min-height: 0; background: var(--bg); }
@@ -218,7 +249,7 @@ kbd {
 
 .pane {
   --c: var(--text-3);
-  display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
+  position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
   background: var(--term); border: 1px solid var(--line); border-radius: 0.5rem;
   transition: border-color .15s;
 }
@@ -254,13 +285,15 @@ kbd {
 .pane-rename { width: 1.25rem; height: 1.25rem; opacity: 0; }
 .pane-header:hover .pane-rename, .pane-rename:focus-visible { opacity: 1; }
 .pane-rename:hover:not(:disabled) { color: var(--text); background: var(--active); }
-.pane-agent { margin-left: auto; color: var(--text-3); font-size: 0.75rem; }
+.pane-agent { margin-left: auto; flex: none; color: var(--text-3); font-size: 0.75rem; }
+.pane-quota { flex: none; }
 @keyframes settle { from { background: color-mix(in srgb, var(--c) 32%, var(--surface)); } }
+.pane-stage { flex: 1; position: relative; min-height: 0; display: flex; flex-direction: column; }
 .pane-body { flex: 1; position: relative; min-height: 0; }
 .term-host { position: absolute; inset: 0.5rem 0.25rem 0.25rem 0.625rem; }
 .pane-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.5rem; color: var(--text-3); }
 .pane-empty-hint { font-size: 0.75rem; }
-.pane:has(.pane-empty) .pane-body { display: none; }
+.pane:has(.pane-empty) .pane-stage { display: none; }
 .pane-exited {
   display: flex; align-items: center; gap: 0.5rem; flex: none; height: 2.5rem; padding: 0 0.75rem;
   background: var(--surface); border-top: 1px solid var(--line); color: var(--text-2);
@@ -269,26 +302,54 @@ kbd {
 
 
 .pane-queued {
-  flex: none; padding: 0.3125rem 0.75rem; font-size: 0.75rem;
-  background: var(--surface); border-top: 1px solid var(--line); color: var(--text-3);
+  position: absolute; top: 0.5rem; right: 0.75rem; z-index: 12; pointer-events: none;
+  padding: 0.25rem 0.625rem; border-radius: 999px; font-size: 0.75rem;
+  background: var(--raised); border: 1px solid var(--line-2); color: var(--text-2);
+  box-shadow: 0 0.375rem 1.25rem rgba(0, 0, 0, .4);
 }
-.review-bar { flex: none; display: flex; flex-direction: column; background: var(--surface); border-top: 1px solid var(--line); }
-.review-line { display: flex; align-items: center; gap: 0.5rem; min-height: 2.5rem; padding: 0 0.75rem; }
-.review-label { flex: none; font-size: 0.75rem; padding: 0 0.4375rem; border-radius: 999px; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2); }
-.review-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+/* Header split pill: one-click Approve on the left, secondary actions & card text in a floating popover on the right. */
+.review-split {
+  flex: none; display: inline-flex; align-items: stretch; height: 1.375rem;
+  border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line-2); overflow: hidden;
+}
+.review-pass, .review-more {
+  display: inline-flex; align-items: center; border: 0; border-radius: 0; background: transparent; color: var(--text-2);
+  font-size: 0.75rem; line-height: 1.25rem;
+}
+.review-pass { gap: 0.25rem; padding: 0 0.5rem 0 0.4375rem; font-weight: 500; color: var(--text); }
+.review-pass .pass-icon { width: 0.75rem; height: 0.75rem; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+.review-more { padding: 0 0.3125rem; border-left: 1px solid var(--line-2); }
+.review-pass:hover:not(:disabled), .review-more:hover:not(:disabled), .review-more.on { background: var(--active); color: var(--text); }
+.review-more .chev { width: 0.75rem; height: 0.75rem; transform: rotate(90deg); }
+.review-more[aria-expanded="true"] .chev { transform: rotate(-90deg); }
+.review-popover {
+  position: absolute; top: 2.375rem; right: 0.625rem; z-index: 25;
+  width: min(23rem, calc(100% - 1.25rem)); max-height: calc(100% - 2.875rem);
+  display: flex; flex-direction: column;
+  background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.5rem;
+  box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .5); overflow: hidden;
+}
+.review-popover:has(.review-body) { width: min(32rem, calc(100% - 1.25rem)); }
+.review-menu { display: flex; flex-direction: column; padding: 0.25rem; flex: none; }
+.review-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 0.0625rem;
+  padding: 0.375rem 0.5625rem; background: transparent; border: 0; border-radius: 0.3125rem; text-align: left;
+}
+.review-item:hover:not(:disabled), .review-item:focus-visible { background: var(--active); outline: none; }
+.review-item-title { font-weight: 500; color: var(--text); }
+.review-item-desc { font-size: 0.7188rem; color: var(--text-3); }
+.review-card-foot {
+  display: flex; flex-direction: column; min-height: 0; border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+.review-card-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.3125rem 0.5rem 0.3125rem 0.6875rem; flex: none; }
+.review-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; color: var(--text-3); }
+.review-expand-btn { flex: none; font-size: 0.75rem; padding: 0.125rem 0.4375rem; }
 .review-body {
-  max-height: 40vh; overflow-y: auto; margin: 0 0.75rem 0.5rem; padding: 0.5rem 0.625rem;
-  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2);
+  flex: 1; min-height: 0; overflow-y: auto; margin: 0 0.5rem 0.5rem; padding: 0.5rem 0.625rem;
+  white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.75rem; color: var(--text-2);
   background: var(--term); border: 1px solid var(--line); border-radius: 0.375rem;
 }
-.review-write { display: flex; flex-direction: column; gap: 0.5rem; padding: 0 0.75rem 0.625rem; }
-.review-write textarea {
-  resize: vertical; min-height: 3.5rem; max-height: 30vh; padding: 0.375rem 0.5625rem; outline: none;
-  background: var(--bg); border: 1px solid var(--line-2); border-radius: 0.375rem;
-}
-.review-write textarea::placeholder { color: var(--text-3); }
-.review-write textarea:focus { border-color: var(--work); }
-.review-actions { display: flex; align-items: center; justify-content: flex-end; gap: 0.5rem; }
 /* One archive for all projects, folded at the bottom of the sidebar. */
 .archive { margin-top: 0.75rem; padding-top: 0.5rem; border-top: 1px solid var(--line); }
 .archived-toggle {
@@ -367,14 +428,16 @@ kbd {
   background: var(--signal-bg); border-bottom: 1px solid rgba(227, 182, 103, .25); color: var(--signal);
 }
 .limit-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.handoff-bar { flex: none; display: flex; flex-direction: column; background: var(--surface); border-bottom: 1px solid var(--line); }
+.handoff-bar { position: relative; z-index: 15; flex: none; background: var(--surface); border-bottom: 1px solid var(--line); }
 .handoff-line { display: flex; align-items: center; gap: 0.5rem; min-height: 1.75rem; padding: 0 0.75rem; font-size: 0.75rem; color: var(--text-3); }
 .handoff-line span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .handoff-line button { height: 1.25rem; padding: 0 0.5rem; font-size: 0.75rem; line-height: 1.125rem; background: transparent; }
 .handoff-body {
-  max-height: 40vh; overflow-y: auto; margin: 0 0.75rem 0.5rem; padding: 0.5rem 0.625rem;
+  position: absolute; top: calc(100% + 0.25rem); left: 0.5rem; right: 0.5rem; z-index: 20;
+  max-height: 45vh; overflow-y: auto; padding: 0.5rem 0.625rem;
   white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2);
-  background: var(--term); border: 1px solid var(--line); border-radius: 0.375rem;
+  background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.5rem;
+  box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .5);
 }
 .hint { color: var(--text-3); font-size: 0.75rem; }
 .modal .preview {

@@ -1,21 +1,22 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, Project, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, GitInfo, Project, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
 import { AGENT_LABEL, DEFAULT_SETTINGS, canResume } from '../../shared/protocol.ts';
 import { connect } from './ws.ts';
 import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, zoomKey, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
 import { Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { setPrivacy, usePrivacy } from './privacy.ts';
-import { ForwardDialog, ProjectDialog, SettingsDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
+import { FeedbackDialog, ForwardDialog, ProjectDialog, SettingsDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
 import { EditableTitle, PencilIcon, StatusTag } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
+import { liveWindows, QUOTA_AGENTS, QUOTA_WARN, quotaTitle } from './quota.ts';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
 
 type PaneSessions = [string | null, string | null];
-type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'search' | 'settings' | null;
+type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'feedback' | 'search' | 'settings' | null;
 type SideFilter = 'active' | 'all';
 type View = 'work' | 'stats';
 
@@ -106,7 +107,7 @@ function defaultAgentFor(d: Snapshot, projectId: string): AgentKind {
 }
 
 export function App() {
-  const [data, setData] = useState<Snapshot>({ projects: [], tasks: [], sessions: [], cards: [], agents: [], settings: DEFAULT_SETTINGS });
+  const [data, setData] = useState<Snapshot>({ projects: [], tasks: [], sessions: [], cards: [], agents: [], settings: DEFAULT_SETTINGS, git: {}, quota: {} });
   const [panes, setPanes] = useState<PaneSessions>([null, null]);
   const [focusedPane, setFocusedPane] = useState(0);
   const [layout, setLayout] = useState<1 | 2>(1);
@@ -271,6 +272,12 @@ export function App() {
         break;
       case 'settings':
         setData((d) => ({ ...d, settings: msg.settings }));
+        break;
+      case 'git':
+        setData((d) => ({ ...d, git: { ...d.git, [msg.projectId]: msg.git } }));
+        break;
+      case 'quota':
+        setData((d) => ({ ...d, quota: { ...d.quota, [msg.agent]: msg.quota } }));
         break;
       case 'card':
         setData((d) => ({ ...d, cards: upsert(d.cards, msg.card) }));
@@ -607,6 +614,21 @@ export function App() {
         >
           <span className="needs-dot" />待验收 <span data-testid="review-count">{reviewing.length}</span>
         </button>
+        {QUOTA_AGENTS.map((a) => {
+          const q = data.quota[a];
+          const ws = liveWindows(q, now);
+          if (!q || !ws.length) return null;
+          return (
+            <span key={a} className="quota" data-testid="quota" data-agent={a} title={quotaTitle(a, q, ws, now)}>
+              <AgentIcon agent={a} />
+              {ws.map((w) => (
+                <span key={w.label} className={`quota-win ${w.usedPercent >= QUOTA_WARN ? 'warn' : ''} ${w.usedPercent >= 100 ? 'full' : ''}`} data-testid="quota-window" data-label={w.label}>
+                  {w.label} {Math.round(w.usedPercent)}%
+                </span>
+              ))}
+            </span>
+          );
+        })}
         <div className="top-right">
           {/* Stepper, not a slider: the slider's rem width changed under the cursor while dragging. */}
           <div className="zoom" title="界面缩放，每次 5%：Ctrl+滚轮、Ctrl+= / Ctrl+-（终端里的 Ctrl+- 留给 CLI），Ctrl+0 恢复 100%；也可以点 −/+" onWheel={(e) => e.deltaY && zoomBy(e.deltaY < 0 ? 1 : -1)}>
@@ -711,6 +733,7 @@ export function App() {
               collapsed={collapsed.has(project.id)}
               agents={data.agents as AgentKind[]}
               defaultAgent={defaultAgentFor(data, project.id)}
+              git={data.git[project.id] ?? null}
               onToggle={() => toggleProject(project.id)}
               onReorder={reorderProject}
               onQuick={(agent) => void quickCreate(project.id, agent)}
@@ -742,6 +765,7 @@ export function App() {
           const id = panes[i];
           const session = id ? sessionsById.get(id) : undefined;
           const task = session ? tasksById.get(session.taskId) : undefined;
+          const paneAgent = task?.agent ?? session?.agent;
           const card = task ? data.cards.filter((c) => c.taskId === task.id && c.kind === 'result').at(-1) : undefined;
           return (
             <Pane
@@ -754,12 +778,17 @@ export function App() {
               focused={layout === 2 && focusedPane === i}
               dual={layout === 2}
               now={now}
+              quota={paneAgent ? data.quota[paneAgent] : undefined}
               onFocus={() => focusedPane !== i && setFocusedPane(i)}
               onRename={(title) => task && renameTask(task, title)}
               onResume={(fresh) => task && void resumeTask(task, fresh)}
               card={card}
               onApprove={() => task && void setPhase(task, 'approve')}
-              onFeedback={(text, mode) => (task ? sendFeedback(task, text, mode) : Promise.resolve(false))}
+              onFeedback={() => {
+                if (!task) return;
+                setDialogTarget(task.id);
+                setDialog('feedback');
+              }}
               onSwitch={() => {
                 if (!task) return;
                 setDialogTarget(task.id);
@@ -841,11 +870,39 @@ export function App() {
           onForward={(to, note) => forward(forwardCard, to, note)}
         />
       )}
+      {dialog === 'feedback' && tasksById.get(dialogTarget) && (
+        <FeedbackDialog
+          task={tasksById.get(dialogTarget)!}
+          onClose={() => {
+            setDialog(null);
+            setFocusTick((n) => n + 1);
+          }}
+          onFeedback={(text) => sendFeedback(tasksById.get(dialogTarget)!, text, 'new')}
+        />
+      )}
     </div>
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, onShowAll, collapsed, agents, defaultAgent, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
+// Long branch names keep their head and tail: feature prefixes and ticket suffixes are the parts that tell them apart.
+const middleCut = (s: string, max = 22) => {
+  const cps = [...s];
+  return cps.length > max ? cps.slice(0, 10).join('') + '…' + cps.slice(-10).join('') : s;
+};
+
+function BranchChip({ git }: { git: GitInfo }) {
+  const title = git.detached
+    ? `游离 HEAD ${git.branch}${git.dirty ? `，${git.dirty} 个文件有未提交的改动` : ''}`
+    : `分支 ${git.branch}${git.dirty ? `，${git.dirty} 个文件有未提交的改动` : ''}`;
+  return (
+    <span className="group-branch" data-testid="project-branch" data-private="" title={title}>
+      <span className="branch-name">{middleCut(git.branch)}</span>
+      {git.dirty > 0 && <span className="branch-dirty" data-testid="project-dirty">· {git.dirty}</span>}
+    </span>
+  );
+}
+
+function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, onShowAll, collapsed, agents, defaultAgent, git, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -857,6 +914,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   collapsed: boolean;
   agents: AgentKind[];
   defaultAgent: AgentKind;
+  git: GitInfo | null;
   onToggle(): void;
   onReorder(dragged: string, target: string, after: boolean): void;
   onQuick(agent: AgentKind): void;
@@ -872,6 +930,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   const [menu, setMenu] = useState(false);
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
   const reviewing = tasks.filter((t) => t.phase === 'review').length;
+  const working = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'working').length;
   // Running tasks first, then approved (done, session still open), stopped last; creation order within each.
   // Status changes inside a band (working / needs you / review) never move a row under the cursor.
   const band = (t: Task) => ((t.sessionId && sessionsById.get(t.sessionId)?.status) ?? 'exited') === 'exited' ? 2 : t.phase === 'approved' ? 1 : 0;
@@ -930,6 +989,8 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
         <button className="group-toggle" data-testid="project-toggle" title={privacy ? undefined : project.path} aria-expanded={!collapsed} onClick={onToggle}>
           <svg className="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
           <span className="group-name" data-private="">{project.name}</span>
+          {git && <BranchChip git={git} />}
+          {collapsed && working > 0 && <span className="group-live" data-testid="group-live">{working} 工作中</span>}
           {collapsed && waiting > 0 && <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>}
           {collapsed && reviewing > 0 && <span className="group-review" data-testid="group-review">{reviewing} 待验收</span>}
           {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.length || ''}</span>}
@@ -1085,9 +1146,12 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
   const status = session?.status ?? 'exited';
   const glyph = rowGlyph(task, session);
   const [editing, setEditing] = useState(false);
+  // The latest prompt as a second line, unless the row is closed or it only repeats the title.
+  const lastPrompt = task.lastPrompt ?? '';
+  const preview = task.phase !== 'archived' && status !== 'exited' && lastPrompt && !lastPrompt.startsWith(task.title.replace(/…$/, '')) ? lastPrompt : '';
   return (
     <div
-      className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''}`}
+      className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''} ${preview ? 'has-preview' : ''}`}
       style={{ '--c': task.color } as CSSProperties}
       data-testid="task-row"
       data-task-id={task.id}
@@ -1170,6 +1234,7 @@ function TaskRow({ task, session, inPane, paneFocused, paneMark, draggable, now,
         </span>
       )}
       <span className="agent-mark" title={AGENT_LABEL[task.agent] ?? task.agent}><AgentIcon agent={task.agent} /></span>
+      {preview && <span className="task-preview" data-testid="task-preview" data-private="">{preview}</span>}
     </div>
   );
 }

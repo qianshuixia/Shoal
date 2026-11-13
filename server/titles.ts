@@ -14,6 +14,15 @@ export function titleFromPrompt(text: string): string {
   return '';
 }
 
+const MAX_PREVIEW = 120;
+
+// Whole prompt on one line (noise removed, whitespace collapsed), cut to 120 code points (+ '…'). '' if nothing usable.
+export function promptPreview(text: string): string {
+  const s = text.replace(NOISE, ' ').replace(/\s+/g, ' ').trim();
+  const cps = [...s];
+  return cps.length > MAX_PREVIEW ? cps.slice(0, MAX_PREVIEW).join('') + '…' : s;
+}
+
 // A title saved before the noise filter existed, cleaned the same way; unchanged if cleaning leaves nothing.
 // A placeholder cut off by the 24-character limit ("[Ima…") goes too.
 export function cleanTitle(title: string): string {
