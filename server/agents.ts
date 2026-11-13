@@ -110,6 +110,149 @@ export function agyUserStatusLine(): { command?: string; stackWithDefault: boole
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AGY_SENDER_RE = /sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
+const AGY_USER_EXPLICIT_RE = /"source"\s*:\s*"USER_EXPLICIT"/;
+const AGY_BRAIN_PATH_RE = /[/\\]brain[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[/\\]|$)/i;
+
+export type AgyConversationState =
+  | { kind: 'main' }
+  | { kind: 'subagent'; parentIds: string[]; hasUserTurn: boolean }
+  | { kind: 'missing' };
+
+function readFirstLine(fd: number, maxBytes = 256 * 1024): string {
+  const chunk = Buffer.allocUnsafe(16 * 1024);
+  const parts: Buffer[] = [];
+  let pos = 0;
+  while (pos < maxBytes) {
+    const n = fs.readSync(fd, chunk, 0, chunk.length, pos);
+    if (n <= 0) break;
+    const nl = chunk.subarray(0, n).indexOf(0x0a);
+    if (nl >= 0) {
+      parts.push(Buffer.from(chunk.subarray(0, nl)));
+      break;
+    }
+    parts.push(Buffer.from(chunk.subarray(0, n)));
+    pos += n;
+  }
+  return parts.length ? Buffer.concat(parts).toString('utf8').trim() : '';
+}
+
+// Inspects <AGY_CONFIG_DIR>/brain/<id>/.system_generated/logs/transcript*.jsonl.
+// User conversations start with source=USER_EXPLICIT; subagents and non-forked swarm workers start with source=SYSTEM
+// carrying `sender=<parent-uuid>` in their leading system messages. Never throws.
+export function agyConversationState(id: string): AgyConversationState {
+  if (!UUID_RE.test(id)) return { kind: 'missing' };
+  const logsDir = path.join(
+    process.env.AGY_CONFIG_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli'),
+    'brain', id, '.system_generated', 'logs',
+  );
+  for (const name of ['transcript.jsonl', 'transcript_full.jsonl']) {
+    const file = path.join(logsDir, name);
+    let fd: number;
+    try {
+      fd = fs.openSync(file, 'r');
+    } catch {
+      continue;
+    }
+    try {
+      const firstLine = readFirstLine(fd);
+      if (!firstLine) continue;
+      const first = JSON.parse(firstLine) as Record<string, unknown>;
+      if (!first || typeof first !== 'object' || Array.isArray(first)) continue;
+      if (first.source !== 'SYSTEM' && first.type !== 'SYSTEM_MESSAGE') return { kind: 'main' };
+
+      const parentIds: string[] = [];
+      const seen = new Set<string>();
+      const collectSenders = (content: unknown) => {
+        if (typeof content !== 'string') return;
+        for (const m of content.matchAll(AGY_SENDER_RE)) {
+          const key = m[1].toLowerCase();
+          if (!seen.has(key)) {
+            seen.add(key);
+            parentIds.push(m[1]);
+          }
+        }
+      };
+      collectSenders(first.content);
+
+      const size = fs.fstatSync(fd).size;
+      const headLen = Math.min(size, 64 * 1024);
+      const headBuf = Buffer.allocUnsafe(headLen);
+      const got = fs.readSync(fd, headBuf, 0, headLen, 0);
+      const headText = headBuf.subarray(0, got).toString('utf8');
+      for (const rawLine of headText.split('\n').slice(1)) {
+        const l = rawLine.trim();
+        if (!l) continue;
+        let obj: Record<string, unknown>;
+        try {
+          obj = JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          break;
+        }
+        if (obj.source !== 'SYSTEM' && obj.type !== 'SYSTEM_MESSAGE') break;
+        collectSenders(obj.content);
+      }
+
+      let hasUserTurn = AGY_USER_EXPLICIT_RE.test(headText);
+      if (!hasUserTurn && size > headLen) {
+        const scanLen = Math.min(size, 16 * 1024 * 1024);
+        const fullBuf = Buffer.allocUnsafe(scanLen);
+        const n = fs.readSync(fd, fullBuf, 0, scanLen, 0);
+        hasUserTurn = AGY_USER_EXPLICIT_RE.test(fullBuf.subarray(0, n).toString('utf8'));
+      }
+      return { kind: 'subagent', parentIds, hasUserTurn };
+    } catch {
+      continue;
+    } finally {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+  return { kind: 'missing' };
+}
+
+function resolveAgyMain(startId: string | null | undefined): string | undefined {
+  if (!startId || !UUID_RE.test(startId)) return undefined;
+  const queue = [startId];
+  const seen = new Set([startId.toLowerCase()]);
+  while (queue.length && seen.size <= 16) {
+    const cur = queue.shift()!;
+    const st = agyConversationState(cur);
+    if (st.kind === 'main') return cur;
+    if (st.kind === 'subagent') {
+      // Preserve a worker conversation only when the user already explicitly sent turns inside it.
+      if (cur === startId && st.hasUserTurn) return cur;
+      for (const p of st.parentIds) {
+        const key = p.toLowerCase();
+        if (!seen.has(key) && seen.size < 16) {
+          seen.add(key);
+          queue.push(p);
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+// Conversation id to pass to `agy --conversation`: prefers the last primary transcript's conversation (recovering from
+// historical in-CLI /resume switches or nested `agy -p` SessionStart overwrites) and walks `sender=<parent>` out of
+// background subagents / swarm workers back to the main coordinator conversation. Undefined if nothing exists on disk.
+export function agyResumeId(native: string | null, transcriptPath: string | undefined): string | undefined {
+  const tpId = typeof transcriptPath === 'string' ? transcriptPath.match(AGY_BRAIN_PATH_RE)?.[1] : undefined;
+  return resolveAgyMain(tpId) ?? resolveAgyMain(native);
+}
+
+export function agyTranscriptFile(id: string): string | undefined {
+  if (!UUID_RE.test(id)) return undefined;
+  const logsDir = path.join(
+    process.env.AGY_CONFIG_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli'),
+    'brain', id, '.system_generated', 'logs',
+  );
+  for (const name of ['transcript_full.jsonl', 'transcript.jsonl']) {
+    const f = path.join(logsDir, name);
+    if (fs.existsSync(f)) return f;
+  }
+  return undefined;
+}
 
 // Conversation id to pass to `claude --resume`: the recorded id if its file exists; otherwise the transcript the last
 // hook reported (records saved before in-CLI /resume switches were tracked still hold the launch id).

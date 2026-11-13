@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import pty from 'node-pty';
 import type { AgentKind, HookBody, ServerMsg, SessionInfo } from '../shared/protocol.ts';
-import { agyUserStatusLine, buildLaunch, userStatusLine } from './agents.ts';
+import { agyConversationState, agyUserStatusLine, buildLaunch, userStatusLine } from './agents.ts';
 import { detectLimit, readResetsAt } from './quota.ts';
 import { isStatusHook, isWorkingHook, reduceStatus } from './status.ts';
 import type { StatusEvent } from './status.ts';
@@ -26,6 +26,7 @@ export const ENV_STRIP = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_AGENT|CODEX_SANDBOX|C
 
 interface Live {
   info: SessionInfo;
+  cwd: string;
   proc: pty.IPty;
   buf: string;
   quiet: NodeJS.Timeout | null;
@@ -83,6 +84,64 @@ export function nativeIdUpdate(
   if (current === null) return { id: incoming };
   if (event !== 'SessionStart') return undefined;
   return { id: incoming, resumable: source === 'resume' };
+}
+
+const normPath = (p: string) => {
+  const clean = path.resolve(p.replace(/^\\\\\?\\/, '')).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? clean.toLowerCase() : clean;
+};
+
+// Interactive agy sessions launched by Shoal carry both the project cwd and `<stateDir>/agy-hooks` in workspacePaths.
+// A nested `agy -p` run inside a shell tool (or a branched worker workspace) lacks the project cwd.
+export function agyPrimaryWorkspaces(cwd: string, stateDir: string, workspacePaths: unknown): boolean {
+  if (!Array.isArray(workspacePaths)) return true;
+  const have = new Set(workspacePaths.filter((x): x is string => typeof x === 'string' && x.length > 0).map(normPath));
+  return have.has(normPath(cwd)) && have.has(normPath(path.join(stateDir, 'agy-hooks')));
+}
+
+// agy emits Stop with `fullyIdle: false` (or `continuationActive: true`) when the main agent pauses its turn solely to
+// wait on async subagents or background commands and will auto-resume without user input.
+export function isAgyIntermediateStop(p: Record<string, unknown>): boolean {
+  if (typeof p.error === 'string' && p.error.trim() !== '') return false;
+  if (detectLimit('agy', 'Stop', p)) return false;
+  return p.fullyIdle === false || p.continuationActive === true;
+}
+
+export type AgyHookAction =
+  | { kind: 'ignore' } // subagent, swarm worker, or nested CLI: logged for token usage, ignored for session/task state
+  | { kind: 'intermediate-stop'; nativeId?: string; resumable?: boolean }
+  | { kind: 'primary'; nativeId?: string; resumable?: boolean };
+
+// Classifies an agy hook so background subagents (`invoke_subagent`), swarm workers, and nested `agy -p` calls never
+// hijack `nativeSessionId` / `transcriptPath` or trigger premature `待验收` cards, while genuine in-TUI `/resume` or
+// `/new` conversation switches (which enter via SessionStart or PreInvocation with a non-empty lastUserInput) still track.
+export function agyHookDisposition(opts: {
+  currentId: string | null;
+  event: string;
+  payload: Record<string, unknown>;
+  cwd: string;
+  stateDir: string;
+}): AgyHookAction {
+  const { currentId, event, payload: p, cwd, stateDir } = opts;
+  if (event === 'RateLimits') return { kind: 'primary' };
+  const conv = typeof p.conversationId === 'string' ? p.conversationId : '';
+  if (!conv) return { kind: 'ignore' };
+  if (currentId === null) {
+    if (!agyPrimaryWorkspaces(cwd, stateDir, p.workspacePaths)) return { kind: 'ignore' };
+    if (agyConversationState(conv).kind === 'subagent') return { kind: 'ignore' };
+    if (event === 'Stop' && isAgyIntermediateStop(p)) return { kind: 'intermediate-stop', nativeId: conv };
+    return { kind: 'primary', nativeId: conv };
+  }
+  if (conv !== currentId) {
+    if (event !== 'SessionStart' && event !== 'PreInvocation') return { kind: 'ignore' };
+    if (!agyPrimaryWorkspaces(cwd, stateDir, p.workspacePaths)) return { kind: 'ignore' };
+    if (typeof p.lastUserInput !== 'string' || p.lastUserInput.trim() === '') return { kind: 'ignore' };
+    const st = agyConversationState(conv);
+    if (st.kind === 'subagent' && !st.hasUserTurn) return { kind: 'ignore' };
+    return { kind: 'primary', nativeId: conv, resumable: true };
+  }
+  if (event === 'Stop' && isAgyIntermediateStop(p)) return { kind: 'intermediate-stop' };
+  return { kind: 'primary' };
 }
 
 // Text safe to paste: no paste markers or control characters other than newline and tab.
@@ -189,7 +248,7 @@ export class SessionManager {
         id, taskId: o.taskId, agent: o.agent, nativeSessionId: launch.nativeSessionId, resumable: Boolean(o.resume || o.prompt),
         status: 'starting', statusSince: now, startedAt: now, exitCode: null, cols, rows,
       },
-      proc, buf: '', quiet: null, removed: false,
+      cwd: o.cwd, proc, buf: '', quiet: null, removed: false,
       queue: [], permBlocked: false, lastInputAt: 0, lastDeliveryAt: 0, modes: new Map(), tail: '', trimmed: false, firstOutAt: 0,
     };
     this.live.set(id, s);
@@ -248,21 +307,47 @@ export class SessionManager {
       return false;
     }
     const p = (body.payload ?? {}) as Record<string, unknown>;
-    const native = s.info.agent === 'agy' ? p.conversationId : p.session_id;
     let changed = false;
-    const nativeUpdate = nativeIdUpdate(s.info.nativeSessionId, body.event, native, p.source);
-    if (nativeUpdate) {
-      s.info.nativeSessionId = nativeUpdate.id;
-      if (nativeUpdate.resumable !== undefined) s.info.resumable = nativeUpdate.resumable;
-      changed = true;
+    if (s.info.agent === 'agy') {
+      const act = agyHookDisposition({
+        currentId: s.info.nativeSessionId,
+        event: body.event,
+        payload: p,
+        cwd: s.cwd,
+        stateDir: this.cfg.stateDir,
+      });
+      if (act.kind === 'ignore') return false;
+      if (act.nativeId && act.nativeId !== s.info.nativeSessionId) {
+        s.info.nativeSessionId = act.nativeId;
+        if (act.resumable !== undefined) s.info.resumable = act.resumable;
+        changed = true;
+      }
+      const tp = p.transcript_path ?? p.transcriptPath;
+      if (typeof tp === 'string' && tp && tp !== s.info.transcriptPath) {
+        s.info.transcriptPath = tp;
+        changed = true;
+      }
+      if (act.kind === 'intermediate-stop') {
+        const prevStatus = s.info.status;
+        this.apply(s, { type: 'hook', event: 'PreInvocation' });
+        if (changed && s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
+        return false;
+      }
+    } else {
+      const nativeUpdate = nativeIdUpdate(s.info.nativeSessionId, body.event, p.session_id, p.source);
+      if (nativeUpdate) {
+        s.info.nativeSessionId = nativeUpdate.id;
+        if (nativeUpdate.resumable !== undefined) s.info.resumable = nativeUpdate.resumable;
+        changed = true;
+      }
+      const tp = p.transcript_path ?? p.transcriptPath;
+      if (typeof tp === 'string' && tp && tp !== s.info.transcriptPath) {
+        s.info.transcriptPath = tp;
+        changed = true;
+      }
     }
     if (!s.info.resumable && PROMPT_EVENTS.has(body.event)) {
       s.info.resumable = true;
-      changed = true;
-    }
-    const tp = p.transcript_path ?? p.transcriptPath;
-    if (typeof tp === 'string' && tp && tp !== s.info.transcriptPath) {
-      s.info.transcriptPath = tp;
       changed = true;
     }
     const lim = detectLimit(s.info.agent, body.event, p);

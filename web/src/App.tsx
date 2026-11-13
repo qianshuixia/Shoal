@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, GitInfo, Project, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
 import { AGENT_LABEL, DEFAULT_SETTINGS, canResume } from '../../shared/protocol.ts';
 import { connect } from './ws.ts';
-import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, zoomKey, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
+import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
 import { Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
+import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
+import { matchProjectFileLink } from './linkParse.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
 import { FeedbackDialog, ForwardDialog, ProjectDialog, SettingsDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
 import { EditableTitle, PencilIcon, StatusTag } from './bits.tsx';
@@ -16,9 +18,12 @@ import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
 
 type PaneSessions = [string | null, string | null];
+type LayoutMode = 1 | 2 | 'inspect';
 type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'feedback' | 'search' | 'settings' | null;
 type SideFilter = 'active' | 'all';
 type View = 'work' | 'stats';
+
+const paneCount = (l: LayoutMode): 1 | 2 => (l === 2 ? 2 : 1);
 
 declare global {
   interface Window {
@@ -82,6 +87,17 @@ function loadSide(): number {
   return Number.isFinite(v) && v > 0 ? clampSide(v) : SIDE_DEFAULT;
 }
 
+// Right Inspector width share in percent of the main work area (28%..68%), double-click resets to 50%.
+const INSPECT_SPLIT_KEY = 'wb.inspectSplit';
+const INSPECT_SPLIT_DEFAULT = 50;
+const INSPECT_SPLIT_MIN = 28;
+const INSPECT_SPLIT_MAX = 68;
+const clampInspectSplit = (v: number) => Math.min(INSPECT_SPLIT_MAX, Math.max(INSPECT_SPLIT_MIN, Math.round(v * 2) / 2));
+function loadInspectSplit(): number {
+  const v = Number(localStorage.getItem(INSPECT_SPLIT_KEY));
+  return Number.isFinite(v) && v > 0 ? clampInspectSplit(v) : INSPECT_SPLIT_DEFAULT;
+}
+
 // Sessions that want the user, oldest first: asked a question (需要你, task still active) / finished a task (待验收).
 const needsList = (d: Snapshot): string[] => {
   const phase = new Map(d.tasks.map((t) => [t.id, t.phase]));
@@ -110,7 +126,12 @@ export function App() {
   const [data, setData] = useState<Snapshot>({ projects: [], tasks: [], sessions: [], cards: [], agents: [], settings: DEFAULT_SETTINGS, git: {}, quota: {} });
   const [panes, setPanes] = useState<PaneSessions>([null, null]);
   const [focusedPane, setFocusedPane] = useState(0);
-  const [layout, setLayout] = useState<1 | 2>(1);
+  const [layout, setLayout] = useState<LayoutMode>(1);
+  const [inspectSplit, setInspectSplit] = useState(loadInspectSplit);
+  const [pinnedInspectProjectId, setPinnedInspectProjectId] = useState<string | null>(null);
+  const [inspectReq, setInspectReq] = useState<InspectOpenRequest | null>(null);
+  const [inspectWatchRev, setInspectWatchRev] = useState(0);
+  const inspectSeqRef = useRef(0);
   const [connected, setConnected] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [dialogTarget, setDialogTarget] = useState(''); // task id (switch) or card id (forward) the open dialog is about
@@ -144,6 +165,10 @@ export function App() {
   }, [sideW]);
 
   useEffect(() => {
+    localStorage.setItem(INSPECT_SPLIT_KEY, String(inspectSplit));
+  }, [inspectSplit]);
+
+  useEffect(() => {
     localStorage.setItem(FILTER_KEY, filter);
   }, [filter]);
 
@@ -167,8 +192,9 @@ export function App() {
   // A given pane (drag and drop) takes the session, swapping with the other pane if it showed it.
   const showSession = useCallback((id: string, pane?: number) => {
     const s = live.current;
-    const shown = s.panes.slice(0, s.layout).indexOf(id);
-    const target = pane ?? (shown !== -1 ? shown : s.focusedPane);
+    const count = paneCount(s.layout);
+    const shown = s.panes.slice(0, count).indexOf(id);
+    const target = pane ?? (shown !== -1 ? shown : count === 2 ? s.focusedPane : 0);
     setPanes((p) => {
       const next: PaneSessions = [...p];
       const other = 1 - target;
@@ -177,6 +203,7 @@ export function App() {
       return next;
     });
     setFocusedPane(target);
+    setPinnedInspectProjectId(null);
     setView('work');
     setFocusTick((n) => n + 1);
     // Reveal the row if its project is folded.
@@ -210,7 +237,7 @@ export function App() {
     showSession(session.id);
   }, [showSession]);
 
-  const focusedSessionOf = (s: typeof live.current) => s.panes[s.layout === 1 ? 0 : s.focusedPane];
+  const focusedSessionOf = (s: typeof live.current) => s.panes[s.layout === 2 ? s.focusedPane : 0];
 
   // One click / one key: new task in the project, title filled in later from the first prompt.
   const quickCreate = useCallback(async (projectId: string, agent: AgentKind) => {
@@ -263,6 +290,7 @@ export function App() {
         break;
       case 'task':
         setData((d) => ({ ...d, tasks: upsert(d.tasks, msg.task) }));
+        setInspectWatchRev((n) => n + 1);
         break;
       case 'task-removed':
         removeTaskLocal(msg.id);
@@ -275,6 +303,7 @@ export function App() {
         break;
       case 'git':
         setData((d) => ({ ...d, git: { ...d.git, [msg.projectId]: msg.git } }));
+        setInspectWatchRev((n) => n + 1);
         break;
       case 'quota':
         setData((d) => ({ ...d, quota: { ...d.quota, [msg.agent]: msg.quota } }));
@@ -313,11 +342,43 @@ export function App() {
     return () => clearInterval(timer);
   }, []);
 
+  const switchLayout = useCallback((next: LayoutMode, focusTerminal = true) => {
+    const s = live.current;
+    if (s.layout === 2 && next !== 2) {
+      setPanes([s.panes[s.focusedPane], null]);
+      setFocusedPane(0);
+    }
+    setLayout(next);
+    if (focusTerminal) setFocusTick((n) => n + 1);
+  }, []);
+
+  const openInspectorAt = useCallback((projectId: string, tab: InspectorTab, filePath?: string, line?: number, col?: number) => {
+    setView('work');
+    setPinnedInspectProjectId(projectId);
+    switchLayout('inspect', !line);
+    const seq = ++inspectSeqRef.current;
+    setInspectReq({ projectId, tab, filePath, line, col, seq });
+  }, [switchLayout]);
+
   useEffect(() => {
     window.__wbTermText = termText;
     window.__wbTermFontSize = termFontSize;
     window.__wbTermSize = sizeOf;
     setTermNotice(setNotice);
+    setTermFileLinkHandler(async (uri: string) => {
+      const match = matchProjectFileLink(uri, live.current.data.projects);
+      if (!match) return false;
+      try {
+        const res = await fetch(`/api/projects/${encodeURIComponent(match.project.id)}/file?path=${encodeURIComponent(match.relPosix)}&stat=1`);
+        if (!res.ok) return false;
+        const stat = (await res.json()) as FilePayload;
+        if (stat.kind !== 'text' && stat.kind !== 'image') return false;
+        openInspectorAt(match.project.id, 'files', match.relPosix, match.line, match.col);
+        return true;
+      } catch {
+        return false;
+      }
+    });
     const onKey = (e: KeyboardEvent) => {
       const zoom = zoomKey(e);
       const inTerm = e.target instanceof Element && !!e.target.closest('.xterm');
@@ -331,10 +392,19 @@ export function App() {
       const isSearch = isSearchKey(e);
       const isJump = isJumpKey(e);
       const isNew = isNewTaskKey(e);
-      if (paneKey === null && !isSearch && !isJump && !isNew) return;
+      const isInspect = isInspectKey(e);
+      if (paneKey === null && !isSearch && !isJump && !isNew && !isInspect) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.type !== 'keydown' || e.repeat) return;
+      if (isInspect) {
+        const s = live.current;
+        if (!s.dialog) {
+          setView('work');
+          switchLayout(s.layout === 'inspect' ? 1 : 'inspect');
+        }
+        return;
+      }
       if (paneKey !== null) {
         const s = live.current;
         if (s.layout === 2 && !s.dialog) {
@@ -374,17 +444,19 @@ export function App() {
     };
     window.addEventListener('beforeunload', onUnload);
     return () => {
+      setTermFileLinkHandler(null);
       window.removeEventListener('keydown', onKey, true);
       window.removeEventListener('wheel', onWheel, true);
       window.removeEventListener('beforeunload', onUnload);
     };
-  }, [jump, quickCreate]);
+  }, [jump, quickCreate, switchLayout, openInspectorAt]);
 
   // Focus after Pane attaches its terminal, before the browser paints the new session.
   useLayoutEffect(() => {
     if (dialog) return;
-    focusOnly(view === 'work' ? panes[layout === 1 ? 0 : focusedPane] : null);
-  }, [panes, focusedPane, layout, dialog, focusTick, view]);
+    focusOnly(view === 'work' ? panes[layout === 2 ? focusedPane : 0] : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panes, focusedPane, dialog, focusTick, view]);
 
   // Hidden terminals skip fitting; refit once the workbench is shown again (the zoom may have changed meanwhile).
   useEffect(() => {
@@ -392,17 +464,6 @@ export function App() {
     const raf = requestAnimationFrame(() => live.current.panes.forEach((id) => id && fitEntry(id)));
     return () => cancelAnimationFrame(raf);
   }, [view]);
-
-  const toggleLayout = () => {
-    if (layout === 2) {
-      setPanes([panes[focusedPane], null]);
-      setFocusedPane(0);
-      setLayout(1);
-    } else {
-      setLayout(2);
-    }
-    setFocusTick((n) => n + 1);
-  };
 
   // ×: an archived task is deleted for good; any other is archived and its session process ended (resumable after 恢复).
   const removeTask = async (task: Task) => {
@@ -450,7 +511,7 @@ export function App() {
   const resumeTask = async (task: Task, fresh = false) => {
     const s = live.current;
     const old = task.sessionId;
-    const pane = old ? s.panes.slice(0, s.layout).indexOf(old) : -1;
+    const pane = old ? s.panes.slice(0, paneCount(s.layout)).indexOf(old) : -1;
     const size = sizeOf(old) ?? sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
     try {
       const r = await post<ResumeResult>(`/api/tasks/${encodeURIComponent(task.id)}/resume`, { fresh, ...size });
@@ -489,7 +550,7 @@ export function App() {
   const sendFeedback = async (task: Task, text: string, mode: FeedbackBody['mode']): Promise<boolean> => {
     const s = live.current;
     const old = task.sessionId;
-    const pane = old ? s.panes.slice(0, s.layout).indexOf(old) : -1;
+    const pane = old ? s.panes.slice(0, paneCount(s.layout)).indexOf(old) : -1;
     const size = sizeOf(old) ?? sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
     try {
       const r = await post<FeedbackResult>(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, { text, mode, ...size });
@@ -515,7 +576,7 @@ export function App() {
   const switchAgent = async (task: Task, agent: AgentKind, note: string) => {
     const s = live.current;
     const old = task.sessionId;
-    const pane = old ? s.panes.slice(0, s.layout).indexOf(old) : -1;
+    const pane = old ? s.panes.slice(0, paneCount(s.layout)).indexOf(old) : -1;
     const size = sizeOf(old) ?? sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
     const r = await post<SwitchResult>(`/api/tasks/${encodeURIComponent(task.id)}/switch`, { agent, note: note || undefined, ...size });
     setData((d) => ({
@@ -535,7 +596,7 @@ export function App() {
     const s = live.current;
     const target = 'taskId' in to ? s.data.tasks.find((t) => t.id === to.taskId) : undefined;
     const old = target?.sessionId ?? null;
-    const pane = old ? s.panes.slice(0, s.layout).indexOf(old) : -1;
+    const pane = old ? s.panes.slice(0, paneCount(s.layout)).indexOf(old) : -1;
     const size = sizeOf(old) ?? sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
     const r = await post<ForwardResult>(`/api/cards/${encodeURIComponent(card.id)}/forward`, { to, note: note || undefined, ...size });
     const replaced = !!old && r.session.id !== old;
@@ -563,12 +624,15 @@ export function App() {
       return next;
     });
 
-  const focusedSessionId = panes[layout === 1 ? 0 : focusedPane];
+  const focusedSessionId = panes[layout === 2 ? focusedPane : 0];
   const focusedProjectId = focusedSessionId
     ? tasksById.get(sessionsById.get(focusedSessionId)?.taskId ?? '')?.projectId
     : undefined;
-  const visibleIds = panes.slice(0, layout);
+  const visibleIds = panes.slice(0, paneCount(layout));
   const sortedProjects = sortProjects(data.projects, order);
+  const activeInspectProject = (pinnedInspectProjectId ? projectsById.get(pinnedInspectProjectId) : undefined)
+    ?? (focusedProjectId ? projectsById.get(focusedProjectId) : undefined)
+    ?? sortedProjects[0];
   // Moves one project next to another; the saved order is the full current list, so deleted ids drop out.
   const reorderProject = (dragged: string, target: string, after: boolean) => {
     if (dragged === target) return;
@@ -644,18 +708,22 @@ export function App() {
             onClick={() => setPrivacy(!privacy)}
           >隐私</button>
           <span className="seg" role="radiogroup" aria-label="布局">
-            {([1, 2] as const).map((n) => (
+            {([
+              [1, '单屏', '单屏'],
+              [2, '双屏', '双屏：左右两屏，点屏幕或 Alt+1 / Alt+2 切换左右屏'],
+              ['inspect', '文件', '变更与文件面板（Alt+E）：右侧审阅 Git 改动、浏览与编辑项目文件'],
+            ] as const).map(([m, label, tip]) => (
               <button
-                key={n}
+                key={String(m)}
                 role="radio"
-                aria-checked={layout === n}
-                className={`ghost seg-btn ${layout === n ? 'on' : ''}`}
-                data-testid={`layout-${n}`}
+                aria-checked={layout === m}
+                className={`ghost seg-btn ${layout === m ? 'on' : ''}`}
+                data-testid={`layout-${m}`}
                 disabled={view !== 'work'}
-                title={n === 1 ? '单屏' : '双屏：左右两屏，点屏幕或 Alt+1 / Alt+2 切换左右屏'}
-                onClick={() => layout !== n && toggleLayout()}
+                title={tip}
+                onClick={() => layout !== m && switchLayout(m)}
               >
-                <span className={`layout-icon l${n}`} />{n === 1 ? '单屏' : '双屏'}
+                <span className={`layout-icon l${m}`} />{label}
               </button>
             ))}
           </span>
@@ -734,6 +802,7 @@ export function App() {
               agents={data.agents as AgentKind[]}
               defaultAgent={defaultAgentFor(data, project.id)}
               git={data.git[project.id] ?? null}
+              onInspectChanges={() => openInspectorAt(project.id, 'changes')}
               onToggle={() => toggleProject(project.id)}
               onReorder={reorderProject}
               onQuick={(agent) => void quickCreate(project.id, agent)}
@@ -760,8 +829,12 @@ export function App() {
           />
         </div>
       </aside>
-      <main className={`main layout-${layout}`} hidden={view !== 'work'}>
-        {([0, 1] as const).slice(0, layout).map((i) => {
+      <main
+        className={`main layout-${layout}`}
+        style={layout === 'inspect' ? ({ '--inspect-w': `${inspectSplit}%` } as CSSProperties) : undefined}
+        hidden={view !== 'work'}
+      >
+        {([0, 1] as const).slice(0, paneCount(layout)).map((i) => {
           const id = panes[i];
           const session = id ? sessionsById.get(id) : undefined;
           const task = session ? tasksById.get(session.taskId) : undefined;
@@ -779,7 +852,10 @@ export function App() {
               dual={layout === 2}
               now={now}
               quota={paneAgent ? data.quota[paneAgent] : undefined}
-              onFocus={() => focusedPane !== i && setFocusedPane(i)}
+              onFocus={() => {
+                if (layout === 2 && focusedPane !== i) setFocusedPane(i);
+                else if (layout === 'inspect') setFocusTick((n) => n + 1);
+              }}
               onRename={(title) => task && renameTask(task, title)}
               onResume={(fresh) => task && void resumeTask(task, fresh)}
               card={card}
@@ -804,6 +880,47 @@ export function App() {
             />
           );
         })}
+        {layout === 'inspect' && (
+          <>
+            <div
+              className="inspect-resizer"
+              data-testid="inspect-resizer"
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuenow={inspectSplit}
+              title="拖动调整变更/文件面板宽度，双击恢复对半"
+              onDoubleClick={() => setInspectSplit(INSPECT_SPLIT_DEFAULT)}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                const el = e.currentTarget;
+                el.setPointerCapture(e.pointerId);
+                const mainRect = el.parentElement!.getBoundingClientRect();
+                const move = (ev: PointerEvent) => {
+                  const pct = ((mainRect.right - ev.clientX) / mainRect.width) * 100;
+                  setInspectSplit(clampInspectSplit(pct));
+                };
+                const up = () => {
+                  el.removeEventListener('pointermove', move);
+                  el.removeEventListener('pointerup', up);
+                  el.removeEventListener('pointercancel', up);
+                };
+                el.addEventListener('pointermove', move);
+                el.addEventListener('pointerup', up);
+                el.addEventListener('pointercancel', up);
+              }}
+            />
+            <Inspector
+              project={activeInspectProject}
+              projects={sortedProjects}
+              git={activeInspectProject ? (data.git[activeInspectProject.id] ?? null) : null}
+              watchRev={inspectWatchRev}
+              openRequest={inspectReq}
+              onSelectProject={(pid) => setPinnedInspectProjectId(pid)}
+              onClose={() => switchLayout(1)}
+              onNotice={setNotice}
+            />
+          </>
+        )}
       </main>
       <StatsView visible={view === 'stats'} />
       {dialog === 'project' && (
@@ -890,19 +1007,26 @@ const middleCut = (s: string, max = 22) => {
   return cps.length > max ? cps.slice(0, 10).join('') + '…' + cps.slice(-10).join('') : s;
 };
 
-function BranchChip({ git }: { git: GitInfo }) {
+function BranchChip({ git, onInspect }: { git: GitInfo; onInspect?: () => void }) {
   const title = git.detached
     ? `游离 HEAD ${git.branch}${git.dirty ? `，${git.dirty} 个文件有未提交的改动` : ''}`
     : `分支 ${git.branch}${git.dirty ? `，${git.dirty} 个文件有未提交的改动` : ''}`;
   return (
-    <span className="group-branch" data-testid="project-branch" data-private="" title={title}>
+    <button
+      type="button"
+      className="group-branch"
+      data-testid="project-branch"
+      data-private=""
+      title={title}
+      onClick={onInspect}
+    >
       <span className="branch-name">{middleCut(git.branch)}</span>
       {git.dirty > 0 && <span className="branch-dirty" data-testid="project-dirty">· {git.dirty}</span>}
-    </span>
+    </button>
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, onShowAll, collapsed, agents, defaultAgent, git, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, onShowAll, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -915,6 +1039,7 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   agents: AgentKind[];
   defaultAgent: AgentKind;
   git: GitInfo | null;
+  onInspectChanges(): void;
   onToggle(): void;
   onReorder(dragged: string, target: string, after: boolean): void;
   onQuick(agent: AgentKind): void;
@@ -961,6 +1086,9 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
       <div
         className="group-head"
         draggable
+        onClick={(e) => {
+          if (!(e.target as HTMLElement).closest('button, .menu')) onToggle();
+        }}
         onDragStart={(e) => {
           e.dataTransfer.setData(PROJECT_DRAG_TYPE, project.id);
           e.dataTransfer.effectAllowed = 'move';
@@ -989,12 +1117,12 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
         <button className="group-toggle" data-testid="project-toggle" title={privacy ? undefined : project.path} aria-expanded={!collapsed} onClick={onToggle}>
           <svg className="chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
           <span className="group-name" data-private="">{project.name}</span>
-          {git && <BranchChip git={git} />}
-          {collapsed && working > 0 && <span className="group-live" data-testid="group-live">{working} 工作中</span>}
-          {collapsed && waiting > 0 && <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>}
-          {collapsed && reviewing > 0 && <span className="group-review" data-testid="group-review">{reviewing} 待验收</span>}
-          {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.length || ''}</span>}
         </button>
+        {git && <BranchChip git={git} onInspect={onInspectChanges} />}
+        {collapsed && working > 0 && <span className="group-live" data-testid="group-live">{working} 工作中</span>}
+        {collapsed && waiting > 0 && <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>}
+        {collapsed && reviewing > 0 && <span className="group-review" data-testid="group-review">{reviewing} 待验收</span>}
+        {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.length || ''}</span>}
         <button className="icon-btn remove-project" data-testid="project-remove" title="从工作台移除项目" onClick={onRemoveProject}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8h6l.5-8M7 7v3.5M9 7v3.5" /></svg>
         </button>

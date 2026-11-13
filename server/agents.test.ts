@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
+import { agyConversationState, agyResumeId, agyTranscriptFile, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
 import { pickColor } from './store.ts';
 import { TASK_COLORS } from '../shared/protocol.ts';
 
@@ -229,6 +229,109 @@ describe('claudeResumeId', () => {
     const odd = path.join(slug, 'notes.jsonl');
     fs.writeFileSync(odd, '');
     expect(withConfig(() => claudeResumeId(OLD, odd))).toBeUndefined();
+  });
+});
+
+describe('agyConversationState and agyResumeId', () => {
+  const MAIN = 'ae1cac0a-c6a3-47d3-968f-06ba2f139408';
+  const REV3 = '27e3af25-4cf9-449a-abb1-a1a9067c3ee7';
+  const BOARD = '4f248e7c-98c1-4d50-94c3-036f8054f7c3';
+  const COORD = 'c3672606-125b-4c58-a696-9fa210e37ab0';
+  const WORKER = 'e41d8e7e-ff77-42b6-9a3e-19e4e651aadb';
+  const ADOPTED = '99999999-9999-4999-8999-999999999999';
+  const NESTED = '8d41fe36-576f-43a3-ba8f-23781cf46302';
+  const MISSING = 'deadbeef-dead-4eef-8eef-deadbeefdead';
+
+  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-agy-resume-'));
+  const writeBrain = (id: string, entries: unknown[], fileName = 'transcript.jsonl') => {
+    const f = path.join(cfg, 'brain', id, '.system_generated', 'logs', fileName);
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, entries.map(e => JSON.stringify(e)).join('\n') + '\n');
+    return f;
+  };
+
+  // Main conversation even with a >20 KB initial prompt (exceeds one 16 KB read chunk).
+  const mainTp = writeBrain(MAIN, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: `<USER_REQUEST>${'x'.repeat(22_000)}</USER_REQUEST>` },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'done' },
+  ]);
+  // Read-only subagent (`reviewer-3`) spawned by MAIN via invoke_subagent: 0 user turns.
+  const rev3Tp = writeBrain(REV3, [
+    {
+      step_index: 0, source: 'SYSTEM', type: 'SYSTEM_MESSAGE',
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=${MAIN} priority=MESSAGE_PRIORITY_HIGH content=Audit Angle 3\n</SYSTEM_MESSAGE>`,
+    },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'VERDICT: REVISE' },
+  ]);
+  // Swarm worker whose step 0 is a missing/board sender and step 1 carries the coordinator assignment.
+  writeBrain(COORD, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: '<USER_REQUEST>run swarm</USER_REQUEST>' },
+  ], 'transcript_full.jsonl');
+  const workerTp = writeBrain(WORKER, [
+    { step_index: 0, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', content: `[Message] sender=${BOARD} content=[swarm] new board message #7` },
+    { step_index: 1, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', content: `[Message] sender=${COORD} content=You have just started.` },
+    { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'working' },
+  ]);
+  // Worker where the user already explicitly sent turns after resuming into it.
+  const adoptedTp = writeBrain(ADOPTED, [
+    { step_index: 0, source: 'SYSTEM', type: 'SYSTEM_MESSAGE', content: `[Message] sender=${COORD} content=assignment` },
+    { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'initial' },
+    { step_index: 2, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: '<USER_REQUEST>直接在这里处理吧</USER_REQUEST>' },
+  ]);
+  // One-shot `agy -p` headless review conversation spawned mid-turn.
+  writeBrain(NESTED, [
+    { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', content: '<USER_REQUEST>Do not use any tools.</USER_REQUEST>' },
+  ]);
+
+  const withAgy = <T>(fn: () => T): T => {
+    const prev = process.env.AGY_CONFIG_DIR;
+    process.env.AGY_CONFIG_DIR = cfg;
+    try {
+      return fn();
+    } finally {
+      if (prev === undefined) delete process.env.AGY_CONFIG_DIR;
+      else process.env.AGY_CONFIG_DIR = prev;
+    }
+  };
+
+  it('distinguishes main conversations, background subagents, adopted workers and missing ids', () => {
+    withAgy(() => {
+      expect(agyConversationState(MAIN)).toEqual({ kind: 'main' });
+      expect(agyConversationState(COORD)).toEqual({ kind: 'main' });
+      expect(agyConversationState(REV3)).toEqual({ kind: 'subagent', parentIds: [MAIN], hasUserTurn: false });
+      expect(agyConversationState(WORKER)).toEqual({ kind: 'subagent', parentIds: [BOARD, COORD], hasUserTurn: false });
+      expect(agyConversationState(ADOPTED)).toEqual({ kind: 'subagent', parentIds: [COORD], hasUserTurn: true });
+      expect(agyConversationState(MISSING)).toEqual({ kind: 'missing' });
+      expect(agyConversationState('not-a-uuid')).toEqual({ kind: 'missing' });
+    });
+  });
+
+  it('self-heals a subagent-poisoned nativeSessionId/transcriptPath back to the main coordinator', () => {
+    withAgy(() => {
+      expect(agyResumeId(REV3, rev3Tp)).toBe(MAIN);
+      expect(agyResumeId(REV3, undefined)).toBe(MAIN);
+      expect(agyResumeId(WORKER, `\\\\?\\${workerTp}`)).toBe(COORD);
+      expect(agyTranscriptFile(agyResumeId(REV3, rev3Tp)!)).toBe(mainTp);
+    });
+  });
+
+  it('recovers the primary TUI conversation when nativeSessionId was overwritten by a nested agy -p', () => {
+    withAgy(() => {
+      expect(agyResumeId(NESTED, mainTp)).toBe(MAIN);
+    });
+  });
+
+  it('preserves a worker conversation where the user already explicitly sent turns', () => {
+    withAgy(() => {
+      expect(agyResumeId(ADOPTED, adoptedTp)).toBe(ADOPTED);
+    });
+  });
+
+  it('returns undefined when neither native nor transcriptPath resolves on disk', () => {
+    withAgy(() => {
+      expect(agyResumeId(MISSING, undefined)).toBeUndefined();
+      expect(agyResumeId(MISSING, path.join(cfg, 'brain', MISSING, '.system_generated', 'logs', 'transcript_full.jsonl'))).toBeUndefined();
+    });
   });
 });
 

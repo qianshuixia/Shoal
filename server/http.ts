@@ -14,7 +14,7 @@ import { canResume, feedbackPrompt, forwardText } from '../shared/protocol.ts';
 import { clipboardFiles } from './clipboard.ts';
 import { autoArchiveMs, staleApproved } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
-import { availableAgents, claudeResumeId, ROOT } from './agents.ts';
+import { agyResumeId, agyTranscriptFile, availableAgents, claudeResumeId, ROOT } from './agents.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
 import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, readCodexQuota } from './quota.ts';
@@ -26,8 +26,12 @@ import type { Store } from './store.ts';
 import type { Usage } from './usage.ts';
 import { titleFromPrompt, titleFromReply, titlePrompt, promptPreview } from './titles.ts';
 import { gitInfo } from './git.ts';
+import {
+  WorkspaceError, discardFile, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveRawImage, writeFileEntry,
+} from './workspace.ts';
 
 const MAX_BODY = 1024 * 1024;
+const MAX_FILE_BODY = 5 * 1024 * 1024;
 const DIST = path.join(ROOT, 'web', 'dist');
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
@@ -38,10 +42,12 @@ const MIME: Record<string, string> = {
 class HttpError extends Error {
   status: number;
   code?: string;
-  constructor(status: number, message: string, code?: string) {
+  extra?: Record<string, unknown>;
+  constructor(status: number, message: string, code?: string, extra?: Record<string, unknown>) {
     super(message);
     this.status = status;
     this.code = code;
+    this.extra = extra;
   }
 }
 
@@ -55,13 +61,13 @@ export interface AppConfig {
   onShutdown?: () => void; // POST /api/shutdown: the desktop shell quitting, same as Ctrl+C on the server
 }
 
-function readBody(req: http.IncomingMessage): Promise<string> {
+function readBody(req: http.IncomingMessage, max = MAX_BODY): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => {
       size += c.length;
-      if (size > MAX_BODY) {
+      if (size > max) {
         reject(new HttpError(413, '请求体过大'));
         req.destroy();
         return;
@@ -122,8 +128,15 @@ export function createApp(cfg: AppConfig) {
       gitBusy.delete(projectId);
     }
   }
+  let gitSweepRunning = false;
   async function refreshAllGit(): Promise<void> {
-    for (const p of store.projects()) await refreshGit(p.id); // one at a time: git status on big repos is not free
+    if (gitSweepRunning) return;
+    gitSweepRunning = true;
+    try {
+      for (const p of store.projects()) await refreshGit(p.id); // one at a time: git status on big repos is not free
+    } finally {
+      gitSweepRunning = false;
+    }
   }
 
   // Subscription quota per agent kind: kept in <stateDir>/quota.json, broadcast when the windows change.
@@ -291,6 +304,7 @@ export function createApp(cfg: AppConfig) {
   function resumableNative(prev: SessionInfo | undefined): string | undefined {
     const native = prev && canResume(prev) ? prev.nativeSessionId! : undefined;
     if (native && prev!.agent === 'claude') return claudeResumeId(native, prev!.transcriptPath);
+    if (native && prev!.agent === 'agy') return agyResumeId(native, prev!.transcriptPath);
     return native;
   }
 
@@ -387,10 +401,12 @@ export function createApp(cfg: AppConfig) {
       const current = (t: Task) => (t.sessionId ? sessions.list().find(s => s.id === t.sessionId) : undefined);
       const before = current(first);
       const from = before?.agent ?? first.agent;
+      const healedAgyId = from === 'agy' && before ? agyResumeId(before.nativeSessionId, before.transcriptPath) : undefined;
+      const tp = (healedAgyId ? agyTranscriptFile(healedAgyId) : undefined) ?? before?.transcriptPath;
       const input: HandoffInput = {
         task: first, from, to: agent, cards: store.cards().filter(c => c.taskId === id),
-        turns: before?.transcriptPath ? readTranscript(from, before.transcriptPath) : [],
-        transcriptPath: before?.transcriptPath, note, limit: before?.limit,
+        turns: tp ? readTranscript(from, tp) : [],
+        transcriptPath: tp, note, limit: before?.limit,
       };
       const generated = await generateCard(agent, generatorPrompt(input), { cwd: project.path, stateDir: cfg.stateDir });
       const task = store.getTask(id);
@@ -575,9 +591,9 @@ export function createApp(cfg: AppConfig) {
       return send(res, 200, { path: path.resolve(file) });
     }
     let body: Record<string, unknown> = {};
-    if (method === 'POST' || method === 'PATCH') {
+    if (method === 'POST' || method === 'PATCH' || method === 'PUT') {
       if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) throw new HttpError(415, '需要 application/json');
-      body = parseJson(await readBody(req));
+      body = parseJson(await readBody(req, method === 'PUT' ? MAX_FILE_BODY : MAX_BODY));
     }
     if (method === 'GET' && pathname === '/api/state') return send(res, 200, snapshot());
     if (method === 'POST' && pathname === '/api/shutdown' && cfg.onShutdown) {
@@ -636,6 +652,50 @@ export function createApp(cfg: AppConfig) {
       store.removeTask(task.id);
       broadcast({ t: 'task-removed', id: task.id });
       return send(res, 200, { ok: true });
+    }
+    const pw = pathname.match(/^\/api\/projects\/([^/]+)\/(changes|diff|tree|files|file|raw|discard)$/);
+    if (pw) {
+      const project = store.getProject(decodeURIComponent(pw[1]));
+      if (!project) throw new HttpError(404, '项目不存在');
+      const sub = pw[2];
+      const q = new URL(req.url ?? '/', 'http://x').searchParams;
+      if (method === 'GET' && sub === 'changes') {
+        const changes = await listChanges(project.path);
+        if (!sameGit(gitMap.get(project.id), changes.git)) {
+          gitMap.set(project.id, changes.git);
+          broadcast({ t: 'git', projectId: project.id, git: changes.git });
+        }
+        return send(res, 200, changes);
+      }
+      if (method === 'GET' && sub === 'diff') return send(res, 200, await readDiff(project.path, q.get('path') ?? ''));
+      if (method === 'GET' && sub === 'tree') return send(res, 200, await listTree(project.path, q.get('path') ?? ''));
+      if (method === 'GET' && sub === 'files') return send(res, 200, await listAllFiles(project.path));
+      if (method === 'GET' && sub === 'file') return send(res, 200, readFileEntry(project.path, q.get('path') ?? '', q.get('stat') === '1'));
+      if (method === 'GET' && sub === 'raw') {
+        const img = resolveRawImage(project.path, q.get('path') ?? '');
+        res.writeHead(200, {
+          'content-type': img.mime,
+          'content-length': String(img.size),
+          'cache-control': 'no-cache',
+          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
+          'x-content-type-options': 'nosniff',
+        });
+        pipeline(fs.createReadStream(img.absPath), res, e => {
+          if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.warn('[raw]', img.absPath, e.message);
+        });
+        return;
+      }
+      if (method === 'PUT' && sub === 'file') {
+        const saved = writeFileEntry(project.path, body);
+        void refreshGit(project.id);
+        return send(res, 200, saved);
+      }
+      if (method === 'POST' && sub === 'discard') {
+        await discardFile(project.path, typeof body.path === 'string' ? body.path : '');
+        await refreshGit(project.id);
+        return send(res, 200, { ok: true });
+      }
+      throw new HttpError(405, '请求方法不支持');
     }
     const pm = pathname.match(/^\/api\/projects\/([^/]+)$/);
     if (method === 'DELETE' && pm) {
@@ -698,13 +758,16 @@ export function createApp(cfg: AppConfig) {
     };
     run().catch(e => {
       if (res.headersSent) return;
-      if (e instanceof HttpError) send(res, e.status, { error: e.message, ...(e.code && { code: e.code }) });
-      else {
+      if (e instanceof HttpError || e instanceof WorkspaceError) {
+        send(res, e.status, { error: e.message, ...(e.code && { code: e.code }), ...e.extra });
+      } else {
         console.error('[http]', e);
         send(res, 500, { error: '服务器内部错误' });
       }
     });
   });
+  server.keepAliveTimeout = 60_000;
+  server.headersTimeout = 65_000;
 
   // Poll git only while somebody is looking; unref so the timer never keeps the process alive.
   const gitTimer = setInterval(() => { if (clients.size) void refreshAllGit(); }, 10_000);

@@ -30,6 +30,7 @@ export const isNewTaskKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyN
 // Alt+1 / Alt+2 focus the left / right pane: 0 / 1; null for any other key.
 export const isPaneKey = (e: KeyboardEvent): 0 | 1 | null => (altOnly(e) ? (e.code === 'Digit1' ? 0 : e.code === 'Digit2' ? 1 : null) : null);
 export const isSearchKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyK';
+export const isInspectKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyE';
 const ctrlOnly = (e: KeyboardEvent) => e.ctrlKey && !e.altKey && !e.metaKey;
 // Ctrl+= / Ctrl++ (numpad too) zoom in, Ctrl+- out, Ctrl+0 back to 100%: 1 / -1 / 0; null for any other key.
 // Shift is allowed because + is Shift+= on most layouts.
@@ -41,7 +42,8 @@ export function zoomKey(e: KeyboardEvent): 1 | -1 | 0 | null {
   return null;
 }
 // Ctrl+- stays with the CLI inside a terminal: it is ^_, Claude Code's undo.
-const isPageKey = (e: KeyboardEvent) => isJumpKey(e) || isNewTaskKey(e) || isPaneKey(e) !== null || isSearchKey(e) || zoomKey(e) === 1 || zoomKey(e) === 0;
+const isPageKey = (e: KeyboardEvent) =>
+  isJumpKey(e) || isNewTaskKey(e) || isPaneKey(e) !== null || isSearchKey(e) || isInspectKey(e) || zoomKey(e) === 1 || zoomKey(e) === 0;
 const isPasteKey = (e: KeyboardEvent) => e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey && e.code === 'KeyV';
 
 let notice: (msg: string) => void = () => {};
@@ -86,7 +88,13 @@ async function pasteNonText(term: Terminal, id: string): Promise<void> {
   send({ t: 'in', id, d: '\x1bv' });
 }
 
-// Clicked terminal link: web links open in a new tab, file links (file: URI or a bare Windows path) are opened by the server, the rest is ignored.
+let fileLinkHandler: ((uri: string) => Promise<boolean> | boolean) | null = null;
+export function setTermFileLinkHandler(fn: ((uri: string) => Promise<boolean> | boolean) | null): void {
+  fileLinkHandler = fn;
+}
+
+// Clicked terminal link: web links open in a new tab, in-project viewable files open in the right Inspector,
+// and other file links (outside project, directories, executables) are opened by the server.
 function openLink(uri: string): void {
   if (/^https?:/i.test(uri)) {
     window.open(uri, '_blank', 'noopener');
@@ -95,6 +103,7 @@ function openLink(uri: string): void {
   if (!/^file:/i.test(uri) && !/^[A-Za-z]:[\\/]/.test(uri)) return;
   void (async () => {
     try {
+      if (fileLinkHandler && (await fileLinkHandler(uri))) return;
       const res = await fetch('/api/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ target: uri }) });
       if (res.ok) return;
       const json = await res.json().catch(() => ({})) as { error?: string };

@@ -44,6 +44,76 @@ export interface GitInfo {
   dirty: number;
 }
 
+// ---- Project Inspector (Changes & Files) ----
+export type ChangeStatus = 'M' | 'A' | 'D' | 'R' | 'U' | '?';
+
+export interface ChangedFile {
+  path: string; // POSIX path relative to project root
+  origPath?: string; // original POSIX path when renamed (status === 'R')
+  status: ChangeStatus;
+  added: number | null; // null for binary files or when unavailable
+  deleted: number | null;
+}
+
+export interface ProjectChanges {
+  git: GitInfo | null;
+  files: ChangedFile[];
+}
+
+export interface TreeEntry {
+  name: string;
+  path: string; // POSIX path relative to project root
+  kind: 'dir' | 'file';
+  ignored?: boolean; // heavy build/dependency dir dimmed by default (e.g. node_modules, dist)
+  gitStatus?: ChangeStatus; // dirty marker on file or folder
+  size?: number;
+}
+
+export interface TreeListing {
+  path: string; // '' for project root
+  entries: TreeEntry[];
+}
+
+export interface FileListResult {
+  files: string[]; // POSIX paths relative to project root
+  truncated: boolean;
+}
+
+export type FileKind = 'text' | 'image' | 'binary' | 'too_large' | 'missing';
+
+export interface FilePayload {
+  path: string;
+  kind: FileKind;
+  content?: string; // omitted when statOnly=true or non-text
+  size: number;
+  mtimeMs: number | null;
+  mime?: string;
+}
+
+export interface DiffPayload {
+  path: string;
+  status: ChangeStatus | null;
+  base: string; // HEAD content ('' for added / untracked)
+  head: string; // working tree content ('' for deleted)
+  binary: boolean;
+  tooLarge: boolean;
+  size: number;
+  mtimeMs: number | null;
+}
+
+export interface WriteFileBody {
+  path: string;
+  content: string;
+  expectedMtimeMs?: number | null;
+  force?: boolean;
+}
+
+export interface WriteFileResult {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
 // result: the agent's last reply when a turn ended (Stop hook). feedback: what the user wrote back.
 // handoff: card made when switching agent; sessionId is the new session that took over.
 // forward: content sent over from another task; sessionId is the session that received it.
@@ -152,6 +222,14 @@ export const TASK_COLORS = [
 // POST   /api/open  { target } -> { action, path }  (a terminal link: file: URI or X:\ path, optional #L12 / :12:3 suffix; opens it in VS Code,
 //                                                Explorer or the default viewer, never executes it; 400 UNC / remote host / relative / other
 //                                                scheme, 404 missing file)
+// GET    /api/projects/:id/changes       -> ProjectChanges   (git branch + uncommitted files with +/- line counts)
+// GET    /api/projects/:id/diff?path=p   -> DiffPayload      (HEAD vs working tree text for one file; >2MB or binary flagged)
+// GET    /api/projects/:id/tree?path=dir -> TreeListing      (single-level lazy directory listing with git dirty badges)
+// GET    /api/projects/:id/files         -> FileListResult   (relative file paths for Ctrl+P quick search, capped at 20,000)
+// GET    /api/projects/:id/file?path=p[&stat=1] -> FilePayload (text content or metadata; stat=1 omits content for fast mtime check)
+// GET    /api/projects/:id/raw?path=p    -> binary stream    (image preview only, strict CSP: default-src 'none')
+// PUT    /api/projects/:id/file WriteFileBody -> WriteFileResult (saves UTF-8 text; 409 { code: 'conflict', mtimeMs } on mtime mismatch)
+// POST   /api/projects/:id/discard { path } -> { ok: true }  (restores tracked file to HEAD or deletes untracked file)
 // POST   /hook  Authorization: Bearer <token>  HookBody -> 204  (called by hooks/notify.mjs, and by hooks/statusline.mjs with the
 //                                                synthetic event 'RateLimits', payload { rate_limits } in claude's status line format
 //                                                ({ five_hour?, seven_day? }, each { used_percentage: 0-100, resets_at: unix seconds })
