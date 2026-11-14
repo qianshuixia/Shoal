@@ -362,9 +362,18 @@ export function buildLaunch(opts: { agent: AgentKind; sessionId: string; prompt:
   }
 }
 
+export interface GeneratorLaunch {
+  file: string;
+  args: string[];
+  stdin: string | null;
+  outFile: string | null;
+}
+
 // Headless one-shot call that writes a handoff card from a prompt. The result comes from stdout, or from outFile when set.
 // No --bare for claude (it skips the OAuth login) and no -m for codex (the user's codex has its own provider and model).
-export function buildGenerator(agent: AgentKind, prompt: string, outFile: string): { file: string; args: string[]; stdin: string | null; outFile: string | null } {
+// Headless agy (-p) is intentionally disabled (returns null): automated non-interactive Antigravity CLI calls violate
+// account policy and spawn extra language-server sidecars.
+export function buildGenerator(agent: AgentKind, prompt: string, outFile: string): GeneratorLaunch | null {
   switch (agent) {
     case 'claude':
       return { file: claudeExe(), args: ['-p', '--model', 'haiku', '--tools', '', '--no-session-persistence'], stdin: prompt, outFile: null };
@@ -374,8 +383,8 @@ export function buildGenerator(agent: AgentKind, prompt: string, outFile: string
         args: [codexJs(), 'exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '-c', 'model_reasoning_effort="low"', '-o', outFile, '-'],
         stdin: prompt, outFile,
       };
-    case 'agy': // agy does not read stdin
-      return { file: agyExe(), args: ['-p', prompt.startsWith('-') ? ` ${prompt}` : prompt, '--effort', 'low', '--print-timeout', '2m', '--disable-slash-commands'], stdin: null, outFile: null };
+    case 'agy':
+      return null;
     case 'fake':
       return { file: process.execPath, args: [path.join(ROOT, 'test', 'fixtures', 'fake-handoff.mjs')], stdin: prompt, outFile: null };
   }

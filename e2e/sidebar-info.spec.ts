@@ -73,6 +73,52 @@ test('git chip: branch, dirty count that follows changes, no chip outside a repo
   await page.evaluate(() => localStorage.removeItem('wb.sideWidth'));
 });
 
+test('git chip: long CJK project names never crush the dirty pill into a circle or overlap the task count', async ({ page, request }) => {
+  const mkRepo = async (name: string, branch: string, dirtyCount: number) => {
+    const dir = path.join(OUT, token('cjk'));
+    fs.mkdirSync(dir, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', branch], { cwd: dir });
+    for (let i = 0; i < dirtyCount; i++) fs.writeFileSync(path.join(dir, `f-${i}.txt`), String(i));
+    const res = await request.post('/api/projects', { data: { name, path: dir } });
+    expect(res.ok()).toBeTruthy();
+    return (await res.json()) as { id: string };
+  };
+
+  const pWechat = await mkRepo('wechat-article-个人创作资料中心', 'main', 12);
+  const pXiapost = await mkRepo('xiapost-浅水虾自媒体分发平台', 'main', 3);
+  const t1 = await createFakeTask(request, pXiapost.id, '任务一', 'exit 0');
+  const t2 = await createFakeTask(request, pXiapost.id, '任务二', 'exit 0');
+
+  await page.goto('/');
+  await expectStatus(page, t1.session.id, 'exited');
+  await expectStatus(page, t2.session.id, 'exited');
+  await group(page, pXiapost.id).getByTestId('project-toggle').click();
+
+  for (const [widthRem, file] of [['15.75', 'git-long-cjk-default.png'], ['13', 'git-long-cjk-narrow.png']] as const) {
+    await page.evaluate((w) => localStorage.setItem('wb.sideWidth', w), widthRem);
+    await page.reload();
+    const side = (await page.locator('aside.sidebar').boundingBox())!;
+    for (const pid of [pWechat.id, pXiapost.id]) {
+      const g = group(page, pid);
+      const nameBox = (await g.locator('.group-name').boundingBox())!;
+      const chipBox = (await g.getByTestId('project-branch').boundingBox())!;
+      const dirtyBox = (await g.getByTestId('project-dirty').boundingBox())!;
+      const addBox = (await g.getByTestId('project-add-task').boundingBox())!;
+      // Dirty count stays strictly inside the pill border, the pill never collapses into a ~14px circle, and the project name stays readable.
+      expect(nameBox.width).toBeGreaterThanOrEqual(48);
+      expect(chipBox.width).toBeGreaterThanOrEqual(24);
+      expect(dirtyBox.x).toBeGreaterThanOrEqual(chipBox.x - 0.5);
+      expect(dirtyBox.x + dirtyBox.width).toBeLessThanOrEqual(chipBox.x + chipBox.width + 0.5);
+      expect(addBox.x + addBox.width).toBeLessThanOrEqual(side.x + side.width + 0.5);
+    }
+    const countBox = (await group(page, pXiapost.id).locator('.group-count').boundingBox())!;
+    const xiaChip = (await group(page, pXiapost.id).getByTestId('project-branch').boundingBox())!;
+    expect(xiaChip.x + xiaChip.width).toBeLessThanOrEqual(countBox.x + 0.5);
+    await page.screenshot({ path: path.join(OUT, file), clip: { x: side.x, y: side.y, width: side.width, height: 380 } });
+  }
+  await page.evaluate(() => localStorage.removeItem('wb.sideWidth'));
+});
+
 test('task preview: shows the latest prompt, follows follow-ups, hides when redundant or exited', async ({ page, request }) => {
   const project = await createProject(request, token('prev'));
   const withPrompt = await createFakeTask(request, project.id, '登录问题', 'fix the login redirect loop');

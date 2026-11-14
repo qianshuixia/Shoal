@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Project, SessionInfo, Task } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
-import { STATUS_LABEL } from './util.ts';
+import { STATUS_LABEL, taskActivityAt } from './util.ts';
 
 const MAX_RESULTS = 50;
 
-// Running tasks first, stopped ones next, archived last; the incoming order within each.
+// Running tasks first, stopped ones next, archived last; most recently active first within each.
 const rank = (t: Task, s?: SessionInfo) => (t.phase === 'archived' ? 2 : !s || s.status === 'exited' ? 1 : 0);
 
 // Alt+K palette: type to filter tasks by title or project name, ↑/↓ to move, Enter to open, Esc to close.
@@ -26,8 +26,11 @@ export function TaskSearch({ tasks, projects, sessionsById, onPick, onClose }: {
     const session = (t: Task) => (t.sessionId ? sessionsById.get(t.sessionId) : undefined);
     return tasks
       .filter((t) => !q || t.title.toLowerCase().includes(q) || (names.get(t.projectId) ?? '').toLowerCase().includes(q))
-      .map((t, i) => ({ t, i, r: rank(t, session(t)) }))
-      .sort((a, b) => a.r - b.r || a.i - b.i)
+      .map((t) => {
+        const s = session(t);
+        return { t, r: rank(t, s), act: taskActivityAt(t, s), started: s?.startedAt ?? 0 };
+      })
+      .sort((a, b) => a.r - b.r || b.act - a.act || b.started - a.started || b.t.createdAt - a.t.createdAt)
       .slice(0, MAX_RESULTS)
       .map((x) => x.t);
   }, [tasks, names, sessionsById, query]);

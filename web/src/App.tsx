@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, ArchiveStoppedResult, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
 import { AGENT_LABEL, DEFAULT_SETTINGS, canResume } from '../../shared/protocol.ts';
 import { connect } from './ws.ts';
@@ -16,6 +16,7 @@ import { AgentIcon } from './agentIcons.tsx';
 import { liveWindows, QUOTA_AGENTS } from './quota.ts';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
+import { sortProjectTasks, taskActivityAt, taskBand } from './util.ts';
 
 type PaneSessions = [string | null, string | null];
 type LayoutMode = 1 | 2 | 'inspect';
@@ -39,6 +40,8 @@ const upsert = <T extends { id: string }>(list: T[], item: T): T[] =>
 const COLLAPSED_KEY = 'wb.collapsed';
 const ARCHIVE_OPEN_KEY = 'wb.archiveOpen';
 const FILTER_KEY = 'wb.sideFilter';
+// In 全部 mode each project keeps at most the N most recently active exited tasks visible; older ones fold locally.
+const RECENT_STOPPED_LIMIT = 2;
 const loadFilter = (): SideFilter => (localStorage.getItem(FILTER_KEY) === 'active' ? 'active' : 'all');
 function loadCollapsed(): Set<string> {
   try {
@@ -114,10 +117,17 @@ const reviewList = (d: Snapshot): string[] => {
     .map((t) => t.sessionId!);
 };
 
-// The agent last used in the project, so quick-create repeats what you just did.
+// The agent of the most recently active task in the project, so quick-create repeats what you just did.
 function defaultAgentFor(d: Snapshot, projectId: string): AgentKind {
   const agents = d.agents as AgentKind[];
-  const last = d.tasks.filter((t) => t.projectId === projectId).sort((a, b) => b.createdAt - a.createdAt)[0];
+  const byId = new Map(d.sessions.map((s) => [s.id, s]));
+  const last = d.tasks
+    .filter((t) => t.projectId === projectId)
+    .sort((a, b) => {
+      const sa = a.sessionId ? byId.get(a.sessionId) : undefined;
+      const sb = b.sessionId ? byId.get(b.sessionId) : undefined;
+      return taskActivityAt(b, sb) - taskActivityAt(a, sa) || b.createdAt - a.createdAt;
+    })[0];
   if (last && agents.includes(last.agent)) return last.agent;
   return agents.includes('claude') ? 'claude' : (agents[0] ?? 'claude');
 }
@@ -146,6 +156,8 @@ export function App() {
   const [order, setOrder] = useState(loadOrder);
   const [sideW, setSideW] = useState(loadSide);
   const [filter, setFilter] = useState<SideFilter>(loadFilter);
+  const [expandedHistory, setExpandedHistory] = useState<Set<string>>(() => new Set());
+  const [resumingAll, setResumingAll] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(() => localStorage.getItem(ARCHIVE_OPEN_KEY) === '1');
 
   // Latest state for handlers registered once (WebSocket, window listeners).
@@ -540,6 +552,100 @@ export function App() {
     }
   };
 
+  const changeFilter = (next: SideFilter) => {
+    setFilter(next);
+    setExpandedHistory(new Set());
+  };
+
+  const toggleProjectHistory = (projectId: string) =>
+    setExpandedHistory((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(projectId)) next.add(projectId);
+      return next;
+    });
+
+  const archiveStopped = async (project: Project) => {
+    try {
+      const r = await post<ArchiveStoppedResult>(`/api/projects/${encodeURIComponent(project.id)}/archive-stopped`, {});
+      if (r.tasks.length) {
+        const byId = new Map(r.tasks.map((t) => [t.id, t]));
+        setData((d) => ({ ...d, tasks: d.tasks.map((t) => byId.get(t.id) ?? t) }));
+        setExpandedHistory((prev) => {
+          if (!prev.has(project.id)) return prev;
+          const next = new Set(prev);
+          next.delete(project.id);
+          return next;
+        });
+        setNotice(`已归档「${project.name}」下 ${r.tasks.length} 个已退出会话`);
+      }
+    } catch (e) {
+      setNotice(`归档失败：${(e as Error).message}`);
+    }
+  };
+
+  const resumeAllInterrupted = async () => {
+    if (resumingAll) return;
+    setResumingAll(true);
+    const s = live.current;
+    const size = sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
+    try {
+      const r = await post<ResumeInterruptedResult>('/api/sessions/resume-interrupted', size);
+      if (r.resumed.length) {
+        const taskMap = new Map(r.resumed.map((x) => [x.task.id, x.task]));
+        const dropIds = new Set(r.resumed.map((x) => x.replacedSessionId).filter((x): x is string => !!x));
+        setData((d) => ({
+          ...d,
+          tasks: d.tasks.map((t) => taskMap.get(t.id) ?? t),
+          sessions: [
+            ...d.sessions.filter((x) => !dropIds.has(x.id)).map((x) => (x.interrupted ? { ...x, interrupted: undefined } : x)),
+            ...r.resumed.map((x) => x.session),
+          ],
+        }));
+        const replacePane = new Map(
+          r.resumed.filter((x) => x.replacedSessionId).map((x) => [x.replacedSessionId!, x.session.id]),
+        );
+        setPanes((p) => {
+          const next: PaneSessions = [
+            p[0] ? (replacePane.get(p[0]) ?? p[0]) : null,
+            p[1] ? (replacePane.get(p[1]) ?? p[1]) : null,
+          ];
+          if (!next[0] && !next[1]) {
+            next[live.current.layout === 2 ? live.current.focusedPane : 0] = r.resumed.at(-1)!.session.id;
+          }
+          return next;
+        });
+        for (const id of dropIds) dispose(id);
+        setFocusTick((n) => n + 1);
+      } else {
+        setData((d) => ({
+          ...d,
+          sessions: d.sessions.map((x) => (x.interrupted ? { ...x, interrupted: undefined } : x)),
+        }));
+      }
+      setNotice(
+        r.resumed.length
+          ? `已续接 ${r.resumed.length} 个会话${r.skipped ? `（${r.skipped} 个无对话记录已跳过）` : ''}`
+          : '没有可续接的对话记录',
+      );
+    } catch (e) {
+      setNotice(`批量续接失败：${(e as Error).message}`);
+    } finally {
+      setResumingAll(false);
+    }
+  };
+
+  const dismissInterrupted = async () => {
+    setData((d) => ({
+      ...d,
+      sessions: d.sessions.map((x) => (x.interrupted ? { ...x, interrupted: undefined } : x)),
+    }));
+    try {
+      await post('/api/sessions/dismiss-interrupted', {});
+    } catch {
+      // optimistic local clear is sufficient if offline
+    }
+  };
+
   // Search palette result: archived tasks are restored first, then the session is shown like a sidebar click.
   const openFound = async (task: Task) => {
     setDialog(null);
@@ -647,11 +753,27 @@ export function App() {
   };
   const forwardCard = dialog === 'forward' ? data.cards.find((c) => c.id === dialogTarget) : undefined;
   const forwardSource = forwardCard ? tasksById.get(forwardCard.taskId) : undefined;
+  const interruptedCount = data.tasks.filter((t) => {
+    if (t.phase === 'archived' || !t.sessionId) return false;
+    const s = sessionsById.get(t.sessionId);
+    return !!s && s.status === 'exited' && s.interrupted === true && canResume(s);
+  }).length;
 
   return (
     <div className={`app ${privacy ? 'privacy' : ''}`} style={{ '--side-w': `${sideW}rem` } as CSSProperties}>
       {!connected && <div className="banner" data-testid="conn-banner">连接断开，正在重连…</div>}
       {connected && notice && <div className="banner" data-testid="notice" onClick={() => setNotice('')}>{notice}</div>}
+      {connected && !notice && interruptedCount > 0 && (
+        <div className="banner resume-banner" data-testid="interrupted-banner">
+          <span>上次服务停止前有 {interruptedCount} 个会话仍在运行</span>
+          <button className="primary banner-btn" data-testid="resume-interrupted-btn" disabled={resumingAll} onClick={() => void resumeAllInterrupted()}>
+            {resumingAll ? '正在续接…' : '一键全部续接'}
+          </button>
+          <button className="ghost banner-btn" data-testid="dismiss-interrupted-btn" disabled={resumingAll} onClick={() => void dismissInterrupted()}>
+            忽略
+          </button>
+        </div>
+      )}
       <header className="topbar">
         <span className="app-name">Shoal</span>
         <span className="view-tabs" role="tablist" aria-label="视图">
@@ -772,8 +894,8 @@ export function App() {
                 aria-checked={filter === k}
                 className={`ghost seg-btn ${filter === k ? 'on' : ''}`}
                 data-testid={`filter-${k}`}
-                title={k === 'active' ? '隐藏已退出的任务（待验收的保留）' : '显示所有任务'}
-                onClick={() => setFilter(k)}
+                title={k === 'active' ? '隐藏已退出的任务（待验收的保留）' : '每个项目默认保留最近 2 个已退出任务，其余局部收起'}
+                onClick={() => changeFilter(k)}
               >{label}</button>
             ))}
           </span>
@@ -793,13 +915,15 @@ export function App() {
             <ProjectGroup
               key={project.id}
               project={project}
-              tasks={data.tasks.filter((t) => t.projectId === project.id && t.phase !== 'archived').sort((a, b) => a.createdAt - b.createdAt)}
+              tasks={data.tasks.filter((t) => t.projectId === project.id && t.phase !== 'archived')}
               sessionsById={sessionsById}
               visibleIds={visibleIds}
               focusedId={focusedSessionId}
               now={now}
               filter={filter}
-              onShowAll={() => setFilter('all')}
+              historyExpanded={expandedHistory.has(project.id)}
+              onToggleHistory={() => toggleProjectHistory(project.id)}
+              onArchiveStopped={() => void archiveStopped(project)}
               collapsed={collapsed.has(project.id)}
               agents={data.agents as AgentKind[]}
               defaultAgent={defaultAgentFor(data, project.id)}
@@ -1011,25 +1135,33 @@ const middleCut = (s: string, max = 22) => {
 };
 
 function BranchChip({ git, onInspect }: { git: GitInfo; onInspect?: () => void }) {
+  const branch = middleCut(git.branch);
+  const short = [...branch].length <= 5;
   const title = git.detached
     ? `游离 HEAD ${git.branch}${git.dirty ? `，${git.dirty} 个文件有未提交的改动` : ''}`
     : `分支 ${git.branch}${git.dirty ? `，${git.dirty} 个文件有未提交的改动` : ''}`;
   return (
     <button
       type="button"
-      className="group-branch"
+      className={`group-branch${short ? ' short-branch' : ''}`}
       data-testid="project-branch"
+      data-dirty={git.dirty > 0 ? 'true' : undefined}
       data-private=""
       title={title}
       onClick={onInspect}
     >
-      <span className="branch-name">{middleCut(git.branch)}</span>
-      {git.dirty > 0 && <span className="branch-dirty" data-testid="project-dirty">· {git.dirty}</span>}
+      <span className="branch-name">{branch}</span>
+      {git.dirty > 0 && (
+        <span className="branch-dirty" data-testid="project-dirty">
+          <span className="branch-sep">· </span>
+          {git.dirty}
+        </span>
+      )}
     </button>
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, onShowAll, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -1037,7 +1169,9 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   focusedId: string | null; // session in the focused pane
   now: number;
   filter: SideFilter;
-  onShowAll(): void;
+  historyExpanded: boolean;
+  onToggleHistory(): void;
+  onArchiveStopped(): void;
   collapsed: boolean;
   agents: AgentKind[];
   defaultAgent: AgentKind;
@@ -1059,14 +1193,24 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
   const reviewing = tasks.filter((t) => t.phase === 'review').length;
   const working = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'working').length;
-  // Running tasks first, then approved (done, session still open), stopped last; creation order within each.
-  // Status changes inside a band (working / needs you / review) never move a row under the cursor.
-  const band = (t: Task) => ((t.sessionId && sessionsById.get(t.sessionId)?.status) ?? 'exited') === 'exited' ? 2 : t.phase === 'approved' ? 1 : 0;
-  tasks = [...tasks].sort((a, b) => band(a) - band(b));
-  // 活跃: stopped tasks are hidden, except 待验收 ones (the process ending does not settle the result).
-  const stopped = (t: Task) => band(t) === 2 && t.phase !== 'review';
-  const shown = filter === 'active' ? tasks.filter((t) => !stopped(t)) : tasks;
+  // Running tasks first, then approved (done, session still open), stopped last; most recently active first within each.
+  // Status changes inside a live band (working / needs you / review) never move a row under the cursor.
+  tasks = sortProjectTasks(tasks, sessionsById);
+  // 活跃 hides all non-review stopped tasks; 全部 keeps the latest 2 stopped tasks visible and locally folds older ones.
+  const stopped = (t: Task) => taskBand(t, t.sessionId ? sessionsById.get(t.sessionId) : undefined) === 2 && t.phase !== 'review';
+  const stoppedTasks = tasks.filter(stopped);
+  const visibleLimit = filter === 'active' ? 0 : RECENT_STOPPED_LIMIT;
+  let seenStopped = 0;
+  const shown = historyExpanded
+    ? tasks
+    : tasks.filter((t) => {
+        if (!stopped(t)) return true;
+        seenStopped++;
+        return seenStopped <= visibleLimit;
+      });
   const hidden = tasks.length - shown.length;
+  const canCollapseBack = historyExpanded && stoppedTasks.length > visibleLimit;
+  const showArchiveStopped = stoppedTasks.length >= 2 || (filter === 'active' && stoppedTasks.length >= 1);
   const row = (task: Task) => (
     <TaskRow
       key={task.id}
@@ -1154,8 +1298,29 @@ function ProjectGroup({ project, tasks, sessionsById, visibleIds, focusedId, now
         </div>
       </div>
       {!collapsed && shown.map(row)}
-      {!collapsed && hidden > 0 && (
-        <button className="group-hidden" data-testid="group-hidden" onClick={onShowAll}>另有 {hidden} 个已退出</button>
+      {!collapsed && (hidden > 0 || canCollapseBack || showArchiveStopped) && (
+        <div className="group-foot" data-testid="group-foot">
+          {hidden > 0 && (
+            <button className="group-hidden" data-testid="group-hidden" onClick={onToggleHistory}>
+              {filter === 'active' ? `另有 ${hidden} 个已退出` : `展开其余 ${hidden} 个已退出`}
+            </button>
+          )}
+          {hidden === 0 && canCollapseBack && (
+            <button className="group-hidden" data-testid="group-collapse-stopped" onClick={onToggleHistory}>
+              收起已退出
+            </button>
+          )}
+          {showArchiveStopped && (
+            <button
+              className="group-tidy"
+              data-testid="group-archive-stopped"
+              title="将本项目下已退出且非待验收的会话移入底部「已归档」（随时可恢复）"
+              onClick={onArchiveStopped}
+            >
+              归档已退出 ({stoppedTasks.length})
+            </button>
+          )}
+        </div>
       )}
       {!collapsed && !tasks.length && <div className="group-empty">没有任务，点右边的 + 新建</div>}
     </section>

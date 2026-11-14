@@ -118,6 +118,18 @@ jobs:
       - run: npm ci
         if: steps.release.outputs.published != 'true'
 
+      - name: Build release notes
+        id: notes
+        if: steps.release.outputs.published != 'true'
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP 'release-body.md'
+          node scripts/release-notes.mjs $file
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot build release notes' }
+          $delim = "RELEASE_BODY_$([guid]::NewGuid().ToString('N'))"
+          $text = (Get-Content $file -Raw -Encoding UTF8).TrimEnd()
+          Add-Content -Path $env:GITHUB_OUTPUT -Encoding UTF8 -Value "body<<$delim`n$text`n$delim"
+
       - uses: tauri-apps/tauri-action@v1
         if: steps.release.outputs.published != 'true'
         env:
@@ -130,17 +142,4 @@ jobs:
           releaseCommitish: ${{ steps.version.outputs.commit }}
           releaseDraft: false
           uploadUpdaterJson: false
-          releaseBody: |
-            Windows x64 installer for the Shoal desktop app, a local workbench that runs Claude Code, Codex CLI and Antigravity CLI (`agy`) sessions side by side.
-
-            The installer is self-contained. It brings its own Node runtime, the Shoal server and the web UI, so running Shoal needs no clone of this repo and no pre-installed Node or npm. The agent CLIs are separate: you install them yourself.
-
-            Before you start:
-            1. Install the agent CLIs you want and sign in to them. Shoal looks for Claude Code and Codex CLI installed globally with npm (`npm install -g @anthropic-ai/claude-code`, `npm install -g @openai/codex`; these two need Node.js and npm on your system) and for agy in its default location (`%LOCALAPPDATA%\agy\bin\agy.exe`).
-            2. Run the installer and start Shoal from the Start menu.
-
-            Notes:
-            - The installer is not code-signed, so Windows SmartScreen may warn: choose More info -> Run anyway.
-            - Shoal listens only on 127.0.0.1:47800. State and server logs are stored under LOCALAPPDATA: Shoal by default, or agent-workbench for older installs until Shoal has its own state.json. Your code stays in your own folders.
-            - Closing the window or choosing Quit in the tray asks for confirmation if agents are running, then stops the server and its agent sessions; you can resume them from the panel later.
-            - Shoal is an independent open-source project and is not affiliated with or endorsed by Anthropic, OpenAI or Google.
+          releaseBody: ${{ steps.notes.outputs.body }}

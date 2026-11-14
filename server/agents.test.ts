@@ -161,7 +161,7 @@ describe('buildGenerator', () => {
   const gen = (agent: 'claude' | 'codex' | 'agy' | 'fake', prompt = 'PROMPT') => buildGenerator(agent, prompt, 'OUT.md');
 
   it('claude: headless haiku without tools or session, prompt on stdin, no --bare', () => {
-    const g = gen('claude');
+    const g = gen('claude')!;
     expect(g.args).toEqual(['-p', '--model', 'haiku', '--tools', '', '--no-session-persistence']);
     expect(g.args).not.toContain('--bare');
     expect(g.stdin).toBe('PROMPT');
@@ -169,7 +169,7 @@ describe('buildGenerator', () => {
   });
 
   it('codex: ephemeral read-only exec, no -m, result in the output file, prompt on stdin', () => {
-    const g = gen('codex');
+    const g = gen('codex')!;
     expect(g.args).not.toContain('-m');
     expect(g.args.slice(-3)).toEqual(['-o', 'OUT.md', '-']);
     expect(g.args).toContain('--ephemeral');
@@ -177,14 +177,13 @@ describe('buildGenerator', () => {
     expect(g.outFile).toBe('OUT.md');
   });
 
-  it('agy: prompt after -p (space-guarded when it starts with a dash), nothing on stdin', () => {
-    expect(gen('agy').args.slice(0, 2)).toEqual(['-p', 'PROMPT']);
-    expect(gen('agy', '-x').args[1]).toBe(' -x');
-    expect(gen('agy').stdin).toBeNull();
+  it('agy: headless -p is disabled (returns null) to protect account policy and avoid sidecar sprawl', () => {
+    expect(gen('agy')).toBeNull();
+    expect(gen('agy', '-x')).toBeNull();
   });
 
   it('fake: runs the fake generator script with the prompt on stdin', () => {
-    const g = gen('fake');
+    const g = gen('fake')!;
     expect(g.args[0]).toMatch(/fake-handoff\.mjs$/);
     expect(g.stdin).toBe('PROMPT');
   });

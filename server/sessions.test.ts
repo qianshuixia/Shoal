@@ -277,15 +277,24 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
       expect(report.total.input + report.total.output).toBe(1800);
 
       // 4. Main wakes up when subagents complete, writes final synthesis, and emits terminal Stop (`fullyIdle: true`).
+      const activeBeforeLoop = store.getTask(taskId)?.lastActiveAt ?? 0;
       fs.appendFileSync(mainTp, JSON.stringify({
         step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: nowIso, content: '三轮汇总完毕，请验收。',
       }) + '\n');
       await postHook(sid1, 'PreInvocation', { conversationId: MAIN, lastUserInput: '三角度评审', transcriptPath: mainTp, workspacePaths: ws, modelName: 'gemini-4-carbon-medium' });
       await postHook(sid1, 'Stop', { conversationId: MAIN, lastUserInput: '三角度评审', transcriptPath: mainTp, workspacePaths: ws, fullyIdle: true, continuationActive: false, error: '', modelName: 'gemini-4-carbon-medium' });
+      // Mid-turn PreInvocation and Stop must NOT bump lastActiveAt (prevents sidebar rows jumping while agents work).
+      expect(store.getTask(taskId)?.lastActiveAt).toBe(activeBeforeLoop);
+
+      // A genuine follow-up user turn once idle (`needs_you` -> `working`) DOES bump lastActiveAt.
+      await new Promise(r => setTimeout(r, 5));
+      await postHook(sid1, 'PreInvocation', { conversationId: MAIN, lastUserInput: '再补一个单测', transcriptPath: mainTp, workspacePaths: ws, modelName: 'gemini-4-carbon-medium' });
+      expect((store.getTask(taskId)?.lastActiveAt ?? 0) > activeBeforeLoop).toBe(true);
+      await postHook(sid1, 'Stop', { conversationId: MAIN, lastUserInput: '再补一个单测', transcriptPath: mainTp, workspacePaths: ws, fullyIdle: true, continuationActive: false, error: '', modelName: 'gemini-4-carbon-medium' });
 
       expect(store.getSession(sid1)?.status).toBe('needs_you');
       expect(store.getTask(taskId)?.phase).toBe('review');
-      expect(store.cards()).toHaveLength(1);
+      expect(store.cards()).toHaveLength(2);
       expect(store.cards()[0].body).toContain('三轮汇总完毕，请验收。');
 
       // 5. Server restart / process exit -> clicking Resume passes `--conversation <MAIN>`, NOT reviewer-3!
@@ -323,7 +332,7 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
       await new Promise<void>(resolve => app.server.close(() => resolve()));
       if (prevAgy === undefined) delete process.env.AGY_CONFIG_DIR; else process.env.AGY_CONFIG_DIR = prevAgy;
       if (prevLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = prevLocal;
-      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   });
 

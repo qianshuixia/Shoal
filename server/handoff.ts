@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import type { AgentKind, Card, SessionInfo, Task } from '../shared/protocol.ts';
 import { AGENT_LABEL } from '../shared/protocol.ts';
-import { buildGenerator } from './agents.ts';
+import { availableAgents, buildGenerator } from './agents.ts';
 import { ENV_STRIP } from './sessions.ts';
 import { excerpt } from './transcript.ts';
 import type { Turn } from './transcript.ts';
@@ -98,6 +98,7 @@ export function handoffPrompt(task: Pick<Task, 'title'>, card: string, o: { from
 export async function runHeadless(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number; what: string }): Promise<string | null> {
   const outFile = path.join(o.stateDir, 'handoff', `${crypto.randomUUID()}.md`);
   const launch = buildGenerator(agent, prompt, outFile);
+  if (!launch) return null;
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP.test(k)));
   try {
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
@@ -136,7 +137,10 @@ export async function runHeadless(agent: AgentKind, prompt: string, o: { cwd: st
   }
 }
 
-// Runs the target agent headless to write the card. Null on any failure (logged); never throws.
+// Runs the target agent headless to write the card (when switching to agy, borrows claude/codex if installed, else falls back to excerpt).
+// Null on any failure (logged); never throws.
 export function generateCard(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number }): Promise<string | null> {
-  return runHeadless(agent, prompt, { ...o, what: '生成交接卡片' });
+  const runner = agent === 'agy' ? availableAgents().find((a): a is 'claude' | 'codex' | 'fake' => a === 'claude' || a === 'codex' || a === 'fake') : agent;
+  if (!runner) return Promise.resolve(null);
+  return runHeadless(runner, prompt, { ...o, what: '生成交接卡片' });
 }

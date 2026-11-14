@@ -1,5 +1,39 @@
-import type { SessionStatus, UsageCounts } from '../../shared/protocol.ts';
+import type { SessionInfo, SessionStatus, Task, UsageCounts } from '../../shared/protocol.ts';
 import { usageCacheHitRate } from '../../shared/protocol.ts';
+
+// 0: live active/review/idle/starting, 1: live approved, 2: exited.
+export function taskBand(task: Pick<Task, 'phase'>, session?: Pick<SessionInfo, 'status'>): 0 | 1 | 2 {
+  if (!session || session.status === 'exited') return 2;
+  return task.phase === 'approved' ? 1 : 0;
+}
+
+// Recency key for sorting within a band (descending). Live sessions intentionally ignore statusSince / phaseSince so
+// background hook transitions (working <-> needs_you <-> review) never move rows under the pointer.
+export function taskActivityAt(
+  task: Pick<Task, 'createdAt' | 'phaseSince' | 'lastActiveAt'>,
+  session?: Pick<SessionInfo, 'status' | 'startedAt' | 'statusSince'>,
+): number {
+  const base = Math.max(task.lastActiveAt ?? 0, session?.startedAt ?? 0, task.createdAt);
+  if (!session || session.status === 'exited') {
+    return Math.max(base, session?.statusSince ?? 0, task.phaseSince ?? 0);
+  }
+  return base;
+}
+
+export function sortProjectTasks(tasks: readonly Task[], sessionsById: ReadonlyMap<string, SessionInfo>): Task[] {
+  return [...tasks].sort((a, b) => {
+    const sa = a.sessionId ? sessionsById.get(a.sessionId) : undefined;
+    const sb = b.sessionId ? sessionsById.get(b.sessionId) : undefined;
+    const ba = taskBand(a, sa);
+    const bb = taskBand(b, sb);
+    if (ba !== bb) return ba - bb;
+    return (
+      taskActivityAt(b, sb) - taskActivityAt(a, sa)
+      || (sb?.startedAt ?? 0) - (sa?.startedAt ?? 0)
+      || b.createdAt - a.createdAt
+    );
+  });
+}
 
 export const STATUS_LABEL: Record<SessionStatus, string> = {
   starting: '启动中',

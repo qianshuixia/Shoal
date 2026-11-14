@@ -27,6 +27,7 @@ const SPLASH_HOST: &str = "tauri.localhost";
 
 static CONNECTING: AtomicBool = AtomicBool::new(false);
 static QUITTING: AtomicBool = AtomicBool::new(false);
+static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 // PID of the server this shell started (0: none, or it was already running).
 static SERVER_PID: AtomicU32 = AtomicU32::new(0);
 // Sessions waiting for the user, as the page last put it in its title ("(3) Shoal").
@@ -111,15 +112,20 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
     let state = state_dir();
     std::fs::create_dir_all(&state).map_err(|e| format!("无法创建 {}：{e}", state.display()))?;
     let (out_path, err_path) = (state.join("server.log"), state.join("server.err.log"));
-    // Keep the previous run's logs: after a crash they hold the reason.
+    // Keep the previous run's logs: after a crash they hold the reason. Best-effort on Windows in case an antivirus or
+    // dying child handle still holds the old file for a moment.
     for (cur, prev) in [(&out_path, "server.prev.log"), (&err_path, "server.err.prev.log")] {
         if cur.is_file() {
-            std::fs::rename(cur, state.join(prev))
-                .map_err(|e| format!("无法保留 {} 的上次运行日志：{e}", cur.display()))?;
+            let _ = std::fs::rename(cur, state.join(prev));
         }
     }
-    let out = File::create(&out_path).map_err(|e| format!("无法写入 {}：{e}", out_path.display()))?;
-    let err = File::create(&err_path).map_err(|e| format!("无法写入 {}：{e}", err_path.display()))?;
+    let open_log = |primary: &PathBuf, fallback_name: &str| -> Result<File, String> {
+        File::create(primary)
+            .or_else(|_| File::create(state.join(fallback_name)))
+            .map_err(|e| format!("无法写入 {}：{e}", primary.display()))
+    };
+    let out = open_log(&out_path, "server.restart.log")?;
+    let err = open_log(&err_path, "server.err.restart.log")?;
     let mut child = Command::new(&node)
         .args(["server/main.ts", "--port", &port.to_string()])
         .current_dir(&dir)
@@ -229,6 +235,7 @@ fn connect(w: WebviewWindow) {
         };
         match result {
             Ok(()) => {
+                WATCHDOG_ARMED.store(true, Ordering::SeqCst);
                 if let Err(e) = w.navigate(server_url()) {
                     call(&w, "setError", &format!("打开工作台失败：{e}"));
                 }
@@ -236,6 +243,51 @@ fn connect(w: WebviewWindow) {
             Err(e) => call(&w, "setError", &e),
         }
         CONNECTING.store(false, Ordering::SeqCst);
+    });
+}
+
+// Restarts the bundled server automatically if it dies unexpectedly while the desktop shell is still open.
+// Once restarted, the page's WebSocket reconnect loop picks up the new server and shows the one-click resume banner.
+fn spawn_watchdog(app: AppHandle) {
+    std::thread::spawn(move || {
+        let port = port();
+        let mut missed: u32 = 0;
+        let mut failures: u32 = 0;
+        loop {
+            std::thread::sleep(Duration::from_secs(3));
+            if QUITTING.load(Ordering::SeqCst) {
+                break;
+            }
+            if !WATCHDOG_ARMED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
+                missed = 0;
+                continue;
+            }
+            if port_taken(port) {
+                missed = 0;
+                failures = 0;
+                continue;
+            }
+            missed += 1;
+            if missed < 2 || failures >= 3 {
+                continue;
+            }
+            if CONNECTING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                continue;
+            }
+            let ok = if !QUITTING.load(Ordering::SeqCst) && !port_taken(port) {
+                start_server(&app, port).is_ok()
+            } else {
+                true
+            };
+            CONNECTING.store(false, Ordering::SeqCst);
+            missed = 0;
+            if ok {
+                failures = 0;
+            } else {
+                failures += 1;
+                std::thread::sleep(Duration::from_secs(5 * u64::from(failures)));
+            }
+        }
     });
 }
 
@@ -358,6 +410,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
             "browser" => open_external(app, &server_url()),
             "reload" => {
                 if let Some(w) = app.get_webview_window("main") {
+                    WATCHDOG_ARMED.store(false, Ordering::SeqCst);
                     // Back to the splash page, which reconnects (and restarts the server if it has stopped).
                     let _ = w.navigate(Url::parse(&format!("http://{SPLASH_HOST}/index.html")).unwrap());
                     show(app);
@@ -389,6 +442,7 @@ fn main() {
         .setup(|app| {
             create_window(app.handle())?;
             create_tray(app.handle())?;
+            spawn_watchdog(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

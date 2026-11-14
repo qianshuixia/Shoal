@@ -33,6 +33,7 @@ export interface Task {
   createdAt: number;
   phase: TaskPhase; // missing in state saved before M2: loaded as 'active'
   phaseSince: number; // ms epoch of the last phase change (待验收 sorts by it)
+  lastActiveAt?: number; // ms epoch of the latest user-initiated session/turn activity (sidebar sorts by it within a band)
   lastPrompt?: string; // one-line preview of the latest prompt typed into the current session (see promptPreview); shown under the title
 }
 
@@ -148,6 +149,8 @@ export interface SessionInfo {
   rows: number;
   queued?: number; // messages waiting to be pasted into this session (see POST /api/tasks/:id/feedback); 0/missing = none
   transcriptPath?: string; // the CLI's own conversation file, from hook payloads
+  // True when the session was still running when the previous server exited, until resumed or dismissed.
+  interrupted?: boolean;
   // The session ran out of quota (resetsAt: ms epoch or null); cleared when the next turn starts.
   limit?: { message: string; resetsAt: number | null; at: number };
 }
@@ -343,6 +346,16 @@ export interface ResumeResult {
   task: Task;
   session: SessionInfo;
   resumed: boolean; // false: started a new conversation (asked for, or nothing to reopen)
+  replacedSessionId?: string; // previous session id replaced by this resume
+}
+
+export interface ArchiveStoppedResult {
+  tasks: Task[]; // tasks moved to phase 'archived'
+}
+
+export interface ResumeInterruptedResult {
+  resumed: ResumeResult[];
+  skipped: number; // interrupted sessions that had no conversation to reopen (cleared so they do not re-prompt)
 }
 
 export interface FeedbackBody {

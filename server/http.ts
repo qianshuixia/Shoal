@@ -7,12 +7,12 @@ import { pipeline } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
-  AgentKind, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, Project,
-  GitInfo, RenameTaskBody, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
+  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, Project,
+  GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
 } from '../shared/protocol.ts';
 import { canResume, feedbackPrompt, forwardText } from '../shared/protocol.ts';
 import { clipboardFiles } from './clipboard.ts';
-import { autoArchiveMs, staleApproved } from './autoarchive.ts';
+import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
 import { agyResumeId, agyTranscriptFile, availableAgents, claudeResumeId, ROOT } from './agents.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
@@ -236,10 +236,11 @@ export function createApp(cfg: AppConfig) {
       title = `新任务 ${n}`;
       titleAuto = true;
     }
+    const now = Date.now();
     const task: Task = {
       id: crypto.randomUUID(), projectId: project.id, title, titleAuto, prompt, color: pickColor(store.tasks()),
-      agent, sessionId: null, createdAt: Date.now(),
-      phase: 'active', phaseSince: Date.now(), ...(lastPrompt && { lastPrompt }),
+      agent, sessionId: null, createdAt: now,
+      phase: 'active', phaseSince: now, lastActiveAt: now, ...(lastPrompt && { lastPrompt }),
     };
     let session;
     try {
@@ -280,16 +281,37 @@ export function createApp(cfg: AppConfig) {
     return next;
   }
 
-  // Approved tasks left alone for days, with no running session, move to 已归档 (nothing to kill).
+  // Approved tasks left alone past the limit (default 1 day), or unapproved active exited tasks untouched for 14 days,
+  // with no running session, move to 已归档 (待验收 is never auto-archived).
   const archiveMs = autoArchiveMs(process.env.WORKBENCH_AUTO_ARCHIVE_DAYS);
+  const archiveInactiveMs = autoArchiveInactiveMs(process.env.WORKBENCH_AUTO_ARCHIVE_INACTIVE_DAYS);
   function autoArchive() {
-    if (!archiveMs) return;
+    if (!archiveMs && !archiveInactiveMs) return;
+    const now = Date.now();
     const live = new Set(sessions.list().filter(s => s.status !== 'exited').map(s => s.id));
-    for (const t of staleApproved(store.tasks(), live, Date.now(), archiveMs)) setPhase(t, 'archived');
+    const stale = staleTasks(store.tasks(), live, now, archiveMs, archiveInactiveMs);
+    if (!stale.length) return;
+    const updated = stale.map(t => ({ ...t, phase: 'archived' as const, phaseSince: now }));
+    store.updateTasks(updated);
+    for (const task of updated) broadcast({ t: 'task', task });
   }
   autoArchive();
   const archiveTimer = setInterval(autoArchive, 3600_000);
   archiveTimer.unref();
+
+  function archiveStoppedTasks(projectId: string): ArchiveStoppedResult {
+    const project = store.getProject(projectId);
+    if (!project) throw new HttpError(404, '项目不存在');
+    const now = Date.now();
+    const live = new Set(sessions.list().filter(s => s.status !== 'exited').map(s => s.id));
+    const targets = store.tasks().filter(
+      t => t.projectId === project.id && t.phase !== 'archived' && t.phase !== 'review' && !(t.sessionId && live.has(t.sessionId)),
+    );
+    const updated = targets.map(t => ({ ...t, phase: 'archived' as const, phaseSince: now }));
+    store.updateTasks(updated);
+    for (const task of updated) broadcast({ t: 'task', task });
+    return { tasks: updated };
+  }
 
   // Spawns a session for the task and makes it the current one; the old session is killed and forgotten so a task never piles up dead ones.
   function replaceSession(
@@ -306,7 +328,7 @@ export function createApp(cfg: AppConfig) {
       sessions.remove(prev.id);
       store.removeSession(prev.id);
     }
-    const next: Task = { ...task, ...patch, sessionId: session.id };
+    const next: Task = { ...task, ...patch, sessionId: session.id, lastActiveAt: session.startedAt };
     store.updateTask(next);
     store.saveSession(session);
     broadcast({ t: 'task', task: next });
@@ -340,7 +362,50 @@ export function createApp(cfg: AppConfig) {
       cols: typeof body.cols === 'number' ? body.cols : undefined,
       rows: typeof body.rows === 'number' ? body.rows : undefined,
     });
-    return { task: next, session, resumed: native !== undefined };
+    return { task: next, session, resumed: native !== undefined, ...(prev && { replacedSessionId: prev.id }) };
+  }
+
+  function dismissInterrupted() {
+    const cleared = sessions.clearInterrupted();
+    store.saveSessions(cleared);
+    for (const session of cleared) broadcast({ t: 'session', session });
+    return { ok: true };
+  }
+
+  function resumeInterrupted(b: Record<string, unknown>): ResumeInterruptedResult {
+    const cols = typeof b.cols === 'number' ? b.cols : undefined;
+    const rows = typeof b.rows === 'number' ? b.rows : undefined;
+    const byId = new Map(sessions.list().map(s => [s.id, s]));
+    const avail = new Set(availableAgents());
+    const candidates = store.tasks()
+      .filter(t => {
+        if (t.phase === 'archived' || !t.sessionId) return false;
+        const s = byId.get(t.sessionId);
+        return !!s && s.status === 'exited' && s.interrupted === true;
+      })
+      .sort((a, b) => (a.lastActiveAt ?? a.createdAt) - (b.lastActiveAt ?? b.createdAt));
+
+    const resumed: ResumeResult[] = [];
+    let skipped = 0;
+    for (const task of candidates) {
+      const prev = task.sessionId ? byId.get(task.sessionId) : undefined;
+      const project = store.getProject(task.projectId);
+      const native = prev && project && avail.has(task.agent) ? resumableNative(prev) : undefined;
+      if (!prev || !project || !native) {
+        skipped++;
+        continue;
+      }
+      try {
+        const r = replaceSession(task, project, prev, { prompt: '', resume: native, cols, rows });
+        resumed.push({ task: r.task, session: r.session, resumed: true, replacedSessionId: prev.id });
+      } catch {
+        skipped++;
+      }
+    }
+    const cleared = sessions.clearInterrupted();
+    store.saveSessions(cleared);
+    for (const session of cleared) broadcast({ t: 'session', session });
+    return { resumed, skipped };
   }
 
   function addCard(task: Task, sessionId: string, kind: Card['kind'], text: string, meta?: Card['meta']): Card {
@@ -357,7 +422,7 @@ export function createApp(cfg: AppConfig) {
   ): { task: Task; session: SessionInfo } {
     if (!prev) throw new HttpError(400, errors.noSession);
     if (prev.status !== 'exited') {
-      const next: Task = { ...task, ...patch };
+      const next: Task = { ...task, ...patch, lastActiveAt: Date.now() };
       store.updateTask(next);
       broadcast({ t: 'task', task: next });
       sessions.enqueue(prev.id, text);
@@ -483,17 +548,23 @@ export function createApp(cfg: AppConfig) {
     void refreshGit(task.projectId); // the turn probably changed files
   }
 
-  // The latest prompt of the task's current session, as a second line under the title.
-  function updateLastPrompt(body: HookBody) {
+  // The latest prompt of the task's current session (second line under the title) and user-initiated turn recency.
+  function updateLastPrompt(body: HookBody, userTurn: boolean) {
     const p = (body.payload ?? {}) as Record<string, unknown>;
     const text = body.event === 'UserPromptSubmit' ? p.prompt : body.event === 'PreInvocation' ? p.lastUserInput : undefined;
-    if (typeof text !== 'string' || text.trimStart().startsWith('/')) return;
-    const preview = promptPreview(text);
-    if (!preview) return;
+    const preview = typeof text === 'string' && !text.trimStart().startsWith('/') ? promptPreview(text) : '';
+    if (!preview && !userTurn) return;
     const session = sessions.list().find(s => s.id === body.sessionId);
     const old = session ? store.getTask(session.taskId) : undefined;
-    if (!old || old.sessionId !== body.sessionId || old.lastPrompt === preview) return;
-    const task: Task = { ...old, lastPrompt: preview };
+    if (!old || old.sessionId !== body.sessionId) return;
+    const nextPreview = preview || old.lastPrompt;
+    const nextActive = userTurn ? Date.now() : old.lastActiveAt;
+    if (nextPreview === old.lastPrompt && nextActive === old.lastActiveAt) return;
+    const task: Task = {
+      ...old,
+      ...(nextPreview !== undefined && { lastPrompt: nextPreview }),
+      ...(nextActive !== undefined && { lastActiveAt: nextActive }),
+    };
     store.updateTask(task);
     broadcast({ t: 'task', task });
   }
@@ -504,7 +575,7 @@ export function createApp(cfg: AppConfig) {
     if (!store.settings().aiTitles) return;
     const task = store.getTask(taskId);
     const project = task ? store.getProject(task.projectId) : undefined;
-    if (!task || !project) return;
+    if (!task || !project || task.agent === 'agy') return;
     void runHeadless(task.agent, titlePrompt(text), { cwd: project.path, stateDir: cfg.stateDir, timeoutMs: 60_000, what: '生成标题' })
       .then(out => {
         const title = out ? titleFromReply(out) : '';
@@ -642,6 +713,10 @@ export function createApp(cfg: AppConfig) {
     }
     if (method === 'POST' && pathname === '/api/projects') return send(res, 200, createProject(body));
     if (method === 'POST' && pathname === '/api/tasks') return send(res, 200, createTask(body));
+    if (method === 'POST' && pathname === '/api/sessions/resume-interrupted') return send(res, 200, resumeInterrupted(body));
+    if (method === 'POST' && pathname === '/api/sessions/dismiss-interrupted') return send(res, 200, dismissInterrupted());
+    const pas = pathname.match(/^\/api\/projects\/([^/]+)\/archive-stopped$/);
+    if (method === 'POST' && pas) return send(res, 200, archiveStoppedTasks(decodeURIComponent(pas[1])));
     const r = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
     if (method === 'POST' && r) return send(res, 200, resumeTask(r[1], body));
     const sw = pathname.match(/^\/api\/tasks\/([^/]+)\/switch$/);
@@ -735,10 +810,11 @@ export function createApp(cfg: AppConfig) {
     if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) throw new HttpError(401, 'unauthorized');
     const b = parseJson(await readBody(req)) as Partial<HookBody>;
     if (typeof b.sessionId !== 'string' || typeof b.event !== 'string') throw new HttpError(400, 'bad hook body');
-    if (sessions.hook(b as HookBody)) { // unknown sessions are logged and ignored
+    const hookRes = sessions.hook(b as HookBody);
+    if (hookRes) { // unknown sessions are logged and ignored
       observeQuota(b as HookBody);
       autoRename(b as HookBody);
-      updateLastPrompt(b as HookBody);
+      updateLastPrompt(b as HookBody, hookRes.userTurn);
       if (b.event === 'Stop') onStop(b as HookBody);
       if (b.event === 'Stop' || b.event === 'PostInvocation') refreshTelemetry(true);
     }

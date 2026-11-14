@@ -77,6 +77,8 @@ kbd {
   box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, .35);
 }
 .banner[data-testid="conn-banner"] { color: var(--signal); border-color: rgba(227, 182, 103, .35); }
+.banner.resume-banner { display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0.5rem 0.25rem 0.75rem; font-size: 0.78125rem; white-space: nowrap; }
+.banner.resume-banner .banner-btn { height: 1.5rem; padding: 0 0.5625rem; font-size: 0.75rem; border-radius: 0.3125rem; }
 
 /* Top bar */
 .topbar {
@@ -149,7 +151,7 @@ kbd {
 .seg .seg-btn.on { background: var(--active); color: var(--text); }
 
 /* Sidebar */
-.sidebar { position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--side); border-right: 1px solid var(--line); }
+.sidebar { container: sidebar / inline-size; position: relative; display: flex; flex-direction: column; min-height: 0; background: var(--side); border-right: 1px solid var(--line); }
 .side-resizer { position: absolute; z-index: 5; top: 0; bottom: 0; right: -0.25rem; width: 0.5rem; cursor: col-resize; touch-action: none; }
 .side-resizer:hover, .side-resizer:active { background: linear-gradient(var(--line-2), var(--line-2)) center / 2px 100% no-repeat; }
 .side-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.125rem; padding: 0.5rem 0.5rem 0.375rem 0.625rem; }
@@ -175,15 +177,35 @@ kbd {
 .group-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
 .group-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .group-branch {
-  flex: 0 100 auto; min-width: 0; display: inline-flex; align-items: center; gap: 0.25rem; padding: 0 0.4375rem; margin-left: 0.125rem;
+  flex: 0 20 auto; min-width: 2.75rem; overflow: hidden; display: inline-flex; align-items: center; gap: 0.25rem; padding: 0 0.4375rem; margin-left: 0.125rem;
   background: transparent; border: 0; border-radius: 999px;
-  font-size: 0.6875rem; font-weight: 400; line-height: 1.45; white-space: nowrap; color: var(--text-3); box-shadow: inset 0 0 0 1px var(--line);
+  font-size: 0.6875rem; font-weight: 400; line-height: 1.45; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text-3); box-shadow: inset 0 0 0 1px var(--line);
   cursor: pointer; transition: color .12s, background-color .12s, box-shadow .12s;
 }
+.group-branch[data-dirty="true"] { min-width: 3.875rem; }
+.group-branch.short-branch { flex-shrink: 0; min-width: min-content; }
 .group-branch:hover:not(:disabled) { color: var(--text); background: var(--active); box-shadow: inset 0 0 0 1px var(--line-2); }
 .branch-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.branch-dirty { flex: none; opacity: .8; }
-.group-count { margin-left: auto; flex: none; color: var(--text-3); font-size: 0.75rem; }
+.group-branch.short-branch .branch-name { flex: none; }
+.branch-dirty { flex: none; opacity: .85; }
+/* When the sidebar is narrow (or a folded row also shows status pills), collapse dirty chips to ±N so the pill never turns into an empty circle or spills over the task count. */
+@container sidebar (max-width: 14.5rem) {
+  .group-branch { flex: 0 20 auto; min-width: 2.25rem; padding: 0 0.375rem; }
+  .group-branch:not([data-dirty="true"]) .branch-name { flex: 0 1 auto; min-width: 0; max-width: 3rem; }
+  .group-branch[data-dirty="true"] { flex-shrink: 0; min-width: min-content; gap: 0; color: var(--text-2); }
+  .group-branch[data-dirty="true"] .branch-name,
+  .group-branch[data-dirty="true"] .branch-sep { display: none; }
+  .group-branch[data-dirty="true"] .branch-dirty { opacity: 1; }
+  .group-branch[data-dirty="true"] .branch-dirty::before { content: "±"; margin-right: 0.0625rem; color: var(--text-3); }
+}
+@container sidebar (max-width: 18rem) {
+  .group-head:has(.group-live, .group-needs, .group-review) .group-branch[data-dirty="true"] { flex-shrink: 0; min-width: min-content; gap: 0; padding: 0 0.375rem; color: var(--text-2); }
+  .group-head:has(.group-live, .group-needs, .group-review) .group-branch[data-dirty="true"] .branch-name,
+  .group-head:has(.group-live, .group-needs, .group-review) .group-branch[data-dirty="true"] .branch-sep { display: none; }
+  .group-head:has(.group-live, .group-needs, .group-review) .group-branch[data-dirty="true"] .branch-dirty { opacity: 1; }
+  .group-head:has(.group-live, .group-needs, .group-review) .group-branch[data-dirty="true"] .branch-dirty::before { content: "±"; margin-right: 0.0625rem; color: var(--text-3); }
+}
+.group-count { margin-left: auto; flex: none; padding-left: 0.25rem; color: var(--text-3); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
 .group-needs { margin-left: auto; flex: none; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.7188rem; white-space: nowrap; color: var(--signal); background: var(--signal-bg); }
 .group-review { margin-left: auto; flex: none; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.7188rem; white-space: nowrap; color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2); }
 /* Folded project with running tasks: "● N 工作中" ahead of the other marks. */
@@ -266,9 +288,22 @@ kbd {
 .task-row:hover > .queued-mark, .task-row:focus-within > .queued-mark { display: none; }
 .queued-mark { flex: none; font-size: 0.75rem; color: var(--text-3); }
 .task-row .remove:hover:not(:disabled) { color: var(--danger); background: rgba(224, 122, 115, .12); }
-/* 活跃 filter: the stopped tasks left out of a group. */
-.group-hidden { display: block; width: 100%; padding: 0.25rem 0.5rem 0.25rem 1.75rem; background: transparent; border: 0; text-align: left; color: var(--text-3); font-size: 0.75rem; }
+/* Stopped-history fold & one-click project tidy bar. */
+.group-foot { display: flex; align-items: center; gap: 0.25rem; padding: 0.125rem 0.375rem 0.125rem 1.625rem; }
+.group-hidden {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 0.125rem 0.125rem; background: transparent; border: 0; text-align: left; color: var(--text-3); font-size: 0.75rem;
+}
 .group-hidden:hover:not(:disabled) { background: transparent; color: var(--text-2); }
+.group-tidy {
+  margin-left: auto; flex: none; padding: 0.125rem 0.375rem; background: transparent; border: 0; border-radius: 0.25rem;
+  white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text-3); font-size: 0.7188rem; opacity: .75;
+}
+.group:hover .group-tidy, .group:focus-within .group-tidy { opacity: 1; }
+.group-tidy:hover:not(:disabled) { background: var(--hover); color: var(--text-2); }
+@container sidebar (max-width: 14.5rem) {
+  .group-foot { padding-left: 1.125rem; }
+}
 /* Quiet until the row is hovered: a column of outlined chips was the loudest thing in the sidebar. */
 .resume-chip {
   flex: none; height: 1.25rem; padding: 0 0.5rem; font-size: 0.75rem; line-height: 1.125rem;

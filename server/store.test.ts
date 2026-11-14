@@ -39,15 +39,21 @@ describe('file store', () => {
     expect(b.sessions().map(s => s.id)).toEqual(['s-t1']);
   });
 
-  it('marks non-exited sessions as exited on load and keeps nativeSessionId', () => {
+  it('marks non-exited sessions as exited + interrupted on load and keeps nativeSessionId', () => {
     const a = createFileStore(file);
     a.addTask(task('t1'));
+    a.addTask(task('t2'));
     a.saveSession(session('s-t1', 't1', 'working'));
-    const [s] = createFileStore(file).sessions();
-    expect(s.status).toBe('exited');
-    expect(s.exitCode).toBeNull();
-    expect(s.statusSince).toBeGreaterThan(1);
-    expect(s.nativeSessionId).toBe('native-s-t1');
+    a.saveSession(session('s-t2', 't2', 'exited'));
+    const loaded = createFileStore(file).sessions();
+    const s1 = loaded.find(x => x.id === 's-t1')!;
+    const s2 = loaded.find(x => x.id === 's-t2')!;
+    expect(s1.status).toBe('exited');
+    expect(s1.interrupted).toBe(true);
+    expect(s1.exitCode).toBeNull();
+    expect(s1.statusSince).toBeGreaterThan(1);
+    expect(s1.nativeSessionId).toBe('native-s-t1');
+    expect(s2.interrupted).toBeUndefined();
   });
 
   it('keeps a corrupt file as state.json.corrupt-* and starts empty', () => {

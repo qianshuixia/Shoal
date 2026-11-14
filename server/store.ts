@@ -22,9 +22,11 @@ export interface Store {
   addProject(p: Project): void;
   addTask(t: Task): void;
   updateTask(t: Task): void;
+  updateTasks(ts: Task[]): void;
   removeTask(id: string): void; // also drops the task's sessions and cards
   removeProject(id: string): void; // also drops all its tasks, their sessions and cards (one save)
   saveSession(s: SessionInfo): void;
+  saveSessions(ss: SessionInfo[]): void;
   removeSession(id: string): void;
   addCard(c: Card): void; // keeps only the newest CARDS_PER_TASK cards of the task
 }
@@ -58,6 +60,11 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
     addProject: p => { projects.set(p.id, p); onChange(store); },
     addTask: t => { tasks.set(t.id, t); onChange(store); },
     updateTask: t => { tasks.set(t.id, t); onChange(store); },
+    updateTasks: ts => {
+      if (!ts.length) return;
+      for (const t of ts) tasks.set(t.id, t);
+      onChange(store);
+    },
     removeTask: id => {
       tasks.delete(id);
       for (const [sid, s] of sessions) if (s.taskId === id) sessions.delete(sid);
@@ -73,6 +80,11 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
       onChange(store);
     },
     saveSession: s => { sessions.set(s.id, { ...s }); onChange(store); },
+    saveSessions: ss => {
+      if (!ss.length) return;
+      for (const s of ss) sessions.set(s.id, { ...s });
+      onChange(store);
+    },
     removeSession: id => { if (sessions.delete(id)) onChange(store); },
     addCard: c => {
       cards.set(c.id, c);
@@ -136,10 +148,14 @@ export function createFileStore(file: string): Store {
         for (const [t, title] of oldTitles) t.title = title;
       }
     }
-    // Their processes died with the previous server.
-    init.sessions = init.sessions.map(({ queued: _q, ...s }) => s.status === 'exited'
-      ? s
-      : { ...s, status: 'exited', exitCode: null, statusSince: Date.now() }); // queues do not survive a restart
+    // Their processes died with the previous server; mark ones that were still live as interrupted so the UI can offer one-click resume.
+    let markedInterrupted = false;
+    init.sessions = init.sessions.map(({ queued: _q, ...s }) => {
+      if (s.status === 'exited') return s;
+      markedInterrupted = true;
+      return { ...s, status: 'exited', exitCode: null, statusSince: Date.now(), interrupted: true }; // queues do not survive a restart
+    });
+    if (markedInterrupted) migrated = true;
   }
   const flush = (store: Store) => {
     const data: StateFile = { version: 1, projects: store.projects(), tasks: store.tasks(), sessions: store.sessions(), cards: store.cards(), settings: store.settings() };

@@ -1,7 +1,8 @@
 // Sidebar tidiness: row order inside a project, one archive for all projects, resizable width.
 //
 // Known failure modes -> expected behaviour (pass criterion):
-// 1. Stopped tasks bury the running ones -> running first, approved next, stopped last; creation order within a band.
+// 1. Stopped tasks bury the running ones, or older tasks stay above newly active ones
+//    -> running first, approved next, stopped last; most recently active first within each band.
 // 2. An archived task still shows inside its project / each project grows its own 已归档 line
 //    -> no archive toggle inside any project; one folded 已归档 section at the bottom, grouped by project.
 // 3. The archive fold is forgotten on reload -> open state survives reload.
@@ -37,10 +38,10 @@ test('rows: running, approved, stopped; archive at the bottom; count only when c
   await expect(row(page, done.session.id).getByTestId('status')).toHaveText('已通过');
 
   const titles = group(page, project.id).locator('.task-title');
-  await expect(titles).toHaveText(['还在跑的', '后建的', '已通过的', '已停止的']);
+  await expect(titles).toHaveText(['后建的', '还在跑的', '已通过的', '已停止的']);
   // Status changes inside the running band do not move rows.
   await expectStatus(page, later.session.id, 'needs_you');
-  await expect(titles).toHaveText(['还在跑的', '后建的', '已通过的', '已停止的']);
+  await expect(titles).toHaveText(['后建的', '还在跑的', '已通过的', '已停止的']);
 
   await expect(group(page, project.id).locator('.group-count')).toHaveCount(0);
 
@@ -86,7 +87,11 @@ test('rows: running, approved, stopped; archive at the bottom; count only when c
   await row(page, busy.session.id).getByTestId('task-unarchive').click();
   await expect(titles).toHaveText(['后建的', '已通过的', '还在跑的']);
 
-  // 后建的 finished its turn: the collapsed head says 1 待验收 instead of the plain count.
+  // Resuming a stopped task promotes its new live session to the very top of the project.
+  await row(page, busy.session.id).getByTestId('task-resume').click();
+  await expect(titles).toHaveText(['还在跑的', '后建的', '已通过的']);
+
+  // Collapse check: 1 待验收 ('后建的') shows on the collapsed header instead of plain count.
   await group(page, project.id).getByTestId('project-toggle').click();
   await expect(group(page, project.id).getByTestId('group-review')).toHaveText('1 待验收');
   await expect(group(page, project.id).locator('.group-count')).toHaveCount(0);

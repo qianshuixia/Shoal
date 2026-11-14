@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { bumpReleaseVersion } from './bump-release-version.mjs';
+import { buildReleaseBody, extractChangelogSection, INSTALLER_NOTES } from './release-notes.mjs';
 
 const fixture = version => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shoal-release-'));
@@ -51,4 +52,21 @@ test('missing or malformed versions fail before writing', () => {
   fs.writeFileSync(path.join(valid.dir, 'Cargo.lock'), 'version = 4\n');
   assert.throws(() => bumpReleaseVersion(valid.root, ''), /Missing desktop version/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(valid.dir, 'tauri.conf.json'), 'utf8')).version, '0.1.1');
+});
+
+test('release notes extract matching CHANGELOG section (including v0.1.10) or fall back cleanly', () => {
+  const realChangelog = fs.readFileSync(path.resolve(import.meta.dirname, '..', 'CHANGELOG.md'), 'utf8');
+  const v0110 = extractChangelogSection(realChangelog, '0.1.10');
+  assert.match(v0110, /项目内会话按最新活跃置顶/);
+  assert.match(v0110, /桌面端服务崩溃自愈重连与一键原位续接/);
+  assert.doesNotMatch(v0110, /0\.1\.9/);
+
+  const full = buildReleaseBody({ version: '0.1.10', changelogText: realChangelog });
+  assert.match(full, /^## 更新日志 \(v0\.1\.10\)/);
+  assert.ok(full.endsWith(INSTALLER_NOTES));
+
+  const fallback = buildReleaseBody({ version: '9.9.9', changelogText: realChangelog, fallbackCommits: '- 修复某问题\n' });
+  assert.match(fallback, /## 更新日志 \(v9\.9\.9\)\n\n- 修复某问题/);
+
+  assert.equal(buildReleaseBody({ version: '9.9.9' }), INSTALLER_NOTES);
 });

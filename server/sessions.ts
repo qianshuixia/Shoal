@@ -39,6 +39,7 @@ interface Live {
   tail: string; // end of the previous PTY chunk, so a mode switch split across chunks is still seen
   trimmed: boolean; // buf has lost its start
   firstOutAt: number; // 0 until the PTY first writes
+  initialPromptPending: boolean; // true until the launch prompt's first hook arrives, so spawn jitter cannot reorder tasks
 }
 
 // DEC private modes that change how the page's terminal behaves: alternate screen, mouse reporting (Claude Code's
@@ -206,6 +207,19 @@ export class SessionManager {
     for (const i of infos) this.dead.set(i.id, i);
   }
 
+  // Clears the `interrupted` flag on restored sessions (e.g. when the user dismisses the recovery banner or batch-resumes).
+  clearInterrupted(onlyIds?: ReadonlySet<string>): SessionInfo[] {
+    const cleared: SessionInfo[] = [];
+    for (const [id, info] of this.dead) {
+      if (!info.interrupted || (onlyIds && !onlyIds.has(id))) continue;
+      const next = { ...info };
+      delete next.interrupted;
+      this.dead.set(id, next);
+      cleared.push(next);
+    }
+    return cleared;
+  }
+
   list(): SessionInfo[] {
     return [...this.dead.values(), ...[...this.live.values()].map(s => s.info)];
   }
@@ -250,6 +264,7 @@ export class SessionManager {
       },
       cwd: o.cwd, proc, buf: '', quiet: null, removed: false,
       queue: [], permBlocked: false, lastInputAt: 0, lastDeliveryAt: 0, modes: new Map(), tail: '', trimmed: false, firstOutAt: 0,
+      initialPromptPending: Boolean(o.prompt && !o.resume),
     };
     this.live.set(id, s);
     this.armQuiet(s);
@@ -299,7 +314,7 @@ export class SessionManager {
     this.emit({ t: 'session', session: s.info });
   }
 
-  hook(body: HookBody): boolean {
+  hook(body: HookBody): false | { userTurn: boolean } {
     this.log({ kind: 'hook', ...body });
     const s = this.live.get(body.sessionId);
     if (!s) {
@@ -307,6 +322,8 @@ export class SessionManager {
       return false;
     }
     const p = (body.payload ?? {}) as Record<string, unknown>;
+    const beforeStatus = s.info.status;
+    const beforeNative = s.info.nativeSessionId;
     let changed = false;
     if (s.info.agent === 'agy') {
       const act = agyHookDisposition({
@@ -350,6 +367,16 @@ export class SessionManager {
       s.info.resumable = true;
       changed = true;
     }
+    let userTurn = false;
+    if (PROMPT_EVENTS.has(body.event)) {
+      if (s.initialPromptPending) {
+        s.initialPromptPending = false;
+      } else if (body.event === 'UserPromptSubmit' || beforeStatus !== 'working' || s.info.nativeSessionId !== beforeNative) {
+        userTurn = true;
+      }
+    } else if (body.event === 'SessionStart' && beforeNative !== null && s.info.nativeSessionId !== beforeNative) {
+      userTurn = true;
+    }
     const lim = detectLimit(s.info.agent, body.event, p);
     if (lim) {
       if (s.info.agent === 'claude' && lim.resetsAt === null && s.info.transcriptPath) lim.resetsAt = readResetsAt(s.info.transcriptPath);
@@ -364,7 +391,7 @@ export class SessionManager {
     const before = s.info.status;
     this.apply(s, { type: 'hook', event: body.event });
     if (changed && s.info.status === before) this.emit({ t: 'session', session: s.info });
-    return true;
+    return { userTurn };
   }
 
   input(id: string, d: string) {
