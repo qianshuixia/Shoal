@@ -188,7 +188,7 @@ function submit() {
     askText = echo;
   } else if (cmd === 'menu') {
     hook('PermissionRequest', { tool_name: 'Fake' });
-    out("Do you want to proceed?\r\n 1. Yes\r\n 2. Yes, and don't ask again\r\n 3. No, keep asking");
+    out("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. Yes, and don't ask again\r\n  3. No, keep asking");
     mode = 'menu';
     askText = echo;
   } else if (cmd === 'shoal') {
@@ -331,9 +331,11 @@ process.stdin.on('data', feed);
 process.stdin.resume();
 
 out('\x1b[?2004h'); // bracketed paste on, like the real CLIs
-out(`FAKE AGENT ${sid.slice(0, 8)}${resumeId ? ` RESUMED ${resumeId}` : ''}\r\n> `);
-hook('SessionStart', { source: resumeId ? 'resume' : 'startup' });
 const TRUST_MARK = '[[trust]]';
+const banner = `FAKE AGENT ${sid.slice(0, 8)}${resumeId ? ` RESUMED ${resumeId}` : ''}\r\n`;
+// The startup dialog comes before the input line, like the real CLIs.
+out(initialPrompt?.startsWith(TRUST_MARK) ? banner : `${banner}> `);
+hook('SessionStart', { source: resumeId ? 'resume' : 'startup' });
 let trustPrompt = '';
 if (initialPrompt?.startsWith(TRUST_MARK)) {
   // Startup folder-trust prompt: printed before any turn, so the server flags the session as blocked (startup).

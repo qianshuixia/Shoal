@@ -20,14 +20,21 @@ export function ConfirmSheet({
   onConfirm(): void;
   onCancel(): void;
 }) {
-  // Once confirmed, neither a second tap nor the system back key may fire onConfirm / onCancel again.
-  const confirmedRef = useRef(false);
-  const [confirmed, setConfirmed] = useState(false);
+  // The first of confirm / cancel wins, set synchronously on the tap: neither a second tap, the other button nor the
+  // system back key may fire onConfirm / onCancel after it.
+  const settledRef = useRef<'confirm' | 'cancel' | null>(null);
+  const [settled, setSettled] = useState(false);
   const layer = useBackLayer(true, () => {
-    if (!confirmedRef.current) onCancel();
+    if (settledRef.current !== 'confirm') onCancel();
   });
+  const cancel = () => {
+    if (settledRef.current) return;
+    settledRef.current = 'cancel';
+    setSettled(true);
+    layer.close();
+  };
   return (
-    <div className="mob-sheet-backdrop mob-confirm-backdrop" onMouseDown={(e) => e.target === e.currentTarget && !confirmedRef.current && layer.close()}>
+    <div className="mob-sheet-backdrop mob-confirm-backdrop" onMouseDown={(e) => e.target === e.currentTarget && cancel()}>
       <div className="mob-sheet" data-testid="mobile-confirm-sheet" role="alertdialog" aria-label={title}>
         <h3>{title}</h3>
         <div className="mob-sub" style={{ whiteSpace: 'normal', fontSize: '0.875rem', color: 'var(--text-2)' }} data-testid="mobile-confirm-message">{message}</div>
@@ -35,15 +42,15 @@ export function ConfirmSheet({
           type="button"
           className={`mob-btn ${danger ? 'danger' : 'primary'}`}
           data-testid="mobile-confirm-ok"
-          disabled={confirmed}
+          disabled={settled}
           onClick={() => {
-            if (confirmedRef.current) return;
-            confirmedRef.current = true;
-            setConfirmed(true);
+            if (settledRef.current) return;
+            settledRef.current = 'confirm';
+            setSettled(true);
             layer.popThen(onConfirm);
           }}
         >{confirmLabel}</button>
-        <button type="button" className="mob-btn ghost" data-testid="mobile-confirm-cancel" disabled={confirmed} onClick={layer.close}>取消</button>
+        <button type="button" className="mob-btn ghost" data-testid="mobile-confirm-cancel" disabled={settled} onClick={cancel}>取消</button>
       </div>
     </div>
   );

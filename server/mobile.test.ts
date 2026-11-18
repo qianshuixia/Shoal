@@ -445,6 +445,37 @@ describe('mobile gateway & security integration', () => {
     }
   }
 
+  it('delivers Enter once for the fake agent startup trust prompt', async () => {
+    const { repo, mainPort, sessions } = await bootApp();
+    const baseMain = `http://127.0.0.1:${mainPort}`;
+    const projectRes = await fetch(`${baseMain}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'P', path: repo }),
+    });
+    expect(projectRes.status).toBe(200);
+    const project = (await projectRes.json()) as { id: string };
+    const taskRes = await fetch(`${baseMain}/api/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: project.id, agent: 'fake', title: 'Trust', prompt: '[[trust]] after-trust', cols: 120, rows: 30 }),
+    });
+    expect(taskRes.status).toBe(200);
+    const { task, session } = (await taskRes.json()) as { task: { id: string }; session: { id: string } };
+    const { call } = await pairPhone(baseMain);
+    await waitFor(() => sessions.replayOf(session.id)?.includes('Press Enter to continue'));
+    const path = `/api/mobile/tasks/${task.id}`;
+    const { prompt } = (await (await call('GET', `${path}/prompt`)).json()) as {
+      prompt: { kind: string; keys: { data: string }[]; fingerprint: string; waitSeq: number };
+    };
+    expect(prompt.kind).toBe('confirm');
+    expect(prompt.keys.map(key => key.data)).toEqual(['\r']);
+    const answer = { fingerprint: prompt.fingerprint, waitSeq: prompt.waitSeq, data: '\r' };
+    expect((await call('POST', `${path}/prompt-answer`, answer)).status).toBe(200);
+    const repeated = await call('POST', `${path}/prompt-answer`, answer);
+    expect(repeated.status).toBe(409);
+    expect(await repeated.json()).toMatchObject({ code: 'stale' });
+    await waitFor(() => sessions.replayOf(session.id)?.includes('> after-trust'));
+    await waitFor(() => !sessions.promptWait(session.id));
+  });
+
   it('answers a blocked prompt only while the same prompt waits, replays retried feedback, and binds approval to the round', async () => {
     const { repo, mainPort, sessions, store } = await bootApp();
     const baseMain = `http://127.0.0.1:${mainPort}`;
@@ -491,9 +522,11 @@ describe('mobile gateway & security integration', () => {
     await waitFor(() => !sessionOf()?.blocked && sessionOf()?.status !== 'working');
     sessions.input(sid, 'ask\r');
     await waitFor(() => sessionOf()?.blocked === 'permission');
-    const asked = ((await (await call('GET', promptPath)).json()) as { prompt: { fingerprint: string } }).prompt;
-    const seq = sessions.promptWait(sid)!.waitSeq;
-    expect(sessions.answerPrompt(sid, seq + 1, 'y')).toBe(false);
+    const asked = ((await (await call('GET', promptPath)).json()) as { prompt: { fingerprint: string; waitSeq: number } }).prompt;
+    const w0 = sessions.promptWait(sid)!;
+    expect(asked.waitSeq).toBe(w0.waitSeq);
+    expect(sessions.answerPrompt(sid, w0.waitSeq + 1, w0.outSeq, 'y')).toBe('stale');
+    expect(sessions.answerPrompt(sid, w0.waitSeq, w0.outSeq - 1, 'y')).toBe('redrawn');
     const realWait = sessions.promptWait.bind(sessions);
     const wait = vi.spyOn(sessions, 'promptWait').mockImplementationOnce(id => {
       const w = realWait(id);
@@ -501,11 +534,75 @@ describe('mobile gateway & security integration', () => {
       return w;
     });
     const raceWrites = vi.spyOn(sessions, 'input');
-    const raced = await call('POST', answerPath, { fingerprint: asked.fingerprint, data: 'y' });
+    const raced = await call('POST', answerPath, { fingerprint: asked.fingerprint, waitSeq: asked.waitSeq, data: 'y' });
     expect(raced.status).toBe(409);
+    // The wait itself moved on (someone answered): "already handled", not "look again".
+    expect(await raced.json()).toMatchObject({ code: 'stale' });
     expect(raceWrites.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(0);
     raceWrites.mockRestore();
     wait.mockRestore();
+
+    // Output lands while the screen renders, without any input: a different prompt now on screen is refused, the
+    // same prompt redrawn is read again and answered once.
+    await waitFor(() => !sessionOf()?.blocked && sessionOf()?.status !== 'working');
+    sessions.input(sid, 'ask\r');
+    await waitFor(() => sessionOf()?.blocked === 'permission');
+    const live = (sessions as unknown as { live: Map<string, { outSeq: number; buf: string }> }).live.get(sid)!;
+    const outputDuringRead = (change: () => void) => vi.spyOn(sessions, 'promptWait').mockImplementationOnce(id => {
+      const w = realWait(id);
+      queueMicrotask(change);
+      return w;
+    });
+    const before = ((await (await call('GET', promptPath)).json()) as { prompt: { fingerprint: string; waitSeq: number } }).prompt;
+    const swapWrites = vi.spyOn(sessions, 'input');
+    const swapWait = outputDuringRead(() => {
+      live.buf += '\r\nDelete everything? (y/n)';
+      live.outSeq++;
+    });
+    const swapped = await call('POST', answerPath, { fingerprint: before.fingerprint, waitSeq: before.waitSeq, data: 'y' });
+    expect(swapped.status).toBe(409);
+    // Same wait, another screen: the prompt is still open and the phone is asked to look again.
+    expect(await swapped.json()).toMatchObject({ code: 'changed' });
+    expect(swapWrites.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(0);
+    swapWait.mockRestore();
+    const current = ((await (await call('GET', promptPath)).json()) as { prompt: { fingerprint: string } }).prompt;
+    // A terminal that never stops redrawing: refused with its own code (the prompt is still open), nothing written.
+    const busyWait = vi.spyOn(sessions, 'promptWait').mockImplementation(id => {
+      const w = realWait(id);
+      queueMicrotask(() => { live.outSeq++; });
+      return w;
+    });
+    const busy = await call('POST', answerPath, { fingerprint: current.fingerprint, data: 'y' });
+    expect(busy.status).toBe(409);
+    expect(await busy.json()).toMatchObject({ code: 'redrawing' });
+    expect(swapWrites.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(0);
+    busyWait.mockRestore();
+    const redrawWait = outputDuringRead(() => { live.outSeq++; });
+    const redrawn = await call('POST', answerPath, { fingerprint: current.fingerprint, data: 'y' });
+    expect(redrawn.status).toBe(200);
+    expect(swapWrites.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(1);
+    swapWrites.mockRestore();
+    redrawWait.mockRestore();
+
+    // The screen changes and the wait ends while the screen renders: "already handled", never "look again".
+    await waitFor(() => !sessionOf()?.blocked && sessionOf()?.status !== 'working');
+    sessions.input(sid, 'ask\r');
+    await waitFor(() => sessionOf()?.blocked === 'permission');
+    const ending = ((await (await call('GET', promptPath)).json()) as { prompt: { fingerprint: string; waitSeq: number } }).prompt;
+    const endWrites = vi.spyOn(sessions, 'input');
+    // The read already sees the new screen (so the fingerprint differs on the first attempt), and the desktop answers
+    // before the refusal is worded.
+    const endWait = vi.spyOn(sessions, 'promptWait').mockImplementationOnce(id => {
+      const w = realWait(id)!;
+      queueMicrotask(() => sessions.input(sid, 'n'));
+      return { ...w, replay: `${w.replay ?? ''}\r\nDelete everything? (y/n)` };
+    });
+    const ended = await call('POST', answerPath, { fingerprint: ending.fingerprint, waitSeq: ending.waitSeq, data: 'y' });
+    expect(ended.status).toBe(409);
+    expect(await ended.json()).toMatchObject({ code: 'stale' });
+    expect(endWrites.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(0);
+    endWrites.mockRestore();
+    endWait.mockRestore();
 
     // Feedback retried with the same clientMsgId is delivered once and answered with the first result.
     await waitFor(() => !sessionOf()?.blocked && sessionOf()?.status !== 'working');

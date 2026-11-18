@@ -1171,27 +1171,42 @@ export function createMobileController(handlers: MobileHandlers) {
       if (!task) throw new MobileGatewayError(404, '任务不存在');
       const sessionId = task.sessionId;
       const scrub = (t: string) => scrubErrorForMobile(t, handlers.stateDir, extraDirs);
-      // The waitSeq is read together with the screen; rendering is async, so the answer below re-checks it synchronously.
+      // waitSeq and outSeq are read together with the screen; rendering is async, so the answer below re-checks both
+      // synchronously.
       const read = async () => {
         const w = sessionId ? handlers.sessions.promptWait(sessionId) : null;
         if (!w) return null;
         const view = await readPrompt(w.info, w.waitSeq, w.replay, scrub);
-        return view ? { view, waitSeq: w.waitSeq } : null;
+        return view ? { view, waitSeq: w.waitSeq, outSeq: w.outSeq } : null;
       };
       if (method === 'GET') return sendJson(res, 200, { prompt: (await read())?.view ?? null });
       if (!sessionId) throw new MobileGatewayError(409, '已在别处处理', 'stale');
-      const { fingerprint, data } = body;
+      const { fingerprint, data, waitSeq } = body;
       if (typeof fingerprint !== 'string' || typeof data !== 'string') throw new MobileGatewayError(400, '缺少 fingerprint 或 data');
       const prev = promptLocks.get(sessionId) ?? Promise.resolve();
       const run = prev.catch(() => {}).then(async () => {
-        const r = await read();
-        if (!r || r.view.fingerprint !== fingerprint) throw new MobileGatewayError(409, '已在别处处理', 'stale');
-        if (!r.view.keys.some(k => k.data === data)) throw new MobileGatewayError(400, '这个按键不在当前提示的选项里');
-        // From here on nothing awaits: the task still owns the session and no input, delivery or new prompt has
-        // happened since the screen was read, or the answer is refused.
-        if (handlers.store.getTask(taskId)?.sessionId !== sessionId || !handlers.sessions.answerPrompt(sessionId, r.waitSeq, data)) {
-          throw new MobileGatewayError(409, '已在别处处理', 'stale');
+        // Output that arrives while the screen renders means the rendered screen may already be gone: read it again
+        // (an agent redrawing the same prompt keeps the fingerprint) a few times, then give up.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const r = await read();
+          if (!r || r.view.fingerprint !== fingerprint) {
+            // Same wait, different screen (the dialog redrew, a timer ticked): the prompt is still open, read it again.
+            // Re-checked synchronously: the wait may have ended while the screen rendered.
+            if (r && r.waitSeq === waitSeq && handlers.sessions.promptWait(sessionId)?.waitSeq === waitSeq) {
+              throw new MobileGatewayError(409, '画面已变化，请看清后重新确认', 'changed');
+            }
+            throw new MobileGatewayError(409, '已在别处处理', 'stale');
+          }
+          if (!r.view.keys.some(k => k.data === data)) throw new MobileGatewayError(400, '这个按键不在当前提示的选项里');
+          // From here on nothing awaits: the task still owns the session, and no input, delivery, new prompt or
+          // output has happened since the screen was read, or the answer is refused.
+          if (handlers.store.getTask(taskId)?.sessionId !== sessionId) throw new MobileGatewayError(409, '已在别处处理', 'stale');
+          const answered = handlers.sessions.answerPrompt(sessionId, r.waitSeq, r.outSeq, data);
+          if (answered === 'ok') return;
+          if (answered === 'stale') throw new MobileGatewayError(409, '已在别处处理', 'stale');
         }
+        // Still the same wait, but the terminal kept redrawing: nothing was written, the prompt may still be open.
+        throw new MobileGatewayError(409, '终端正在刷新，请稍后重试', 'redrawing');
       });
       promptLocks.set(sessionId, run);
       try {

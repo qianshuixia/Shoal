@@ -96,6 +96,8 @@ interface Live {
   // Bumped by anything that can answer or replace an on-screen prompt (input, delivery, a new permission request,
   // a detected startup prompt). A phone answer carries the value it saw, so it only lands on that same wait.
   waitSeq: number;
+  // Bumped by every PTY output chunk: a prompt answer also needs the screen it was read from to still be the screen.
+  outSeq: number;
   enterTimer: NodeJS.Timeout | null;
   enterWasSystem: boolean;
   systemInjectedPending: number;
@@ -379,19 +381,22 @@ export class SessionManager {
 
   // The wait a phone prompt answer is bound to: a live, blocked session's current waitSeq plus its replay at the same
   // instant (info is a copy, so a later change cannot leak into a screen read from this instant). Null when nothing waits.
-  promptWait(id: string): { info: SessionInfo; waitSeq: number; replay: string | null } | null {
+  promptWait(id: string): { info: SessionInfo; waitSeq: number; outSeq: number; replay: string | null } | null {
     const s = this.live.get(id);
     if (!s || s.removed || s.info.status === 'exited' || !s.info.blocked) return null;
-    return { info: { ...s.info }, waitSeq: s.waitSeq, replay: this.replayOf(id) };
+    return { info: { ...s.info }, waitSeq: s.waitSeq, outSeq: s.outSeq, replay: this.replayOf(id) };
   }
 
-  // Writes a phone's prompt answer only if the same wait is still open: nothing typed, delivered or re-prompted since
-  // `waitSeq` was read. Synchronous, so no other input can slip between the check and the write.
-  answerPrompt(id: string, waitSeq: number, data: string): boolean {
+  // Writes a phone's prompt answer only if the same wait is still open (nothing typed, delivered or re-prompted since
+  // `waitSeq` was read) and the screen it was read from is still the screen (no output since `outSeq`). 'redrawn'
+  // means only the output moved on: the caller may read the screen again. Synchronous, so nothing can slip between the
+  // check and the write.
+  answerPrompt(id: string, waitSeq: number, outSeq: number, data: string): 'ok' | 'stale' | 'redrawn' {
     const s = this.live.get(id);
-    if (!s || s.removed || s.info.status === 'exited' || !s.info.blocked || s.waitSeq !== waitSeq) return false;
+    if (!s || s.removed || s.info.status === 'exited' || !s.info.blocked || s.waitSeq !== waitSeq) return 'stale';
+    if (s.outSeq !== outSeq) return 'redrawn';
     this.input(id, data, { fromMobile: true });
-    return true;
+    return 'ok';
   }
 
   // A live session's buffer, or the saved output of a session restored from disk.
@@ -471,7 +476,7 @@ export class SessionManager {
       cwd: o.cwd, collabDir, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
       queue: [], permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '',
       hasDraft: false, interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
-      inputSeq: 0, waitSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
+      inputSeq: 0, waitSeq: 0, outSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
       modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0,
       initialPromptPending: Boolean(o.prompt && !o.resume),
     };
@@ -481,6 +486,7 @@ export class SessionManager {
     this.armScrollSave();
     proc.onData(d => {
       if (!s.firstOutAt) s.firstOutAt = Date.now();
+      if (d) s.outSeq++;
       trackModes(s.modes, s.tail + d);
       s.tail = (s.tail + d).slice(-MODE_TAIL);
       if (!s.firstTurnSeen) {

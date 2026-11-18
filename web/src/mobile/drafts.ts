@@ -77,9 +77,10 @@ export function resolveSendId(taskId: string, payload: string, makeId: () => str
   return rec.clientMsgId;
 }
 
-export function clearSendId(taskId: string): void {
-  memorySends.delete(taskId);
+/** Forgets the pending send once the server confirmed it, unless a newer send (another tab) has replaced it since. */
+export function clearSendId(taskId: string, clientMsgId: string): void {
+  if (memorySends.get(taskId)?.clientMsgId === clientMsgId) memorySends.delete(taskId);
   try {
-    localStorage.removeItem(SEND_PREFIX + taskId);
+    if (readSend(taskId)?.clientMsgId === clientMsgId) localStorage.removeItem(SEND_PREFIX + taskId);
   } catch { /* memory-only */ }
 }

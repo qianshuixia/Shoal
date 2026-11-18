@@ -32,6 +32,7 @@ interface MobilePrompt {
   lines: string[];
   keys: { label: string; data: string }[];
   fingerprint: string;
+  waitSeq: number;
 }
 
 const CARD_LABEL: Record<Card['kind'], string> = {
@@ -136,6 +137,21 @@ export function MobileTaskView({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // The banner shows the whole terminal screen; the options are at its bottom, what they are about may be above. A
+  // new wait opens at the bottom; a redraw of the same wait keeps a user who scrolled up to read where they are.
+  const promptLinesRef = useRef<HTMLPreElement>(null);
+  const promptAtBottomRef = useRef(true);
+  const promptWaitRef = useRef<number | null>(null);
+  useEffect(() => {
+    const el = promptLinesRef.current;
+    const wait = prompt?.waitSeq ?? null;
+    const newWait = wait !== promptWaitRef.current;
+    promptWaitRef.current = wait;
+    if (el && (newWait || promptAtBottomRef.current)) {
+      el.scrollTop = el.scrollHeight;
+      promptAtBottomRef.current = true;
+    }
+  }, [prompt?.fingerprint, prompt?.waitSeq]);
   const stickBottomRef = useRef(true);
   const sendingRef = useRef(false);
   const sendStatusTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -203,7 +219,7 @@ export function MobileTaskView({
     setPromptBusy(true);
     setPromptNote('');
     try {
-      await mobilePost(`/api/mobile/tasks/${encodeURIComponent(task.id)}/prompt-answer`, { fingerprint: prompt.fingerprint, data });
+      await mobilePost(`/api/mobile/tasks/${encodeURIComponent(task.id)}/prompt-answer`, { fingerprint: prompt.fingerprint, waitSeq: prompt.waitSeq, data });
       setPromptSentFp(prompt.fingerprint);
     } catch (e) {
       if ((e as { code?: string }).code === 'stale') setPromptNote('已在别处处理');
@@ -325,7 +341,7 @@ export function MobileTaskView({
         ...body,
         clientMsgId,
       });
-      clearSendId(task.id);
+      clearSendId(task.id, clientMsgId);
       showSendStatus((res.session?.queued ?? 0) > 0 ? 'queued' : 'delivered', SEND_STATUS_MS);
       sendingRef.current = false;
       const d = draftRef.current;
@@ -405,7 +421,15 @@ export function MobileTaskView({
               : '会话在终端启动界面等待信任确认'}
           </div>
           {prompt && prompt.lines.length > 0 && (
-            <pre className="mob-prompt-lines" data-private="">
+            <pre
+              className="mob-prompt-lines"
+              data-private=""
+              ref={promptLinesRef}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                promptAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+              }}
+            >
               {prompt.lines.map((line, i) => (
                 <div key={i} className="mob-prompt-line" data-testid="mobile-prompt-line">{line}</div>
               ))}

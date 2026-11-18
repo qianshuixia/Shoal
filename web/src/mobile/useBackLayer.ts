@@ -16,11 +16,14 @@ import { useCallback, useEffect, useRef } from 'react';
  * top of the list are rolled back with one history.go(-k) per microtask; dead records below a live layer wait until
  * everything above them is popped.
  *
- * - `close()`   : UI close. Top layer goes through history.back() so the popstate handler closes it.
+ * - `close()`   : UI close. Top layer goes through history.back() so the popstate handler closes it; a repeated
+ *                 close before that back landed asks for nothing more.
  * - `release()` : the caller takes over the pushed entry (e.g. replaceState it); no back() is issued.
  *                 Returns whether an entry was pushed.
  * - `popThen(fn)`: pops the entry (if any) and runs `fn` after the browser finished going back. A repeated call while
- *                 a pop is already pending is ignored.
+ *                 a pop is already pending is ignored; after a `close()` whose back has not landed yet, `fn` waits
+ *                 for that same back (never a second one). `fn` is dropped if the component unmounted before the
+ *                 pop landed (the user already left the screen it confirmed for).
  *
  * Refs survive React StrictMode's double effect run, so a layer is never pushed twice.
  */
@@ -33,6 +36,7 @@ interface LayerRecord {
   id: number;
   layer: LayerEntry | null; // null = dead (closed programmatically, waiting for its history entry to go)
   callbacks: (() => void)[];
+  backPending: boolean; // close() already asked the browser to go back for this entry
 }
 
 const records: LayerRecord[] = [];
@@ -101,7 +105,7 @@ export function useBackLayer(open: boolean, onPop: () => void) {
   useEffect(() => {
     const e = entry.current;
     if (open && !alive()) {
-      const rec: LayerRecord = { id: nextId++, layer: e, callbacks: [] };
+      const rec: LayerRecord = { id: nextId++, layer: e, callbacks: [], backPending: false };
       history.pushState({ ...(history.state ?? {}), shoalLayer: rec.id }, '', location.href);
       records.push(rec);
       recRef.current = rec;
@@ -123,6 +127,8 @@ export function useBackLayer(open: boolean, onPop: () => void) {
       return;
     }
     if (records[records.length - 1] === rec) {
+      if (rec.backPending) return; // a second tap before the first back landed
+      rec.backPending = true;
       history.back();
     } else {
       // Not the top layer: its entry goes later, in a batched pop once the layers above it are gone.
@@ -140,14 +146,25 @@ export function useBackLayer(open: boolean, onPop: () => void) {
   }, []);
 
   const popThen = useCallback((fn: () => void) => {
+    // The callback belongs to this layer's component: once it unmounted (the user went elsewhere), it must not run.
+    const e = entry.current;
+    const guarded = () => {
+      if (e.mounted) fn();
+    };
     const rec = current();
     if (!rec) {
       fn();
       return;
     }
     if (rec.layer === null) return; // a pop is already pending for this layer
+    if (rec.backPending) {
+      // close() already asked for this entry's back: ride on it instead of going back a second time (which would
+      // close the layer underneath too).
+      if (rec.callbacks.length === 0) rec.callbacks.push(guarded);
+      return;
+    }
     if (records[records.length - 1] === rec) {
-      markDead(rec, fn);
+      markDead(rec, guarded);
     } else {
       markDead(rec);
       fn();

@@ -233,7 +233,8 @@ export function MobileApp() {
     if (auth !== 'paired') return;
     let alive = true;
     // The server pushes a snapshot as soon as the socket is up; it is the source of truth for this connection. The
-    // initial HTTP snapshot only fills the gap before that and must never overwrite newer WS state.
+    // initial HTTP snapshot only fills the gap before the first one and must never overwrite WS state, even after a
+    // disconnect (so this flag is never reset; `wsConnected` tracks the current connection).
     let wsSnapshotSeen = false;
     void mobileGet<Snapshot>('/api/state').then(
       (snap) => {
@@ -248,13 +249,11 @@ export function MobileApp() {
       onOpen: () => {
         if (!alive) return;
         // Not "connected" until this connection's snapshot arrives (a reconnect missed events; task views reload their own data).
-        wsSnapshotSeen = false;
         lastSyncRef.current = Date.now();
         send({ t: 'ping', ts: Date.now() });
       },
       onClose: () => {
         if (!alive) return;
-        wsSnapshotSeen = false;
         setWsConnected(false);
         setLastSyncAt(lastSyncRef.current);
       },
