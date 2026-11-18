@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AgentKind, Card, ForwardBody, Project, Task } from '../../../shared/protocol.ts';
 import { AGENT_LABEL, AGY_MODELS, FORWARD_NOTE } from '../../../shared/protocol.ts';
 import { mobilePatch, mobilePost, mobileUploadImage } from './api.ts';
+import { clearDraft, loadDraft, NEW_TASK_DRAFT_KEY, saveDraft } from './drafts.ts';
 
 function Sheet({ testId, title, onClose, children }: {
   testId: string;
@@ -39,10 +40,33 @@ export function NewTaskSheet({
   const [agent, setAgent] = useState<AgentKind>(agents[0] ?? 'claude');
   const [agyModel, setAgyModel] = useState(defaultAgyModel ?? '');
   const [title, setTitle] = useState('');
-  const [prompt, setPrompt] = useState('');
+  const [prompt, setPrompt] = useState(() => loadDraft(NEW_TASK_DRAFT_KEY)?.text ?? '');
   const [attachments, setAttachments] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+
+  // Draft of the requirement text; throttled, flushed on hide/unmount unless the task was created.
+  const promptRef = useRef(prompt);
+  promptRef.current = prompt;
+  const createdRef = useRef(false);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!createdRef.current) saveDraft(NEW_TASK_DRAFT_KEY, { text: promptRef.current, attachments: [] });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [prompt]);
+  useEffect(() => {
+    const flush = () => {
+      if (!createdRef.current) saveDraft(NEW_TASK_DRAFT_KEY, { text: promptRef.current, attachments: [] });
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', flush);
+      flush();
+    };
+  }, []);
 
   const upload = async (files: FileList | null) => {
     if (!files?.length) return;
@@ -70,6 +94,8 @@ export function NewTaskSheet({
         prompt: prompt.trim(),
         ...(attachments.length ? { attachments } : {}),
       });
+      createdRef.current = true;
+      clearDraft(NEW_TASK_DRAFT_KEY);
       onCreated(res.task.id);
     } catch (e) {
       setError((e as Error).message);
@@ -79,6 +105,23 @@ export function NewTaskSheet({
 
   return (
     <Sheet testId="mobile-new-task-sheet" title="新建任务" onClose={onClose}>
+      <textarea
+        className="mob-textarea"
+        data-testid="mobile-new-task-prompt"
+        autoFocus
+        value={prompt}
+        placeholder="描述需求…（也可以拍照或从相册附加截图）"
+        onChange={(e) => setPrompt(e.target.value)}
+      />
+
+      <input
+        className="mob-input"
+        data-testid="mobile-new-task-title"
+        value={title}
+        placeholder="任务标题（可留空，自动从需求首行生成）"
+        onChange={(e) => setTitle(e.target.value)}
+      />
+
       <label className="mob-sub" style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
         <span>项目目录（仅可选电脑端已添加项目）</span>
         <select className="mob-input" value={projectId} onChange={(e) => setProjectId(e.target.value)}>
@@ -107,20 +150,6 @@ export function NewTaskSheet({
           </select>
         </label>
       )}
-
-      <input
-        className="mob-input"
-        value={title}
-        placeholder="任务标题（可留空，自动从需求首行生成）"
-        onChange={(e) => setTitle(e.target.value)}
-      />
-
-      <textarea
-        className="mob-textarea"
-        value={prompt}
-        placeholder="描述需求…（也可以拍照或从相册附加截图）"
-        onChange={(e) => setPrompt(e.target.value)}
-      />
 
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
         <label className="mob-btn compact" style={{ cursor: 'pointer' }}>

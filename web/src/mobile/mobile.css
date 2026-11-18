@@ -1,11 +1,14 @@
 /* Android PWA / Mobile Shell */
 .mob-root {
-  display: flex; flex-direction: column; height: 100dvh; max-height: 100dvh;
+  display: flex; flex-direction: column; height: var(--mob-vvh, 100dvh); max-height: var(--mob-vvh, 100dvh);
   background: var(--bg); color: var(--text);
   padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
   overflow: hidden;
   -webkit-tap-highlight-color: transparent;
 }
+
+.mob-privacy [data-private] { filter: blur(0.3rem); }
+.mob-privacy input[data-private]:focus, .mob-privacy textarea[data-private]:focus { filter: none; }
 
 .mob-header {
   flex: none; display: flex; align-items: center; gap: 0.5rem;
@@ -92,15 +95,22 @@
 }
 .mob-input {
   width: 100%; min-height: 2.75rem; padding: 0.5625rem 0.75rem; border-radius: 0.5rem;
-  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); font-size: 0.9375rem;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); font-size: 16px; /* >=16px: iOS Safari zooms smaller inputs on focus */
 }
 .mob-textarea {
   width: 100%; min-height: 5.5rem; padding: 0.625rem 0.75rem; border-radius: 0.5rem;
-  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); font-size: 0.9375rem;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text); font-size: 16px;
   resize: vertical;
 }
 
 /* Conversation feed */
+.mob-scroll-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+.mob-scroll-latest {
+  position: absolute; left: 50%; bottom: 0.75rem; transform: translateX(-50%); z-index: 5;
+  min-height: 2.25rem; padding: 0 0.875rem; border-radius: 999px;
+  background: var(--text); color: var(--bg); border: 0; font-size: 0.8125rem; font-weight: 600;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .45);
+}
 .mob-turn-user {
   align-self: flex-end; max-width: 88%; padding: 0.625rem 0.875rem;
   border-radius: 0.875rem 0.875rem 0.25rem 0.875rem;
@@ -142,9 +152,9 @@
 }
 .mob-composer-row { display: flex; align-items: flex-end; gap: 0.5rem; }
 .mob-composer-box {
-  flex: 1; min-height: 2.75rem; max-height: 7.5rem; padding: 0.5625rem 0.75rem;
+  flex: 1; min-height: 2.75rem; max-height: 9.75rem; padding: 0.5625rem 0.75rem; overflow-y: auto;
   border-radius: 0.625rem; background: var(--bg); border: 1px solid var(--line-2);
-  color: var(--text); font-size: 0.9375rem; line-height: 1.4; resize: none;
+  color: var(--text); font-size: 16px; line-height: 1.4; resize: none;
 }
 .mob-attach-chips { display: flex; flex-wrap: wrap; gap: 0.375rem; }
 .mob-attach-chip {
@@ -200,3 +210,26 @@
 .mob-diff-line.del { background: rgba(224, 122, 115, .14); color: #f6c0bc; }
 .mob-diff-ln { width: 2.5rem; flex: none; color: var(--text-3); user-select: none; }
 .mob-diff-sigil { width: 1rem; flex: none; user-select: none; }
+
+/* Confirm sheet stacks above other sheets and drawers. */
+.mob-confirm-backdrop { z-index: 80; }
+
+/* Prompt banner (R3), send status and connection notices (R6/R8) */
+.mob-prompt-banner {
+  flex: none; display: flex; flex-direction: column; gap: 0.5rem;
+  padding: 0.5625rem 0.75rem; font-size: 0.8125rem;
+  background: var(--signal-bg); color: var(--signal); border-bottom: 1px solid var(--line);
+}
+.mob-prompt-lines {
+  margin: 0; padding: 0.375rem 0.5rem; max-height: 9rem; overflow: auto;
+  border-radius: 0.375rem; background: var(--bg); color: var(--text);
+  font-family: "Maple Mono NF CN", Consolas, monospace; font-size: 0.75rem; line-height: 1.45;
+}
+.mob-prompt-line { white-space: pre-wrap; word-break: break-all; min-height: 1.45em; }
+.mob-prompt-keys { display: flex; flex-wrap: wrap; gap: 0.375rem; }
+.mob-conn-bar {
+  flex: none; padding: 0.375rem 0.75rem; font-size: 0.75rem;
+  background: var(--signal-bg); color: var(--signal); border-bottom: 1px solid var(--line);
+}
+.mob-send-status { font-size: 0.75rem; color: var(--text-3); }
+.mob-btn:disabled, .mob-keybar button:disabled { opacity: .5; }

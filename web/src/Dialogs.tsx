@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { usePrivacy } from './privacy.ts';
 import type { AgentKind, AgyOptimizeStatus, Card, CreateProjectBody, CreateTaskBody, DirListing, ForwardBody, MobileAdminStatus, MobileConfigPatch, MobileTunnelMode, Project, SessionInfo, Settings, Task } from '../../shared/protocol.ts';
-import { AGENT_LABEL, AGY_MODELS, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
+import { AGENT_LABEL, AGY_MODELS, DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
 import { QrCodeSvg } from './QrCode.tsx';
 
 async function getJson<T>(url: string): Promise<T> {
@@ -127,6 +127,8 @@ function Modal({ title, testId, onClose, onSubmit, children }: {
     </div>
   );
 }
+
+const AUTO_DELEGATE_TIP = '启动 Claude Code、Codex 和 Antigravity 会话时告诉它们可以用 shoal delegate 把任务派给其他 CLI。关闭后 shoal 命令仍然可用，但 agent 只在你明确要求时才会用。只对之后新启动的会话生效。';
 
 const AI_TITLES_TIP = [
   '开启后，任务的第一句需求发出时，工作台先用这句话的第一行当标题，同时在后台让支持 headless 的 CLI 做一次短调用，写一个更短、更概括的标题，通常十几秒内换上。',
@@ -414,7 +416,10 @@ function MobileSettingsSection() {
                   className="ghost"
                   data-testid="mobile-devices-revoke-all"
                   disabled={busy}
-                  onClick={() => void runAction(() => post<MobileAdminStatus>('/api/mobile/admin/devices/revoke-all', {}), '已撤销全部设备')}
+                  onClick={() => {
+                    if (!confirm('踢出全部已配对的手机？这些设备需要重新扫码配对才能再连接。')) return;
+                    void runAction(() => post<MobileAdminStatus>('/api/mobile/admin/devices/revoke-all', {}), '已撤销全部设备');
+                  }}
                 >全部踢出</button>
               )}
             </div>
@@ -585,6 +590,7 @@ function MobileSettingsSection() {
                       className="ghost"
                       disabled={busy}
                       onClick={() => {
+                        if (!confirm('清除已保存的 Tunnel Token？固定隧道会随之关闭，之后需要重新粘贴 Token 才能开启。')) return;
                         setDraftTunnelToken('');
                         patchMobile({ tunnelEnabled: false, tunnelToken: '' }, 'Tunnel Token 已清除', true);
                       }}
@@ -694,6 +700,7 @@ function MobileSettingsSection() {
                   data-testid="mobile-feishu-clear"
                   disabled={busy}
                   onClick={() => {
+                    if (!confirm('清除飞书通知配置？Webhook 地址和签名密钥会被删除，手机将不再收到提醒。')) return;
                     setDraftFeishuWebhook('');
                     setDraftFeishuSecret('');
                     patchMobile({ feishuEnabled: false, feishuWebhookUrl: '', feishuSecret: '' }, '通知配置已清除', true);
@@ -815,7 +822,28 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  const patchSettings = async (patch: Partial<Settings>) => {
+  // Optimistic: a controlled checkbox that waits for the server's value snaps back on the click, so this one flips at once
+  // and is re-synced from the settings that arrive over the WebSocket.
+  const serverAutoDelegate = settings.autoDelegate !== false;
+  const [autoDelegate, setAutoDelegate] = useState(serverAutoDelegate);
+  useEffect(() => setAutoDelegate(serverAutoDelegate), [serverAutoDelegate]);
+  const setAutoDelegateNow = (value: boolean) => {
+    setAutoDelegate(value);
+    setError('');
+    post<Settings>('/api/settings', { autoDelegate: value }).catch((e) => {
+      setError((e as Error).message);
+      setAutoDelegate(serverAutoDelegate);
+    });
+  };
+
+  // Rules text is edited locally and saved with the button; it resets whenever the server's value changes.
+  const serverRules = settings.delegationRules ?? DEFAULT_DELEGATION_RULES;
+  const [rules, setRules] = useState(serverRules);
+  useEffect(() => setRules(serverRules), [serverRules]);
+  const rulesLen = [...rules].length;
+  const rulesTooLong = rulesLen > DELEGATION_RULES_MAX;
+
+  const patchSettings = async (patch: Partial<Settings> | { delegationRules: null }) => {
     if (busy) return;
     setBusy(true);
     setError('');
@@ -846,6 +874,56 @@ export function SettingsDialog({ settings, onClose }: { settings: Settings; onCl
           <button type="button" className="help-btn" data-testid="setting-ai-titles-help" aria-label="说明" aria-describedby="tip-ai-titles">?</button>
           <span role="tooltip" id="tip-ai-titles" className="help-tip" data-testid="setting-ai-titles-tip">{AI_TITLES_TIP}</span>
         </span>
+      </div>
+      <div className="setting-row">
+        <label className="check-row">
+          <input
+            type="checkbox"
+            data-testid="setting-auto-delegate"
+            checked={autoDelegate}
+            onChange={(e) => setAutoDelegateNow(e.target.checked)}
+          />
+          允许主 agent 主动委派
+        </label>
+        <span className="help">
+          <button type="button" className="help-btn" data-testid="setting-auto-delegate-help" aria-label="说明" aria-describedby="tip-auto-delegate">?</button>
+          <span role="tooltip" id="tip-auto-delegate" className="help-tip" data-testid="setting-auto-delegate-tip">{AUTO_DELEGATE_TIP}</span>
+        </span>
+      </div>
+      <div className="delegation-rules">
+        <label>
+          <span>分工与评审规则</span>
+          <textarea
+            data-testid="setting-delegation-rules"
+            rows={10}
+            value={rules}
+            onChange={(e) => setRules(e.target.value)}
+          />
+        </label>
+        <div className="delegation-rules-bar">
+          <span className={`delegation-rules-count ${rulesTooLong ? 'over' : ''}`} data-testid="setting-delegation-rules-count">
+            {rulesLen} / {DELEGATION_RULES_MAX}
+          </span>
+          <button
+            type="button"
+            className="ghost"
+            data-testid="setting-delegation-rules-reset"
+            disabled={busy || settings.delegationRules === undefined}
+            onClick={() => void patchSettings({ delegationRules: null })}
+          >
+            恢复默认
+          </button>
+          <button
+            type="button"
+            className="primary"
+            data-testid="setting-delegation-rules-save"
+            disabled={busy || rulesTooLong || rules === serverRules}
+            onClick={() => void patchSettings({ delegationRules: rules })}
+          >
+            保存
+          </button>
+        </div>
+        <span className="field-hint">告诉每个会话哪类工作交给哪个 CLI、什么时候请另外两个 CLI 一起评审。只对之后新启动的会话生效；关闭「允许主 agent 主动委派」时不注入。</span>
       </div>
       <label>
         <span>Antigravity 默认模型档位</span>

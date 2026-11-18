@@ -178,4 +178,6 @@ test('settings dialog: Antigravity model tier selector persists Orchestrator (Ca
   // Rejects deprecated model slug over REST API as well.
   const badRes = await request.post('/api/settings', { data: { agyModel: 'gemini-3.8-flash-high' } });
   expect(badRes.status()).toBe(400);
+  // Settings are shared by every spec in the run (ai-title expects the defaults).
+  expect((await request.post('/api/settings', { data: { agyModel: '' } })).status()).toBe(200);
 });

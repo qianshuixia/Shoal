@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cleanTitle, promptPreview, titleFromPrompt, titleFromReply, titlePrompt, TITLE_PROMPT_HEAD } from './titles.ts';
+import { cleanTitle, delegationTitle, promptPreview, titleFromPrompt, titleFromReply, titlePrompt, TITLE_PROMPT_HEAD } from './titles.ts';
 
 describe('titleFromPrompt', () => {
   it('uses the first non-empty line with whitespace collapsed', () => {
@@ -88,5 +88,19 @@ describe('promptPreview', () => {
   it('returns an empty string when nothing is left', () => {
     expect(promptPreview('')).toBe('');
     expect(promptPreview(' \n [Image #2] \n')).toBe('');
+  });
+});
+
+describe('delegationTitle', () => {
+  it('drops a leading label, bracketed paths and backticks', () => {
+    expect(delegationTitle('任务：在项目根目录（G:\\Workspace\\agent-workbench）下新建 `hello.txt`')).toBe('在项目根目录下新建 hello.txt');
+    expect(delegationTitle('Task: fix the login (/srv/app/login.ts) bug')).toBe('fix the login bug');
+  });
+  it('skips lines left empty by the cleanup and cuts like a prompt title', () => {
+    expect(delegationTitle('任务：\n目标：' + '中'.repeat(30))).toBe('中'.repeat(24) + '…');
+  });
+  it('keeps ordinary brackets and returns empty when nothing usable', () => {
+    expect(delegationTitle('重构 parser（保留旧接口）')).toBe('重构 parser（保留旧接口）');
+    expect(delegationTitle('任务：\n（C:\\x）')).toBe('');
   });
 });

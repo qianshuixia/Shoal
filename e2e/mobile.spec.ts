@@ -286,7 +286,7 @@ test.describe('mobile access gateway & Android PWA', () => {
       // Navigate mobile directly using deep link hash from Feishu notification.
       await mobilePage.goto(`${MOBILE_ORIGIN}/#task=${askTask.task.id}`);
       await expect(mobilePage.getByTestId('mobile-blocked-banner')).toBeVisible({ timeout: 10_000 });
-      await mobilePage.getByTestId('mobile-blocked-open-term').click();
+      await mobilePage.getByTestId('mobile-prompt-open-term').click();
       await expect(mobilePage.getByTestId('mobile-term-drawer')).toBeVisible();
       await expect(mobilePage.getByTestId('mobile-term-drawer')).toHaveCSS('position', 'fixed');
       await expect(mobilePage.getByTestId('mobile-term-drawer')).toContainText('Allow? (y/n)', { timeout: 10_000 });

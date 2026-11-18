@@ -103,6 +103,11 @@ describe('feishu webhook notifications', () => {
     await new Promise(r => setTimeout(r, 80));
     expect(sent).toEqual(['review']);
 
+    // A delegated task's finished round is reviewed by its main task: nothing is pushed to the user.
+    notifier.onTask({ ...task, id: 't2', phase: 'review', delegation: { parentTaskId: 't1', brief: 'x', round: 1, createdAt: 1 } });
+    await new Promise(r => setTimeout(r, 80));
+    expect(sent).toEqual(['review']);
+
     // Desktop active recently -> suppresses limit alert.
     desktopAt = nowAt - 5_000;
     session = { ...session, limit: { message: 'hit limit', resetsAt: null, at: nowAt } };

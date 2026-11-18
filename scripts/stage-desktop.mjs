@@ -48,7 +48,6 @@ const copy = (rel, filter) => fs.cpSync(path.join(ROOT, rel), path.join(OUT, rel
 copy('server', src => !src.endsWith('.test.ts'));
 copy('shared');
 copy('hooks');
-if (fs.existsSync(path.join(ROOT, 'skills'))) copy('skills');
 copy('web/dist');
 copy('package.json');
 copy('package-lock.json');

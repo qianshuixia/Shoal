@@ -1,12 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
 import type { ActivityPhase, Card, Project, QuotaInfo, SessionActivity, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
-import { AGENT_LABEL, canResume } from '../../shared/protocol.ts';
-import { attach, fitEntry, focusOnly } from './terms.ts';
+import { AGENT_LABEL, DELEGATION_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
+import { attach, fitEntry, focusOnly, isReplayEmpty, requestReplay, subscribeReplayEmpty } from './terms.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
 import { liveWindows } from './quota.ts';
+import { fmtClock } from './util.ts';
+import { DelegationHud, type DelegateView } from './DelegationHud.tsx';
 
 interface Props {
   index: number;
@@ -32,9 +34,33 @@ interface Props {
   onForward(): void; // open the forward dialog for the result card
   handoff?: Card; // latest handoff card of the task
   onDropSession?(sessionId: string): void; // a sidebar task row was dropped on this pane (dual layout only)
+  delegates?: DelegateView[]; // tasks this task delegated to other CLIs (open ones, plus recently closed ones)
+  onOpenDelegate?(sessionId: string): void;
+  parentTask?: Task; // set on a delegated task: the main task that dispatched it (when it still exists)
+  onOpenParent?(): void;
+  onOpenPath?(path: string): void; // open a file outside the project (the CLI's transcript) with the system handler
 }
 
 export const SESSION_DRAG_TYPE = 'application/x-wb-session';
+
+// Shown over an exited session's empty terminal (no output was saved, e.g. it ran before Shoal kept scrollback):
+// the task's last reply and a way to the CLI's own conversation file.
+function ExitedSummary({ card, transcriptPath, onOpenPath }: { card?: Card; transcriptPath?: string; onOpenPath?(path: string): void }) {
+  const privacy = usePrivacy();
+  return (
+    <div className="pane-exited-summary" data-testid="pane-exited-summary">
+      <div className="pane-exited-summary-head">
+        <span>终端内容没有保存下来{card ? `，下面是最后一轮回复（${new Date(card.createdAt).toLocaleString('zh-CN', { hour12: false })}）` : ''}</span>
+        {transcriptPath && onOpenPath && (
+          <button className="btn" data-testid="pane-open-transcript" title={privacy ? undefined : transcriptPath} onClick={() => onOpenPath(transcriptPath)}>打开对话记录</button>
+        )}
+      </div>
+      {card
+        ? <div className="pane-exited-summary-body" data-testid="pane-exited-reply" data-private="">{card.body}</div>
+        : <div className="pane-exited-summary-none">这个会话没有留下回复记录。</div>}
+    </div>
+  );
+}
 export const ACTIVITY_STALL_MS = 60_000;
 
 const PHASE_LABEL: Record<ActivityPhase, string> = {
@@ -44,16 +70,6 @@ const PHASE_LABEL: Record<ActivityPhase, string> = {
   compacting: '压缩上下文',
   error: '步骤异常',
 };
-
-function fmtClock(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const rem = s % 60;
-  if (m < 60) return `${m}:${String(rem).padStart(2, '0')}`;
-  const h = Math.floor(m / 60);
-  return `${h}:${String(m % 60).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
-}
 
 function fmtNoProgress(sec: number): string {
   const s = Math.max(0, Math.floor(sec));
@@ -124,6 +140,8 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
           data-testid="activity-toggle"
           aria-expanded={open}
           title={privacy ? undefined : `${activity.summary}（点击查看步骤与文件详情）`}
+          // Clicking must not take focus from the terminal: a focused pill keeps a ring that reads as a second outline.
+          onMouseDown={(e) => e.preventDefault()}
           onClick={() => setOpen((v) => !v)}
         >
           <span className="activity-dot" aria-hidden="true" />
@@ -380,13 +398,15 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const reviewToggleRef = useRef<HTMLButtonElement>(null);
   const [editing, setEditing] = useState(false);
   // Secondary review actions live in a floating popover anchored to the header; Approve sits directly in the header.
   const [openCard, setOpenCard] = useState<string | null>(null);
-  const reviewing = task?.phase === 'review' && !!card;
+  const delegState = task ? delegationState(task, session) : null;
+  // A delegated task's result is accepted by its main task, not from here.
+  const reviewing = task?.phase === 'review' && !!card && !task.delegation;
   const reviewOpen = reviewing && openCard === card.id;
   const paneAgent = task?.agent ?? session?.agent;
   const paneWindows = paneAgent ? liveWindows(quota, now) : [];
@@ -411,12 +431,19 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
     };
   }, [sessionId]);
 
+  // An exited session's terminal starts empty after a reload or a Shoal restart: fetch its saved output.
+  const exited = session?.status === 'exited';
+  useEffect(() => {
+    if (sessionId && exited) requestReplay(sessionId);
+  }, [sessionId, exited]);
+  const noReplay = useSyncExternalStore(subscribeReplayEmpty, () => !!sessionId && isReplayEmpty(sessionId));
+
   const privacy = usePrivacy();
   const [dropOver, setDropOver] = useState(false);
   const style = { '--c': task?.color ?? 'var(--text-3)' } as CSSProperties;
   const wantsSession = (e: DragEvent) => !!onDropSession && e.dataTransfer.types.includes(SESSION_DRAG_TYPE);
   const onPaneFocusCapture = (e: { target: EventTarget | null }) => {
-    if ((e.target as Element | null)?.closest?.('.activity-hud')) return;
+    if ((e.target as Element | null)?.closest?.('.activity-hud, .delegation-hud')) return;
     onFocus();
   };
   return (
@@ -460,12 +487,28 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
               <PencilIcon />
             </button>
           )}
+          {delegState && (
+            <span className={`pane-delegation st-deleg-${delegState}`} data-testid="pane-delegation" data-state={delegState}>
+              {task?.delegation?.mode === 'review' ? '评审' : '委派'} · {DELEGATION_LABEL[delegState]}
+            </span>
+          )}
+          {parentTask?.sessionId && onOpenParent && (
+            <button
+              type="button"
+              className="btn pane-parent"
+              data-testid="pane-delegation-parent"
+              title={privacy ? undefined : `打开主任务「${parentTask.title}」`}
+              onClick={onOpenParent}
+            >
+              ↩ 主任务
+            </button>
+          )}
           <span className="pane-spacer" aria-hidden="true" />
           {metrics && <TelemetryPill counts={metrics} tps={metrics.tps} label="本任务累计用量" compact testId="pane-metrics" />}
           {paneAgent && quota && paneWindows.length > 0 && (
             <QuotaPill agent={paneAgent} quota={quota} windows={paneWindows} now={now} compact />
           )}
-          {session && !(task?.phase === 'approved' && session.status === 'needs_you') && <StatusTag status={session.status} since={session.statusSince} now={now} />}
+          {session && !((task?.phase === 'approved' || task?.phase === 'review') && session.status === 'needs_you') && <StatusTag status={session.status} since={session.statusSince} now={now} />}
           {reviewing && (
             <span className="review-split">
               <button
@@ -539,6 +582,20 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
               if (!dual || focused) focusOnly(sessionId);
             }}
           />
+        )}
+        {!!delegates?.length && onOpenDelegate && (
+          <DelegationHud
+            key={sessionId ?? 'none'}
+            delegates={delegates}
+            now={now}
+            onOpen={onOpenDelegate}
+            onRestoreFocus={() => {
+              if (!dual || focused) focusOnly(sessionId);
+            }}
+          />
+        )}
+        {exited && noReplay && (
+          <ExitedSummary card={card} transcriptPath={session?.transcriptPath} onOpenPath={onOpenPath} />
         )}
         {!!session?.queued && (
           <div className="pane-queued" data-testid="pane-queued">消息排队中，agent 空闲后自动发送</div>

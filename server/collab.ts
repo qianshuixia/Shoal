@@ -2,15 +2,24 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
-  AgentKind, Card, PeerListResult, PeerSendBody, PeerSendResult, PeerTaskSummary, Project, SessionInfo, Task,
+  AgentKind, Card, DelegationSummary, PeerDelegateBody, PeerDelegateResult, PeerDelegationActionBody, PeerDelegationActionResult,
+  PeerDelegationList, PeerListResult, PeerSendBody, PeerSendResult, PeerTaskSummary, Project, SessionInfo, Task, TaskDelegation,
 } from '../shared/protocol.ts';
-import { AGENT_LABEL, forwardText } from '../shared/protocol.ts';
+import {
+  AGENT_LABEL, DELEGATION_LABEL, delegationBlockedText, delegationHandle, delegationPrompt, delegationReworkText,
+  delegationResultText, delegationState, forwardText,
+} from '../shared/protocol.ts';
 import { capBody } from './cards.ts';
+import { delegationTitle } from './titles.ts';
 import type { EnqueueOptions, SessionManager } from './sessions.ts';
 import type { Store } from './store.ts';
 
 export const MAX_AUTO_HOPS = 4;
 export const MAX_SENDS_PER_TURN = 2;
+// Delegation has its own limits: a result/rework round trip is not a runaway agent-to-agent chat.
+export const MAX_DELEGATION_HOPS = 12;
+export const MAX_DELEGATION_ROUNDS = 4;
+export const MAX_OPEN_DELEGATIONS = 6;
 const MAX_PEER_FILE_BYTES = 512 * 1024;
 const VALID_AGENTS = new Set<AgentKind>(['claude', 'codex', 'agy', 'fake']);
 
@@ -37,7 +46,10 @@ export interface CollabDeps {
   store: Store;
   sessions: SessionManager;
   availableAgents: () => AgentKind[];
-  createPeerTask: (opts: { projectId: string; agent: AgentKind; title: string; prompt: string }) => { task: Task; session: SessionInfo };
+  // retitleFrom: the title was made up from this text, so an AI title (when enabled) may replace it.
+  createPeerTask: (opts: { projectId: string; agent: AgentKind; title: string; prompt: string; delegation?: TaskDelegation; retitleFrom?: string }) => { task: Task; session: SessionInfo };
+  // Ends the child's process and archives it with the outcome written into its delegation.
+  closeDelegation: (task: Task, outcome: 'accepted' | 'canceled') => Task;
   deliverToTask: (opts: {
     targetTask: Task;
     project: Project;
@@ -92,6 +104,7 @@ export function createCollabManager(deps: CollabDeps) {
   const sessionHops = new Map<string, number>(); // sessionId -> active turn's hop depth (0 = human turn)
   const turnSentCounts = new Map<string, Map<string, number>>(); // sessionId -> (targetKey -> send count in current turn)
   const latestPreviews = new Map<string, string>(); // taskId -> one-line reply summary
+  const blockNotified = new Map<string, number>(); // delegated task id -> round whose blocked notice was already sent
 
   const collabDirOf = (projectId: string) => path.join(stateDir, 'collab', projectId);
   const peersFileOf = (projectId: string) => path.join(collabDirOf(projectId), 'PEERS.md');
@@ -132,6 +145,10 @@ export function createCollabManager(deps: CollabDeps) {
         `### #${n} ${t.title} (\`${t.id}\`)`,
         `- Agent: ${AGENT_LABEL[t.agent]} (\`${t.agent}\`) · Phase: \`${t.phase}\` · Session: \`${status}\``,
       ];
+      if (t.delegation) {
+        const parentTitle = store.getTask(t.delegation.parentTaskId)?.title ?? '（已删除）';
+        infoParts.push(`- Delegated by: ${firstLinePreview(parentTitle, 60)} · State: ${DELEGATION_LABEL[delegationState(t, sess)!]} · Round: ${t.delegation.round}`);
+      }
       if (promptLine) infoParts.push(`- Last prompt: ${promptLine}`);
       if (hasFile) infoParts.push(`- Latest reply snapshot: \`${replyPath}\``);
       if (preview) infoParts.push(`- Latest reply preview: ${preview}`);
@@ -193,6 +210,7 @@ export function createCollabManager(deps: CollabDeps) {
 
   function removeTaskSnapshot(projectId: string, taskId: string): void {
     latestPreviews.delete(taskId);
+    blockNotified.delete(taskId);
     for (const [id, o] of obligations) {
       if (o.targetTaskId === taskId || o.sourceTaskId === taskId) obligations.delete(id);
     }
@@ -268,6 +286,56 @@ export function createCollabManager(deps: CollabDeps) {
     }
   }
 
+  // Pastes a delegated task's result or blocked notice into its main task. Skipped when the main task is gone or archived.
+  function relayToParent(
+    child: Task, session: SessionInfo, kind: 'result' | 'blocked', makeText: () => string, resultCardId?: string,
+  ): void {
+    const d = child.delegation;
+    if (!d) return;
+    const parent = store.getTask(d.parentTaskId);
+    if (!parent || parent.phase === 'archived' || parent.id === child.id) return;
+    const parentProject = store.getProject(parent.projectId);
+    if (!parentProject) return;
+    const hop = sessionHops.get(session.id) ?? 1;
+    if (hop >= MAX_DELEGATION_HOPS) {
+      console.warn(`[collab] 委派链过长 (hop ${hop})，不再自动送回主任务`);
+      return;
+    }
+    const nextHop = hop + 1;
+    try {
+      let deliveredSessionId = '';
+      const delivered = deps.deliverToTask({
+        targetTask: parent,
+        project: parentProject,
+        text: makeText(),
+        system: true,
+        onDelivered: () => {
+          if (deliveredSessionId) onSystemDelivered(deliveredSessionId, nextHop);
+        },
+        cardMeta: {
+          sourceTaskId: child.id,
+          ...(resultCardId ? { sourceCardId: resultCardId } : {}),
+          isAutoReply: true,
+          peerHop: nextHop,
+          delegation: kind,
+        },
+      });
+      deliveredSessionId = delivered.session.id;
+      syncProjectPeers(parentProject.id);
+    } catch (e) {
+      console.warn('[collab] 委派自动回传失败:', (e as Error).message);
+    }
+  }
+
+  function onChildBlocked(task: Task, session: SessionInfo): void {
+    const d = task.delegation;
+    if (!d || task.phase === 'archived' || !session.blocked) return;
+    if (blockNotified.get(task.id) === d.round) return;
+    blockNotified.set(task.id, d.round);
+    const blocked = session.blocked;
+    relayToParent(task, session, 'blocked', () => delegationBlockedText({ title: task.title, agent: session.agent }, blocked));
+  }
+
   function onPrimaryStop(opts: {
     task: Task;
     session: SessionInfo;
@@ -283,6 +351,15 @@ export function createCollabManager(deps: CollabDeps) {
 
     recordTurnReply(task, session.agent, replyText);
 
+    // A delegated task's result goes back to its main task whoever started the turn, so it does not use obligations.
+    const fresh = store.getTask(task.id);
+    if (fresh?.delegation && fresh.phase !== 'archived') {
+      const { round, mode } = fresh.delegation;
+      relayToParent(fresh, session, 'result', () => delegationResultText(
+        { id: fresh.id, title: fresh.title, agent: session.agent, round, mode }, replyText,
+      ), resultCardId);
+    }
+
     const ready: ReplyObligation[] = [];
     for (const [id, o] of obligations) {
       if (o.targetTaskId === task.id && o.targetSessionId === session.id && o.stage === 'armed') {
@@ -294,6 +371,7 @@ export function createCollabManager(deps: CollabDeps) {
 
     for (const o of ready) {
       if (o.hop >= MAX_AUTO_HOPS) continue;
+      if (fresh?.delegation && o.sourceTaskId === fresh.delegation.parentTaskId) continue; // the delegation result already went there
       const source = store.getTask(o.sourceTaskId);
       if (!source || source.id === task.id || source.phase === 'archived') continue;
       const sourceProject = store.getProject(source.projectId);
@@ -352,6 +430,7 @@ export function createCollabManager(deps: CollabDeps) {
         isSelf: t.id === selfTaskId,
         ...(t.lastPrompt ? { lastPrompt: t.lastPrompt } : {}),
         ...(fs.existsSync(snapshot) ? { latestReplyFile: snapshot } : {}),
+        ...(t.delegation ? { delegation: { parentTaskId: t.delegation.parentTaskId, state: delegationState(t, s)!, round: t.delegation.round } } : {}),
       };
     });
   }
@@ -588,6 +667,194 @@ export function createCollabManager(deps: CollabDeps) {
     };
   }
 
+  function sessionOf(task: Task): SessionInfo | undefined {
+    return task.sessionId ? sessions.list().find(s => s.id === task.sessionId) : undefined;
+  }
+
+  function summarize(task: Task): DelegationSummary {
+    const d = task.delegation!;
+    const s = sessionOf(task);
+    const replyFile = turnFileOf(task.projectId, task.id);
+    return {
+      id: task.id,
+      handle: delegationHandle(task.id),
+      title: task.title,
+      agent: task.agent,
+      state: delegationState(task, s)!,
+      round: d.round,
+      brief: d.brief,
+      status: s?.status ?? 'none',
+      createdAt: d.createdAt,
+      ...(d.mode ? { mode: d.mode } : {}),
+      ...(fs.existsSync(replyFile) ? { latestReplyFile: replyFile } : {}),
+    };
+  }
+
+  // Brief or feedback text: -m, --stdin and --file joined in that order.
+  function composeText(project: Project, body: { note?: string; stdinText?: string; filePath?: string }): string {
+    const note = typeof body.note === 'string' ? body.note.trim() : '';
+    const stdinText = typeof body.stdinText === 'string' ? body.stdinText.trim() : '';
+    const fileContent = typeof body.filePath === 'string' && body.filePath.trim()
+      ? readSafePeerFile(project, body.filePath.trim()).trim()
+      : '';
+    const text = [note, stdinText, fileContent].filter(Boolean).join('\n\n');
+    if (!text) throw new CollabError(400, '内容不能为空，请提供 -m、--file 或 --stdin');
+    return text;
+  }
+
+  function checkDelegationHop(callerSessionId: string): number {
+    const hop = (sessionHops.get(callerSessionId) ?? 0) + 1;
+    if (hop > MAX_DELEGATION_HOPS) {
+      throw new CollabError(429, `自动委派链过长（已达 ${MAX_DELEGATION_HOPS} 跳），已停止；需要用户介入后再继续`);
+    }
+    return hop;
+  }
+
+  function delegate(callerSessionId: string, body: PeerDelegateBody): PeerDelegateResult {
+    const { task: caller, project } = verifyCaller(callerSessionId);
+    if (caller.delegation) throw new CollabError(403, '委派任务不能再向下委派');
+    const agent = (typeof body.agent === 'string' ? body.agent.trim().toLowerCase() : '') as AgentKind;
+    if (!VALID_AGENTS.has(agent) || !deps.availableAgents().includes(agent)) {
+      throw new CollabError(400, `智能体不可用：${String(body.agent)}（可用：${deps.availableAgents().join(' / ')}）`);
+    }
+    const hop = checkDelegationHop(callerSessionId);
+    const open = store.tasks().filter(t => t.delegation?.parentTaskId === caller.id && t.phase !== 'archived').length;
+    if (open >= MAX_OPEN_DELEGATIONS) {
+      throw new CollabError(409, `未关闭的委派任务已有 ${open} 个（上限 ${MAX_OPEN_DELEGATIONS}），请先用 shoal done / shoal cancel 处理已有的`);
+    }
+    const brief = composeText(project, body);
+    const review = body.review === true;
+    const rawTitle = typeof body.title === 'string' ? body.title.trim() : '';
+    const title = [...(rawTitle || delegationTitle(brief) || firstLinePreview(brief, 40))].slice(0, 80).join('');
+    const { task, session } = deps.createPeerTask({
+      projectId: project.id,
+      agent,
+      title,
+      prompt: delegationPrompt({ title: caller.title, agent: caller.agent }, brief, { review }),
+      delegation: { parentTaskId: caller.id, brief: firstLinePreview(brief, 140), round: 1, createdAt: Date.now(), ...(review ? { mode: 'review' as const } : {}) },
+    });
+    seedSessionHop(session.id, hop);
+    syncProjectPeers(project.id);
+    return { task: summarize(store.getTask(task.id) ?? task), hop };
+  }
+
+  // Candidates are the caller's delegated tasks, archived ones included.
+  function resolveDelegated(caller: Task, raw: string, opts: { includeArchived: boolean }): Task {
+    const q = raw.trim().replace(/^@+/, '');
+    if (!q) throw new CollabError(400, '请指定委派任务（句柄、#序号或标题片段，shoal status 可查看）');
+    const candidates = store.tasks().filter(t => t.delegation?.parentTaskId === caller.id);
+    const found = (t: Task): Task => {
+      if (t.phase === 'archived' && !opts.includeArchived) {
+        throw new CollabError(409, `委派任务「${t.title}」已关闭（${DELEGATION_LABEL[delegationState(t, undefined)!]}），不能再操作`);
+      }
+      return t;
+    };
+    const handles = (list: Task[]) => list.map(t => `${delegationHandle(t.id)}「${t.title}」`).join(' / ');
+
+    const num = /^#?(\d+)$/.exec(q);
+    if (num) {
+      const byIndex = activeProjectTasks(caller.projectId)[Number(num[1]) - 1];
+      if (byIndex) {
+        if (!candidates.some(c => c.id === byIndex.id)) throw new CollabError(400, `#${num[1]} 不是你委派的任务`);
+        return found(byIndex);
+      }
+    }
+    const lower = q.toLowerCase();
+    const exact = candidates.find(t => t.id.toLowerCase() === lower);
+    if (exact) return found(exact);
+    if (q.length >= 4) {
+      const byPrefix = candidates.filter(t => t.id.toLowerCase().startsWith(lower));
+      if (byPrefix.length === 1) return found(byPrefix[0]);
+      if (byPrefix.length > 1) throw new CollabError(400, `句柄「${q}」命中多个委派任务：${handles(byPrefix)}`);
+    }
+    const byTitle = candidates.filter(t => t.phase !== 'archived' && t.title.toLowerCase().includes(lower));
+    if (byTitle.length === 1) return found(byTitle[0]);
+    if (byTitle.length > 1) throw new CollabError(400, `标题片段「${q}」命中多个委派任务：${handles(byTitle)}`);
+    throw new CollabError(404, `没有找到你委派的任务：${q}（运行 shoal status 查看句柄）`);
+  }
+
+  function rework(callerSessionId: string, body: PeerDelegationActionBody): PeerDelegationActionResult {
+    const { task: caller, project } = verifyCaller(callerSessionId);
+    const child = resolveDelegated(caller, typeof body.target === 'string' ? body.target : '', { includeArchived: false });
+    const feedback = composeText(project, body);
+    const d = child.delegation!;
+    const nextRound = d.round + 1;
+    if (nextRound > MAX_DELEGATION_ROUNDS) {
+      throw new CollabError(409, `这个委派任务已经返工 ${d.round - 1} 轮（上限 ${MAX_DELEGATION_ROUNDS - 1} 轮），请自己接手修改，或请用户决定下一步`);
+    }
+    const hop = checkDelegationHop(callerSessionId);
+    if (!deps.availableAgents().includes(child.agent)) {
+      throw new CollabError(400, `目标智能体不可用：${child.agent}`);
+    }
+    let sentMap = turnSentCounts.get(callerSessionId);
+    if (!sentMap) {
+      sentMap = new Map<string, number>();
+      turnSentCounts.set(callerSessionId, sentMap);
+    }
+    const prior = sentMap.get(child.id) ?? 0;
+    if (prior >= MAX_SENDS_PER_TURN) {
+      throw new CollabError(409, `本轮向同一目标发送次数已达上限 (${MAX_SENDS_PER_TURN})，请先结束本轮等待对方回应`);
+    }
+    sentMap.set(child.id, prior + 1);
+
+    // pasteIntoTask writes this task object (round included) back to the store.
+    const updated: Task = { ...child, delegation: { ...d, round: nextRound } };
+    let boundSessionId = child.sessionId ?? '';
+    // Queueing the note re-emits the child's session synchronously. A dialog still open from the previous round was
+    // already reported, so that emit must not count as the new round's notice: hold the slot while delivering.
+    blockNotified.set(child.id, nextRound);
+    let result: ReturnType<CollabDeps['deliverToTask']>;
+    try {
+      result = deps.deliverToTask({
+        targetTask: updated,
+        project,
+        text: delegationReworkText({ title: caller.title }, nextRound, feedback),
+        system: true,
+        onDelivered: () => {
+          const sid = store.getTask(child.id)?.sessionId ?? boundSessionId;
+          if (sid) onSystemDelivered(sid, hop);
+        },
+        cardMeta: { sourceTaskId: caller.id, peerHop: hop, delegation: 'rework' },
+      });
+    } finally {
+      blockNotified.delete(child.id);
+    }
+    const { task: delivered, session } = result;
+    boundSessionId = session.id;
+    syncProjectPeers(project.id);
+    return { task: summarize(store.getTask(child.id) ?? delivered), queued: (session.queued ?? 0) > 0 };
+  }
+
+  function settle(
+    callerSessionId: string, body: PeerDelegationActionBody, outcome: 'accepted' | 'canceled',
+  ): PeerDelegationActionResult {
+    const { task: caller } = verifyCaller(callerSessionId);
+    const child = resolveDelegated(caller, typeof body.target === 'string' ? body.target : '', { includeArchived: true });
+    if (child.phase === 'archived') return { task: summarize(child) };
+    if (outcome === 'accepted') {
+      const state = delegationState(child, sessionOf(child))!;
+      if (state !== 'review') {
+        throw new CollabError(409, `委派任务「${child.title}」还没有交付结果（当前：${DELEGATION_LABEL[state]}），不能验收通过；要放弃请用 shoal cancel`);
+      }
+    }
+    return { task: summarize(deps.closeDelegation(child, outcome)) };
+  }
+
+  function listDelegations(callerSessionId: string): PeerDelegationList {
+    const { task: caller, project } = verifyCaller(callerSessionId);
+    const children = store.tasks()
+      .filter(t => t.delegation?.parentTaskId === caller.id)
+      .sort((a, b) => a.delegation!.createdAt - b.delegation!.createdAt)
+      .slice(-20);
+    const parent = caller.delegation ? store.getTask(caller.delegation.parentTaskId) : undefined;
+    return {
+      projectName: project.name,
+      selfTaskId: caller.id,
+      ...(parent && parent.phase !== 'archived' ? { parent: { id: parent.id, title: parent.title } } : {}),
+      tasks: children.map(summarize),
+    };
+  }
+
   return {
     collabDirOf,
     peersFileOf,
@@ -604,6 +871,11 @@ export function createCollabManager(deps: CollabDeps) {
     onPrimaryStop,
     listPeers,
     sendPeer,
+    delegate,
+    rework,
+    settle,
+    listDelegations,
+    onChildBlocked,
   };
 }
 

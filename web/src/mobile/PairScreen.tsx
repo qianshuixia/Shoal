@@ -64,26 +64,39 @@ export function PairScreen({
   useEffect(() => {
     if (!claim) return;
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // One request at a time: the next poll is scheduled only after the previous one finished.
     const poll = async () => {
+      let next = true;
       try {
         const res = await mobilePost<MobilePairRedeemResult>('/api/mobile/pair/redeem', {
           claimId: claim.claimId,
           claimSecret: claim.claimSecret,
         });
         if (!alive) return;
+        setStatusMsg('请在电脑桌面端输入下方 6 位配对码并点击确认放行…');
         if (res.status === 'approved') {
+          next = false;
           onPaired();
         }
       } catch (e) {
         if (!alive) return;
-        setClaim(null);
-        setError((e as Error).message || '配对已过期或被拒绝，请重新扫码');
+        const err = e as Error & { code?: string };
+        // Only an explicit expiry / mismatch drops the claim; everything else (flaky link, 5xx, plain 403/4xx) keeps polling.
+        if (err.code === 'pair-expired' || err.code === 'pair-mismatch') {
+          next = false;
+          setClaim(null);
+          setError(err.message || '配对已过期或被拒绝，请重新扫码');
+        } else {
+          setStatusMsg(err.message ? `${err.message}，正在重试…` : '网络波动，正在重试…');
+        }
       }
+      if (alive && next) timer = setTimeout(() => void poll(), 1000);
     };
-    const timer = setInterval(() => void poll(), 1000);
+    timer = setTimeout(() => void poll(), 1000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
   }, [claim, onPaired]);
 

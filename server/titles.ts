@@ -59,3 +59,16 @@ export function titleFromReply(out: string): string {
   const cps = [...s];
   return cps.length > MAX_TITLE ? cps.slice(0, MAX_TITLE).join('') + '…' : s;
 }
+
+// A delegated brief usually opens with a label ("任务：…") and names paths in brackets; neither belongs in a title.
+const BRIEF_LABEL = /^\s*(?:#+\s*)?(?:任务|目标|需求|task|goal)\s*[：:]\s*/i;
+const BRACKETED_PATH = /[（(]\s*(?:[A-Za-z]:[\\/]|\/)[^）)]*[）)]/g;
+
+// Default title of a delegated task: the first usable line of its brief, cleaned like a prompt title. '' if none.
+export function delegationTitle(brief: string): string {
+  for (const line of brief.split(/\r\n|\r|\n/)) {
+    const t = titleFromPrompt(line.replace(BRIEF_LABEL, '').replace(BRACKETED_PATH, '').replace(/`/g, ''));
+    if (t) return t;
+  }
+  return '';
+}

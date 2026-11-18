@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentKind, SessionInfo, SessionStatus, Task, TaskPhase } from '../../shared/protocol.ts';
-import { sortProjectTasks, taskActivityAt } from './util.ts';
+import { needsList, nestDelegated, reviewList, sortProjectTasks, taskActivityAt } from './util.ts';
 
 function mkTask(id: string, o: {
   agent?: AgentKind;
@@ -99,5 +99,49 @@ describe('sortProjectTasks', () => {
       'approved-open',
       'exited-recent',
     ]);
+  });
+});
+
+describe('nestDelegated', () => {
+  const deleg = (id: string, parent: string, createdAt: number): Task => ({
+    ...mkTask(id, { createdAt: 1 }),
+    delegation: { parentTaskId: parent, brief: id, round: 1, createdAt },
+  });
+
+  it('nests children under a main task in the list, oldest dispatch first, and keeps the rest in order', () => {
+    const main = mkTask('main', { createdAt: 1 });
+    const other = mkTask('other', { createdAt: 2 });
+    const late = deleg('late', 'main', 300);
+    const early = deleg('early', 'main', 100);
+    const orphan = deleg('orphan', 'gone', 50);
+    const { top, childrenOf } = nestDelegated([late, main, orphan, other, early]);
+    expect(top.map((t) => t.id)).toEqual(['main', 'orphan', 'other']);
+    expect(childrenOf.get('main')!.map((t) => t.id)).toEqual(['early', 'late']);
+    expect(childrenOf.has('orphan')).toBe(false);
+  });
+});
+
+describe('needsList / reviewList', () => {
+  it('counts 需要你 only on active tasks and 待验收 only on main tasks with a live session, oldest first', () => {
+    const tasks = [
+      mkTask('ask-late', { createdAt: 1 }),
+      mkTask('ask-early', { createdAt: 1 }),
+      mkTask('review-old', { createdAt: 1, phase: 'review', phaseSince: 10 }),
+      mkTask('review-new', { createdAt: 1, phase: 'review', phaseSince: 20 }),
+      { ...mkTask('review-deleg', { createdAt: 1, phase: 'review', phaseSince: 5 }), delegation: { parentTaskId: 'ask-late' } } as Task,
+      mkTask('review-gone', { createdAt: 1, phase: 'review', phaseSince: 1 }),
+      mkTask('approved', { createdAt: 1, phase: 'approved' }),
+    ];
+    const sessions = [
+      mkSession('s-ask-late', 'ask-late', { status: 'needs_you', startedAt: 1, statusSince: 30 }),
+      mkSession('s-ask-early', 'ask-early', { status: 'needs_you', startedAt: 1, statusSince: 3 }),
+      // Finished rounds also sit in needs_you; they are 待验收, not 需要你.
+      mkSession('s-review-old', 'review-old', { status: 'needs_you', startedAt: 1 }),
+      mkSession('s-review-new', 'review-new', { status: 'needs_you', startedAt: 1 }),
+      mkSession('s-review-deleg', 'review-deleg', { status: 'needs_you', startedAt: 1 }),
+      mkSession('s-approved', 'approved', { status: 'needs_you', startedAt: 1 }),
+    ];
+    expect(needsList({ tasks, sessions })).toEqual(['s-ask-early', 's-ask-late']);
+    expect(reviewList({ tasks, sessions })).toEqual(['s-review-old', 's-review-new']);
   });
 });

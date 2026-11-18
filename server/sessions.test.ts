@@ -224,6 +224,17 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
       'C:\\Users\\Admin\\AppData\\Local\\wb',
       ['C:/Users/Admin/AppData/Local/wb/agy-hooks', 'G:/Workspace/agent-workbench-share-1'],
     )).toBe(false);
+    // A folder agy does not trust yet is left out of workspacePaths: only the folders Shoal added remain.
+    const collab = 'C:\\Users\\Admin\\AppData\\Local\\wb\\collab\\p1';
+    const untrusted = ['C:/Users/Admin/AppData/Local/wb/agy-hooks', 'C:/Users/Admin/AppData/Local/wb/collab/p1'];
+    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', untrusted, collab)).toBe(true);
+    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb',
+      [...untrusted, 'C:/Users/Admin/AppData/Local/wb/agy-instructions'], collab)).toBe(true);
+    // ...but not when the collab folder is another project's, missing, or joined by a folder Shoal did not add.
+    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', untrusted, collab.replace('p1', 'p2'))).toBe(false);
+    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', untrusted)).toBe(false);
+    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', [...untrusted, 'G:/H5-game/x-share-1'], collab)).toBe(false);
+    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', ['C:/Users/Admin/AppData/Local/wb/collab/p1'], collab)).toBe(false);
     expect(isAgyIntermediateStop({ fullyIdle: false, continuationActive: false, error: '' })).toBe(true);
     expect(isAgyIntermediateStop({ fullyIdle: true, continuationActive: true, error: '' })).toBe(true);
     expect(isAgyIntermediateStop({ fullyIdle: false, error: 'RESOURCE_EXHAUSTED (code 429)' })).toBe(false);
@@ -434,6 +445,26 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
       const healed = await api('POST', `/api/tasks/${poisonedTaskId}/resume`, {});
       expect(healed.status).toBe(200);
       expect(spawns[2].args.slice(0, 2)).toEqual(['--conversation', MAIN]);
+
+      // 8. A project folder agy does not trust yet is missing from workspacePaths (only agy-hooks + collab remain).
+      //    The session is still the primary one: it gets the conversation id (resumable) and its Stop becomes a result.
+      const UNTRUSTED = '413ef5ee-9aab-45e1-bc22-28731c5ac250';
+      const untrustedTp = writeBrain(UNTRUSTED, [
+        { step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', created_at: nowIso, content: '<USER_REQUEST>跑一批视频</USER_REQUEST>' },
+        { step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', created_at: nowIso, content: 'Colab 只分到 L4，任务未运行。' },
+      ]);
+      const fresh = (await api('POST', '/api/tasks', { projectId: proj.id, agent: 'agy', title: '新文件夹', prompt: '跑一批视频' })).json;
+      const sidU: string = fresh.session.id;
+      const wsU = [path.join(stateDir, 'agy-hooks'), path.join(stateDir, 'collab', proj.id)].map(p => p.replaceAll('\\', '/'));
+      const base8 = { conversationId: UNTRUSTED, lastUserInput: '跑一批视频', transcriptPath: untrustedTp, workspacePaths: wsU, cwd: path.join(stateDir, 'agy-hooks') };
+      await postHook(sidU, 'SessionStart', base8);
+      await postHook(sidU, 'PreInvocation', base8);
+      expect(store.getSession(sidU)?.nativeSessionId).toBe(UNTRUSTED);
+      expect(store.getSession(sidU)?.status).toBe('working');
+      await postHook(sidU, 'Stop', { ...base8, fullyIdle: true, continuationActive: false, error: '' });
+      expect(store.getSession(sidU)?.status).toBe('needs_you');
+      expect(store.getTask(fresh.task.id)?.phase).toBe('review');
+      expect(store.cards().some(c => c.taskId === fresh.task.id && c.body.includes('Colab 只分到 L4'))).toBe(true);
     } finally {
       await sessions.killAll();
       await new Promise<void>(resolve => app.server.close(() => resolve()));

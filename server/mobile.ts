@@ -37,6 +37,7 @@ import type { ActivityTracker } from './activity.ts';
 import { buildTaskConversation } from './conversation.ts';
 import { createMobileNotifier, isAllowedWebhookUrl } from './notify.ts';
 import { createPowerBlocker } from './power.ts';
+import { readPrompt } from './prompt.ts';
 import type { SessionManager } from './sessions.ts';
 import type { Store } from './store.ts';
 import { createCfAccessVerifier, createTunnelManager, extractTunnelToken, normalizeTeamDomain } from './tunnel.ts';
@@ -553,7 +554,8 @@ function injectMobileMeta(html: string): string {
     /<meta\s+name=["']viewport["'][^>]*>/i,
     '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />',
   );
-  const meta = '<meta name="shoal-mobile" content="1" /><meta name="theme-color" content="#08090a" />';
+  // index.html already carries theme-color (the phone header colour) and the icons; only the marker is added here.
+  const meta = '<meta name="shoal-mobile" content="1" />';
   return out.includes('</head>') ? out.replace('</head>', `  ${meta}\n</head>`) : `${meta}\n${out}`;
 }
 
@@ -597,6 +599,11 @@ export function createMobileController(handlers: MobileHandlers) {
 
   // deviceId -> active WS sockets
   const wsByDevice = new Map<string, Set<WebSocket>>();
+  // Feedback retries carry the same clientMsgId; the first result is replayed instead of queueing the text twice.
+  const FEEDBACK_REPLAY_MS = 10 * 60_000;
+  const feedbackReplays = new Map<string, { at: number; body: unknown }>();
+  // Prompt answers for one session run one at a time, so a double tap cannot pass the fingerprint check twice.
+  const promptLocks = new Map<string, Promise<unknown>>();
   // ws -> { deviceId, via, watchedSessionId }
   const wsMeta = new Map<WebSocket, { deviceId: string; via: MobileRouteVia; watchedSessionId: string | null }>();
 
@@ -950,10 +957,15 @@ export function createMobileController(handlers: MobileHandlers) {
     const approved = approvedRedeems.get(claimId);
     if (approved) {
       if (!timingSafeStrEqual(claimSecret, approved.claimSecret)) {
-        throw new MobileGatewayError(403, '配对校验失败');
+        throw new MobileGatewayError(403, '配对校验失败', 'pair-mismatch');
       }
-      approvedRedeems.delete(claimId);
-      const dev = disk.devices.find(d => d.id === approved.device.id) ?? approved.device;
+      // Kept until it expires (REDEEM_TTL_MS after approval): if the phone never saw the first approved response, its
+      // next poll gets the same result. A device revoked in the meantime is not handed back.
+      const dev = disk.devices.find(d => d.id === approved.device.id);
+      if (!dev) {
+        approvedRedeems.delete(claimId);
+        throw new MobileGatewayError(410, '配对请求已失效或已被拒绝', 'pair-expired');
+      }
       const cookie = `${COOKIE_NAME}=${dev.id}.${approved.rawToken}; Max-Age=${COOKIE_MAX_AGE_S}; Path=/; HttpOnly; SameSite=Lax${isHttps ? '; Secure' : ''}`;
       return {
         body: { status: 'approved', device: deviceSummary({ ...dev, via }) },
@@ -964,7 +976,8 @@ export function createMobileController(handlers: MobileHandlers) {
     if (activePair && activePair.claimId === claimId && activePair.claimSecret && timingSafeStrEqual(claimSecret, activePair.claimSecret)) {
       return { body: { status: 'pending' } };
     }
-    throw new MobileGatewayError(410, '配对请求已失效或已被拒绝');
+    if (activePair && activePair.claimId === claimId) throw new MobileGatewayError(403, '配对校验失败', 'pair-mismatch');
+    throw new MobileGatewayError(410, '配对请求已失效或已被拒绝', 'pair-expired');
   }
 
   async function handleMobileApi(req: http.IncomingMessage, res: http.ServerResponse, pathname: string) {
@@ -1151,21 +1164,75 @@ export function createMobileController(handlers: MobileHandlers) {
       });
     }
 
+    const promptMatch = pathname.match(/^\/api\/mobile\/tasks\/([^/]+)\/(prompt|prompt-answer)$/);
+    if (promptMatch && ((method === 'GET' && promptMatch[2] === 'prompt') || (method === 'POST' && promptMatch[2] === 'prompt-answer'))) {
+      const taskId = safeDecodeParam(promptMatch[1]);
+      const task = handlers.store.getTask(taskId);
+      if (!task) throw new MobileGatewayError(404, '任务不存在');
+      const sessionId = task.sessionId;
+      const scrub = (t: string) => scrubErrorForMobile(t, handlers.stateDir, extraDirs);
+      // The waitSeq is read together with the screen; rendering is async, so the answer below re-checks it synchronously.
+      const read = async () => {
+        const w = sessionId ? handlers.sessions.promptWait(sessionId) : null;
+        if (!w) return null;
+        const view = await readPrompt(w.info, w.waitSeq, w.replay, scrub);
+        return view ? { view, waitSeq: w.waitSeq } : null;
+      };
+      if (method === 'GET') return sendJson(res, 200, { prompt: (await read())?.view ?? null });
+      if (!sessionId) throw new MobileGatewayError(409, '已在别处处理', 'stale');
+      const { fingerprint, data } = body;
+      if (typeof fingerprint !== 'string' || typeof data !== 'string') throw new MobileGatewayError(400, '缺少 fingerprint 或 data');
+      const prev = promptLocks.get(sessionId) ?? Promise.resolve();
+      const run = prev.catch(() => {}).then(async () => {
+        const r = await read();
+        if (!r || r.view.fingerprint !== fingerprint) throw new MobileGatewayError(409, '已在别处处理', 'stale');
+        if (!r.view.keys.some(k => k.data === data)) throw new MobileGatewayError(400, '这个按键不在当前提示的选项里');
+        // From here on nothing awaits: the task still owns the session and no input, delivery or new prompt has
+        // happened since the screen was read, or the answer is refused.
+        if (handlers.store.getTask(taskId)?.sessionId !== sessionId || !handlers.sessions.answerPrompt(sessionId, r.waitSeq, data)) {
+          throw new MobileGatewayError(409, '已在别处处理', 'stale');
+        }
+      });
+      promptLocks.set(sessionId, run);
+      try {
+        await run;
+      } finally {
+        if (promptLocks.get(sessionId) === run) promptLocks.delete(sessionId);
+      }
+      return sendJson(res, 200, { ok: true });
+    }
+
     const actMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/(approve|archive|unarchive|feedback)$/);
     if (method === 'POST' && actMatch) {
       const taskId = safeDecodeParam(actMatch[1]);
       const action = actMatch[2];
       if (action === 'feedback') {
-        const r = handlers.feedback(taskId, { ...body, ...fixedSize });
-        return sendJson(res, 200, {
+        const rawId = body.clientMsgId;
+        if (rawId !== undefined && (typeof rawId !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(rawId))) {
+          throw new MobileGatewayError(400, 'clientMsgId 格式无效');
+        }
+        const replayKey = typeof rawId === 'string' ? `${device.id}:${taskId}:${rawId}` : null;
+        const now = Date.now();
+        for (const [k, v] of feedbackReplays) if (now - v.at > FEEDBACK_REPLAY_MS) feedbackReplays.delete(k);
+        const prior = replayKey ? feedbackReplays.get(replayKey) : undefined;
+        if (prior) return sendJson(res, 200, prior.body);
+        const { clientMsgId: _drop, ...feedbackBody } = body;
+        const r = handlers.feedback(taskId, { ...feedbackBody, ...fixedSize });
+        const payload = {
           ...r,
           task: sanitizeTaskForMobile(r.task, handlers.stateDir, extraDirs),
           session: sanitizeSessionForMobile(r.session),
           card: sanitizeCardForMobile(r.card, handlers.stateDir, extraDirs),
-        });
+        };
+        if (replayKey) feedbackReplays.set(replayKey, { at: now, body: payload });
+        return sendJson(res, 200, payload);
       }
       const task = handlers.store.getTask(taskId);
       if (!task) throw new MobileGatewayError(404, '任务不存在');
+      // 通过 belongs to the round the phone was looking at: a new round (feedback, delegation result) resets phaseSince.
+      if (action === 'approve' && (task.phase !== 'review' || body.phaseSince !== task.phaseSince)) {
+        throw new MobileGatewayError(409, '这一轮验收已变化，请看最新结果后再操作', 'stale-round');
+      }
       if (action === 'archive' && task.sessionId) handlers.sessions.kill(task.sessionId);
       return sendJson(res, 200, sanitizeTaskForMobile(handlers.setTaskPhase(task, action === 'approve' ? 'approved' : action === 'archive' ? 'archived' : 'active'), handlers.stateDir, extraDirs));
     }

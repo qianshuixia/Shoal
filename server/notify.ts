@@ -523,7 +523,8 @@ export function createMobileNotifier(cfg: MobileNotifierConfig) {
       prevPhase.set(task.id, task.phase);
       if (task.phase === 'review' && old !== 'review') {
         cancelNeedsYou(task.id);
-        dispatch(task, 'review');
+        // A delegated task's result goes to its main task for review, not to the user.
+        if (!task.delegation) dispatch(task, 'review');
       } else if (task.phase === 'archived' || task.phase === 'approved') {
         cancelNeedsYou(task.id);
         if (task.phase === 'archived') {

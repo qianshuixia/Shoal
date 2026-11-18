@@ -206,6 +206,7 @@ describe('mobile gateway & security integration', () => {
       body: JSON.stringify({ claimId: claim1.claimId, claimSecret: claim1.claimSecret }),
     });
     expect(redeemDead.status).toBe(410);
+    expect(await redeemDead.json()).toMatchObject({ code: 'pair-expired' });
 
     // 3) Happy-path pairing: start -> claim -> approve with exact PIN -> redeem cookie
     const pairStart2 = (await (await fetch(`${baseMain}/api/mobile/admin/pair/start`, {
@@ -234,6 +235,21 @@ describe('mobile gateway & security integration', () => {
     });
     expect(redeemOk.status).toBe(200);
     const setCookie = redeemOk.headers.get('set-cookie') ?? '';
+    // The phone may never see that response: its next poll gets the same approval; a wrong secret is told apart.
+    const redeemAgain = await fetch(`${mobOrigin}/api/mobile/pair/redeem`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-shoal-mobile': '1' },
+      body: JSON.stringify({ claimId: claim2.claimId, claimSecret: claim2.claimSecret }),
+    });
+    expect(redeemAgain.status).toBe(200);
+    expect((redeemAgain.headers.get('set-cookie') ?? '').split(';')[0]).toBe(setCookie.split(';')[0]);
+    const redeemWrong = await fetch(`${mobOrigin}/api/mobile/pair/redeem`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-shoal-mobile': '1' },
+      body: JSON.stringify({ claimId: claim2.claimId, claimSecret: 'not-the-secret' }),
+    });
+    expect(redeemWrong.status).toBe(403);
+    expect(await redeemWrong.json()).toMatchObject({ code: 'pair-mismatch' });
     expect(setCookie).toContain('shoal_mobile=');
     expect(setCookie).toContain('HttpOnly');
     const cookiePair = setCookie.split(';')[0];
@@ -386,6 +402,133 @@ describe('mobile gateway & security integration', () => {
     const afterRevoke = await fetch(`${mobOrigin}/api/state`, { headers: { cookie: cookiePair } });
     expect(afterRevoke.status).toBe(401);
   });
+
+  async function pairPhone(baseMain: string) {
+    const st = (await (await fetch(`${baseMain}/api/mobile/admin/config`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true, lanEnabled: false }),
+    })).json()) as MobileAdminStatus;
+    const mobOrigin = `http://127.0.0.1:${st.actualPort}`;
+    const start = (await (await fetch(`${baseMain}/api/mobile/admin/pair/start`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    })).json()) as MobileAdminStatus;
+    const claim = (await (await fetch(`${mobOrigin}/api/mobile/pair/claim`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-shoal-mobile': '1' },
+      body: JSON.stringify({ pairToken: start.activePair!.pairUrl.split('#pair=')[1], deviceName: 'Pixel' }),
+    })).json()) as MobilePairClaimResult;
+    await fetch(`${baseMain}/api/mobile/admin/pair/approve`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: claim.code }),
+    });
+    const redeem = await fetch(`${mobOrigin}/api/mobile/pair/redeem`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-shoal-mobile': '1' },
+      body: JSON.stringify({ claimId: claim.claimId, claimSecret: claim.claimSecret }),
+    });
+    const cookie = (redeem.headers.get('set-cookie') ?? '').split(';')[0];
+    const call = (method: string, p: string, body?: unknown) => fetch(`${mobOrigin}${p}`, {
+      method,
+      headers: { cookie, 'content-type': 'application/json', 'x-shoal-mobile': '1' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { call };
+  }
+
+  async function waitFor<T>(fn: () => T | undefined | false, ms = 8000): Promise<T> {
+    const until = Date.now() + ms;
+    for (;;) {
+      const v = fn();
+      if (v) return v;
+      if (Date.now() > until) throw new Error('timed out');
+      await new Promise(r => setTimeout(r, 25));
+    }
+  }
+
+  it('answers a blocked prompt only while the same prompt waits, replays retried feedback, and binds approval to the round', async () => {
+    const { repo, mainPort, sessions, store } = await bootApp();
+    const baseMain = `http://127.0.0.1:${mainPort}`;
+    const project = (await (await fetch(`${baseMain}/api/projects`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'P', path: repo }),
+    })).json()) as { id: string };
+    const created = (await (await fetch(`${baseMain}/api/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: project.id, agent: 'fake', title: 't', cols: 100, rows: 30 }),
+    })).json()) as { task: { id: string }; session: { id: string } };
+    const taskId = created.task.id;
+    const sid = created.session.id;
+    const { call } = await pairPhone(baseMain);
+    const promptPath = `/api/mobile/tasks/${taskId}/prompt`;
+    const answerPath = `/api/mobile/tasks/${taskId}/prompt-answer`;
+    const sessionOf = () => sessions.list().find(s => s.id === sid);
+
+    expect(await (await call('GET', promptPath)).json()).toEqual({ prompt: null });
+
+    await waitFor(() => sessions.replayOf(sid)?.includes('> '));
+    sessions.input(sid, 'ask\r');
+    await waitFor(() => sessionOf()?.blocked === 'permission');
+    const { prompt } = (await (await call('GET', promptPath)).json()) as {
+      prompt: { kind: string; lines: string[]; keys: { data: string }[]; fingerprint: string };
+    };
+    expect(prompt.kind).toBe('yn');
+    expect(prompt.lines.at(-1)).toContain('Allow? (y/n)');
+    expect(prompt.keys.map(k => k.data)).toEqual(['y', 'n']);
+
+    expect((await call('POST', answerPath, { fingerprint: prompt.fingerprint, data: 'x' })).status).toBe(400);
+    const wrongFp = await call('POST', answerPath, { fingerprint: 'nope', data: 'y' });
+    expect(wrongFp.status).toBe(409);
+    expect(await wrongFp.json()).toMatchObject({ code: 'stale' });
+
+    // A double tap: the first answer clears the block, so the second no longer matches and writes nothing.
+    const writes = vi.spyOn(sessions, 'input');
+    const both = await Promise.all([0, 1].map(() => call('POST', answerPath, { fingerprint: prompt.fingerprint, data: 'y' })));
+    expect(both.map(r => r.status).sort()).toEqual([200, 409]);
+    expect(writes.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(1);
+    writes.mockRestore();
+
+    // The desktop answers while the phone's answer is being checked: the phone's answer is refused, not written.
+    await waitFor(() => !sessionOf()?.blocked && sessionOf()?.status !== 'working');
+    sessions.input(sid, 'ask\r');
+    await waitFor(() => sessionOf()?.blocked === 'permission');
+    const asked = ((await (await call('GET', promptPath)).json()) as { prompt: { fingerprint: string } }).prompt;
+    const seq = sessions.promptWait(sid)!.waitSeq;
+    expect(sessions.answerPrompt(sid, seq + 1, 'y')).toBe(false);
+    const realWait = sessions.promptWait.bind(sessions);
+    const wait = vi.spyOn(sessions, 'promptWait').mockImplementationOnce(id => {
+      const w = realWait(id);
+      queueMicrotask(() => sessions.input(sid, 'n'));
+      return w;
+    });
+    const raceWrites = vi.spyOn(sessions, 'input');
+    const raced = await call('POST', answerPath, { fingerprint: asked.fingerprint, data: 'y' });
+    expect(raced.status).toBe(409);
+    expect(raceWrites.mock.calls.filter(c => c[0] === sid && c[1] === 'y')).toHaveLength(0);
+    raceWrites.mockRestore();
+    wait.mockRestore();
+
+    // Feedback retried with the same clientMsgId is delivered once and answered with the first result.
+    await waitFor(() => !sessionOf()?.blocked && sessionOf()?.status !== 'working');
+    const fbPath = `/api/tasks/${taskId}/feedback`;
+    expect((await call('POST', fbPath, { text: 'x', mode: 'same', clientMsgId: 'bad id!' })).status).toBe(400);
+    const cardsBefore = store.cards().length;
+    const first = (await (await call('POST', fbPath, { text: 'deliver once', mode: 'same', clientMsgId: 'retry-0001' })).json()) as { card: { id: string } };
+    const again = (await (await call('POST', fbPath, { text: 'deliver once', mode: 'same', clientMsgId: 'retry-0001' })).json()) as { card: { id: string } };
+    expect(again.card.id).toBe(first.card.id);
+    expect(store.cards().length).toBe(cardsBefore + 1);
+
+    // Approval only applies to the review round the phone saw.
+    const t0 = store.getTask(taskId)!;
+    store.updateTask({ ...t0, phase: 'review', phaseSince: 1000 });
+    const stale = await call('POST', `/api/tasks/${taskId}/approve`, { phaseSince: 999 });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ code: 'stale-round' });
+    expect((await call('POST', `/api/tasks/${taskId}/approve`, {})).status).toBe(409);
+    const ok = await call('POST', `/api/tasks/${taskId}/approve`, { phaseSince: 1000 });
+    expect(ok.status).toBe(200);
+    expect(store.getTask(taskId)?.phase).toBe('approved');
+    expect((await call('POST', `/api/tasks/${taskId}/approve`, { phaseSince: 1000 })).status).toBe(409);
+  }, 30_000);
 
   it('rejects tunnel host requests without valid Cloudflare Access JWT when configured', async () => {
     const { mainPort } = await bootApp();

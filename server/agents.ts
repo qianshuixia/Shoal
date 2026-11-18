@@ -319,6 +319,9 @@ export function writeHookFiles(stateDir: string): void {
   const statusLine = { type: 'command', command: `${nodeCmd} "${STATUSLINE}" claude` };
   fs.writeFileSync(path.join(stateDir, 'claude-hooks.json'), JSON.stringify({ hooks, statusLine }, null, 2));
 
+  // Earlier versions synced a shoal-collab skill for agy; it now gets its instructions like the other CLIs (see buildLaunch).
+  fs.rmSync(path.join(stateDir, 'agy-hooks', '.agents', 'skills', 'shoal-collab'), { recursive: true, force: true });
+
   if (!agyUsable()) {
     console.warn(`[agents] WARNING: hook command path contains a space (${NODE} ${NOTIFY} ${STATUSLINE}); agy hooks cannot be quoted, agy is disabled`);
     return;
@@ -328,12 +331,6 @@ export function writeHookFiles(stateDir: string): void {
   const dir = path.join(stateDir, 'agy-hooks', '.agents');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'hooks.json'), JSON.stringify({ workbench: agy }, null, 2));
-  const skillSrc = path.join(ROOT, 'skills', 'shoal-collab', 'SKILL.md');
-  if (fs.existsSync(skillSrc)) {
-    const skillDst = path.join(dir, 'skills', 'shoal-collab', 'SKILL.md');
-    fs.mkdirSync(path.dirname(skillDst), { recursive: true });
-    fs.copyFileSync(skillSrc, skillDst);
-  }
   const agySl = agyUserStatusLine();
   const agyStatusLine = {
     type: 'command',
@@ -370,6 +367,16 @@ export const FULL_ACCESS = {
   agy: '--dangerously-skip-permissions',
 } as const;
 
+// True when the user's Codex config.toml sets developer_instructions itself.
+export function codexHasUserDeveloperInstructions(): boolean {
+  const file = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml');
+  try {
+    return /^[ 	]*developer_instructions[ 	]*=/m.test(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
 // resume: native session id of a saved conversation to reopen (resume commands verified in M0); the prompt is ignored then.
 export function buildLaunch(opts: {
   agent: AgentKind;
@@ -379,13 +386,15 @@ export function buildLaunch(opts: {
   resume?: string;
   model?: string;
   collabDir?: string;
+  instructions?: string; // standing instructions for the session (the fake agent ignores them)
 }): Launch {
-  const { agent, sessionId, stateDir, resume, model, collabDir } = opts;
+  const { agent, sessionId, stateDir, resume, model, collabDir, instructions } = opts;
   const prompt = resume ? '' : preparePrompt(opts.prompt, sessionId, stateDir);
   switch (agent) {
     case 'claude': {
       const native = resume ?? crypto.randomUUID();
       const args = [resume ? '--resume' : '--session-id', native, '--settings', path.join(stateDir, 'claude-hooks.json').replaceAll('\\', '/'), FULL_ACCESS.claude];
+      if (instructions) args.push('--append-system-prompt', instructions);
       if (prompt) args.push(prompt);
       return { file: claudeExe(), args, nativeSessionId: native };
     }
@@ -394,6 +403,8 @@ export function buildLaunch(opts: {
       if (resume) args.push('resume', resume);
       // Byte-identical to spikes/probe.mjs: Codex stores trust hashes of these strings.
       for (const ev of CODEX_EVENTS) args.push('-c', `hooks.${ev}=[{hooks=[{type="command",command='${hookCmd('codex', ev)}',timeout=5}]}]`);
+      // Not injected when the user's own Codex config defines developer_instructions: a -c override would replace it.
+      if (instructions && !codexHasUserDeveloperInstructions()) args.push('-c', `developer_instructions=${JSON.stringify(instructions)}`);
       args.push('-c', 'check_for_update_on_startup=false', FULL_ACCESS.codex);
       if (prompt) args.push(prompt);
       return { file: process.execPath, args, nativeSessionId: resume ?? null };
@@ -404,6 +415,14 @@ export function buildLaunch(opts: {
       if (collabDir) {
         fs.mkdirSync(collabDir, { recursive: true });
         args.push('--add-dir', collabDir);
+      }
+      // agy has no system-prompt flag. It reads AGENTS.md of every workspace folder as an always-on rule, and a folder
+      // added with --add-dir is a workspace folder, so the instructions go into a folder of their own.
+      if (instructions) {
+        const dir = path.join(stateDir, 'agy-instructions');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'AGENTS.md'), `${instructions}\n`);
+        args.push('--add-dir', dir);
       }
       args.push(FULL_ACCESS.agy);
       if (model && isValidAgyModel(model)) args.push('--model', model);

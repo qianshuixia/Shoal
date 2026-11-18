@@ -82,6 +82,7 @@ export function EmergencyTerminalDrawer({
   }, [wsConnected, session.id, cols, rows, sendMsg]);
 
   const sendKey = (d: string) => {
+    if (!wsConnected) return;
     setConfirmCtrlC(false);
     sendMsg({ t: 'term-key', id: session.id, d });
   };
@@ -102,12 +103,14 @@ export function EmergencyTerminalDrawer({
         <div ref={hostRef} style={{ width: 'max-content', minHeight: '100%' }} />
       </div>
 
+      {!wsConnected && <div className="mob-conn-bar" data-testid="mobile-term-offline">连接中断，按键暂不可用，重连后恢复</div>}
       <div className="mob-keybar" data-testid="mobile-term-keybar">
         {QUICK_KEYS.map((k) => (
           <button
             key={k.label}
             type="button"
             data-testid={k.testId}
+            disabled={!wsConnected}
             style={k.primary ? { background: 'var(--signal)', color: '#111317', borderColor: 'var(--signal)' } : undefined}
             onClick={() => sendKey(k.seq)}
           >{k.label}</button>
@@ -115,6 +118,7 @@ export function EmergencyTerminalDrawer({
         <button
           type="button"
           data-testid="mobile-key-ctrlc"
+          disabled={!wsConnected}
           style={confirmCtrlC ? { background: 'var(--danger)', color: '#111317', borderColor: 'var(--danger)' } : undefined}
           onClick={() => {
             if (!confirmCtrlC) {

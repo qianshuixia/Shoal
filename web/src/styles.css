@@ -386,6 +386,15 @@ kbd {
   background: var(--surface); border-top: 1px solid var(--line); color: var(--text-2);
 }
 .pane-exited span { margin-right: auto; }
+/* Over the empty terminal of an exited session that has no saved output; absolute so .pane-body keeps its size. */
+.pane-exited-summary {
+  position: absolute; inset: 0.75rem; z-index: 6; display: flex; flex-direction: column; gap: 0.5rem; min-height: 0;
+  padding: 0.75rem 0.875rem; border: 1px solid var(--line); border-radius: 0.5rem; background: var(--surface); color: var(--text-2);
+}
+.pane-exited-summary-head { display: flex; align-items: center; gap: 0.5rem; flex: none; font-size: 0.8125rem; }
+.pane-exited-summary-head span { margin-right: auto; }
+.pane-exited-summary-body { flex: 1; min-height: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); font-size: 0.8125rem; line-height: 1.6; user-select: text; }
+.pane-exited-summary-none { color: var(--text-3); font-size: 0.8125rem; }
 
 
 .pane-queued {
@@ -819,6 +828,11 @@ kbd {
 
 /* Model selector hint & sidebar live activity line */
 .field-hint { color: var(--text-3); font-size: 0.7188rem; line-height: 1.35; }
+.delegation-rules { display: flex; flex-direction: column; gap: 0.375rem; }
+.delegation-rules textarea { width: 100%; box-sizing: border-box; min-height: 10rem; font-size: 0.75rem; line-height: 1.45; }
+.delegation-rules-bar { display: flex; align-items: center; justify-content: flex-end; gap: 0.5rem; }
+.delegation-rules-count { margin-right: auto; color: var(--text-3); font-size: 0.7188rem; }
+.delegation-rules-count.over { color: var(--danger); }
 .task-preview.is-activity { color: var(--work); }
 .task-preview.is-activity.is-stalled { color: var(--signal); }
 
@@ -974,3 +988,98 @@ kbd {
 .mobile-admin details summary { cursor: pointer; font-size: 0.7188rem; color: var(--text-2); user-select: none; }
 .mobile-admin-ok { font-size: 0.7188rem; color: #6fd396; }
 
+
+/* Delegated tasks: nested sidebar rows, status chip, pane header marker and the HUD on the main task's pane. */
+/* A delegated row is a smaller row hung under its main task by a tree elbow. */
+.task-row.nested { position: relative; height: 1.5rem; gap: 0.4375rem; padding-left: 1.6875rem; font-size: 0.75rem; }
+.task-row.nested.has-preview { height: auto; }
+.task-row.nested.has-preview::before { height: 1.5rem; margin-right: -0.4375rem; }
+.task-row.nested .task-preview { flex-basis: calc(100% - 0.9375rem); margin-left: 0.9375rem; font-size: 0.6875rem; }
+.task-row.nested.in-pane .task-preview { flex-basis: calc(100% - 1.5rem); margin-left: 1.5rem; }
+.task-row.nested .status { min-width: 0; font-size: 0.6875rem; }
+.task-row.nested[data-phase="archived"] .task-title { color: var(--text-3); }
+.nest-mark {
+  position: absolute; left: 0.8125rem; top: -0.125rem; width: 0.5rem; height: 0.875rem;
+  border-left: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); border-bottom-left-radius: 0.3125rem;
+}
+.kids-toggle {
+  display: block; margin: 0 0 0.125rem 1.6875rem; padding: 0.0625rem 0.375rem; border: 0; border-radius: 0.25rem;
+  background: transparent; color: var(--text-3); font-size: 0.6875rem; cursor: pointer;
+}
+.kids-toggle:hover { background: var(--hover); color: var(--text-2); }
+.status.st-deleg { padding: 0 0.4375rem; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--text-2); }
+.status.st-deleg-working, .status.st-deleg-rework { color: var(--work); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--work) 40%, var(--line-2)); font-weight: 500; }
+.status.st-deleg-needs_you { color: var(--signal); background: var(--signal-bg); box-shadow: none; font-weight: 600; }
+.status.st-deleg-failed { color: var(--danger); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 45%, var(--line-2)); }
+.status.st-deleg-accepted { color: #6fd396; box-shadow: none; }
+.status.st-deleg-canceled { color: var(--text-3); box-shadow: none; }
+.pane-delegation {
+  flex: none; height: 1.375rem; padding: 0 0.5rem; border-radius: 999px; font-size: 0.75rem; line-height: 1.375rem; white-space: nowrap;
+  color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2);
+}
+.pane-delegation.st-deleg-working, .pane-delegation.st-deleg-rework { color: var(--work); }
+.pane-delegation.st-deleg-needs_you { color: var(--signal); background: var(--signal-bg); box-shadow: none; }
+.pane-delegation.st-deleg-failed { color: var(--danger); }
+.pane-parent { flex: none; height: 1.375rem; padding: 0 0.5rem; font-size: 0.75rem; line-height: 1.25rem; background: transparent; color: var(--text-2); }
+
+/* Strictly position:absolute inside .pane-stage (like .activity-hud): .pane-body must never resize or ConPTY redraws. */
+.delegation-hud {
+  position: absolute; top: 0.5rem; right: 0.75rem; left: 0.75rem; z-index: 7;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 0.375rem;
+  pointer-events: none;
+}
+.pane-stage:has(.activity-hud) .delegation-hud { top: 2.5rem; }
+.pane-stage:has(.delegation-hud) .pane-queued { top: 2.5rem; }
+.pane-stage:has(.delegation-hud):has(.activity-hud) .pane-queued { top: 4.5rem; }
+/* An open popover covers the queued notice (z-index 12) that sits under the pills. */
+.delegation-hud:has(.delegation-popover), .activity-hud:has(.activity-popover) { z-index: 13; }
+.delegation-pill {
+  pointer-events: auto;
+  display: inline-flex; align-items: center; gap: 0.4375rem; height: 1.625rem; max-width: min(34rem, 100%); min-width: 0;
+  padding: 0 0.5625rem; border-radius: 999px; font-size: 0.75rem;
+  background: rgba(20, 22, 26, .92); backdrop-filter: blur(8px);
+  border: 1px solid var(--line-2); color: var(--text-2); box-shadow: 0 0.375rem 1.25rem rgba(0, 0, 0, .42);
+}
+.delegation-pill:hover:not(:disabled) { background: var(--raised); color: var(--text); }
+.delegation-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; }
+.delegation-kind { flex: none; padding-right: 0.4375rem; border-right: 1px solid var(--line-2); line-height: 0.875rem; color: var(--text-3); }
+.delegation-total { flex: none; color: var(--text); font-weight: 600; }
+/* Status chip shared by the pill and the popover rows: the state reads by color before the words are read. */
+.delegation-chip {
+  flex: none; height: 1.125rem; padding: 0 0.4375rem; border-radius: 999px; font-size: 0.6875rem; line-height: 1.125rem;
+  color: var(--text-2); background: rgba(255, 255, 255, .07);
+}
+.delegation-chip.st-working, .delegation-chip.st-rework { color: var(--work); background: color-mix(in srgb, var(--work) 15%, transparent); }
+.delegation-chip.st-needs_you { color: var(--signal); background: var(--signal-bg); font-weight: 600; }
+.delegation-chip.st-failed { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.delegation-chip.st-review { color: var(--text); background: rgba(255, 255, 255, .1); }
+.delegation-chip.st-accepted { color: #6fd396; background: rgba(111, 211, 150, .12); }
+.delegation-chip.st-canceled { color: var(--text-3); }
+/* HUD pills are not focused by clicks; for keyboard focus the border lights up instead of a ring around the pill. */
+.activity-pill:focus-visible, .delegation-pill:focus-visible { outline: none; border-color: var(--work); }
+.delegation-dot { flex: none; width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: var(--text-3); }
+.delegation-hud.level-needs_you .delegation-dot { background: var(--signal); }
+.delegation-hud.level-needs_you .delegation-pill { border-color: color-mix(in srgb, var(--signal) 55%, var(--line-2)); }
+.delegation-hud.level-failed .delegation-dot { background: var(--danger); }
+.delegation-hud.level-review .delegation-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-2); }
+.delegation-hud.level-working .delegation-dot { background: var(--work); box-shadow: 0 0 0 0 var(--ring); animation: ping 1.8s cubic-bezier(.2, .6, .3, 1) infinite; }
+.delegation-popover {
+  pointer-events: auto;
+  width: min(28rem, 100%); max-height: min(22rem, calc(100% - 2.5rem));
+  display: flex; flex-direction: column; gap: 0.25rem; padding: 0.375rem;
+  background: rgba(22, 24, 28, .97); backdrop-filter: blur(10px);
+  border: 1px solid var(--line-2); border-radius: 0.5rem;
+  box-shadow: 0 0.875rem 2.25rem rgba(0, 0, 0, .55); overflow-y: auto;
+}
+.delegation-item {
+  display: flex; flex-direction: column; align-items: stretch; gap: 0.1875rem; padding: 0.375rem 0.5rem;
+  background: transparent; border: 0; border-radius: 0.3125rem; text-align: left; color: var(--text-2); font-size: 0.75rem;
+}
+.delegation-item:hover:not(:disabled) { background: var(--active); color: var(--text); }
+.delegation-item-head, .delegation-item-sub { display: flex; align-items: center; gap: 0.4375rem; min-width: 0; }
+.delegation-item-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; }
+.delegation-item-round { flex: none; color: var(--text-3); }
+.delegation-mode { flex: none; padding: 0 0.3125rem; border-radius: 0.25rem; color: var(--work); background: color-mix(in srgb, var(--work) 15%, transparent); font-size: 0.6875rem; }
+.delegation-item-line { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); }
+.delegation-item-elapsed { flex: none; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.delegation-item-steps { display: flex; flex-direction: column; gap: 0.1875rem; padding-left: 1.3125rem; }

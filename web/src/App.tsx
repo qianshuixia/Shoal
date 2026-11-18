@@ -3,9 +3,9 @@ import type { CSSProperties } from 'react';
 import type {
   AgentKind, ArchiveStoppedResult, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
-import { AGENT_LABEL, DEFAULT_SETTINGS, canResume } from '../../shared/protocol.ts';
+import { AGENT_LABEL, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
 import { connect, send } from './ws.ts';
-import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
+import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
 import { ACTIVITY_STALL_MS, Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
 import { matchProjectFileLink } from './linkParse.ts';
@@ -16,7 +16,8 @@ import { AgentIcon } from './agentIcons.tsx';
 import { liveWindows, QUOTA_AGENTS } from './quota.ts';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
-import { sortProjectTasks, taskActivityAt, taskBand } from './util.ts';
+import type { DelegateView } from './DelegationHud.tsx';
+import { needsList, nestDelegated, reviewList, sortProjectTasks, taskActivityAt, taskBand } from './util.ts';
 
 type PaneSessions = [string | null, string | null];
 type LayoutMode = 1 | 2 | 'inspect';
@@ -42,6 +43,10 @@ const ARCHIVE_OPEN_KEY = 'wb.archiveOpen';
 const FILTER_KEY = 'wb.sideFilter';
 // In 全部 mode each project keeps at most the N most recently active exited tasks visible; older ones fold locally.
 const RECENT_STOPPED_LIMIT = 2;
+// A closed delegated task stays in the main task's HUD this long, so the outcome can still be seen.
+const DELEGATION_LINGER_MS = 5 * 60_000;
+// Closed delegated tasks listed under their main task before older ones fold behind a toggle.
+const CLOSED_KIDS_SHOWN = 2;
 const loadFilter = (): SideFilter => (localStorage.getItem(FILTER_KEY) === 'active' ? 'active' : 'all');
 function loadCollapsed(): Set<string> {
   try {
@@ -100,22 +105,6 @@ function loadInspectSplit(): number {
   const v = Number(localStorage.getItem(INSPECT_SPLIT_KEY));
   return Number.isFinite(v) && v > 0 ? clampInspectSplit(v) : INSPECT_SPLIT_DEFAULT;
 }
-
-// Sessions that want the user, oldest first: asked a question (需要你, task still active) / finished a task (待验收).
-const needsList = (d: Snapshot): string[] => {
-  const phase = new Map(d.tasks.map((t) => [t.id, t.phase]));
-  return d.sessions
-    .filter((s) => s.status === 'needs_you' && phase.get(s.taskId) === 'active')
-    .sort((a, b) => a.statusSince - b.statusSince)
-    .map((s) => s.id);
-};
-const reviewList = (d: Snapshot): string[] => {
-  const ids = new Set(d.sessions.map((s) => s.id));
-  return d.tasks
-    .filter((t) => t.phase === 'review' && t.sessionId && ids.has(t.sessionId))
-    .sort((a, b) => a.phaseSince - b.phaseSince)
-    .map((t) => t.sessionId!);
-};
 
 // The agent of the most recently active task in the project, so quick-create repeats what you just did.
 function defaultAgentFor(d: Snapshot, projectId: string): AgentKind {
@@ -388,6 +377,7 @@ export function App() {
         onOpen: () => {
           setConnected(true);
           forgetSentSizes();
+          resendWantedReplays();
           live.current.panes.forEach((id) => id && fitEntry(id));
         },
         onClose: () => setConnected(false),
@@ -410,6 +400,12 @@ export function App() {
     if (focusTerminal) setFocusTick((n) => n + 1);
   }, []);
 
+  // Shows a session beside the one in `fromPane`: switches to the dual layout first when needed, the left pane keeps its session.
+  const openBeside = useCallback((sessionId: string, fromPane: number) => {
+    if (live.current.layout !== 2) setLayout(2);
+    showSession(sessionId, live.current.layout === 2 ? 1 - fromPane : 1);
+  }, [showSession]);
+
   const openInspectorAt = useCallback((projectId: string, tab: InspectorTab, filePath?: string, line?: number, col?: number) => {
     setView('work');
     setPinnedInspectProjectId(projectId);
@@ -419,8 +415,10 @@ export function App() {
   }, [switchLayout]);
 
   const interruptSession = useCallback((sid: string) => {
-    send({ t: 'in', id: sid, d: '\x1b' });
+    // Focus first: refocusing the terminal reports focus-in (\x1b[I, ConPTY turns focus reporting on); sent right after a
+    // lone Esc it reads as Alt+Esc and the interrupt is lost.
     focusOnly(sid);
+    send({ t: 'in', id: sid, d: '\x1b' });
     setNotice('已向终端发送 Esc 中断信号');
   }, []);
 
@@ -819,6 +817,16 @@ export function App() {
   const focusedProjectId = focusedTaskId ? tasksById.get(focusedTaskId)?.projectId : undefined;
   const visibleIds = panes.slice(0, paneCount(layout));
   const sortedProjects = sortProjects(data.projects, order);
+  // A closed delegated task stays listed under its main task while that task is listed, instead of in 已归档.
+  const listedTaskIds = new Set(data.tasks.filter((t) => t.phase !== 'archived').map((t) => t.id));
+  const closedKid = (t: Task) => t.phase === 'archived' && !!t.delegation && listedTaskIds.has(t.delegation.parentTaskId);
+  // A delegated row opens beside its main task when that one is on screen, like the main pane's 委派 HUD does.
+  const openChild = (sessionId: string, parentTaskId: string) => {
+    const parentSession = tasksById.get(parentTaskId)?.sessionId;
+    const at = parentSession ? visibleIds.indexOf(parentSession) : -1;
+    if (at >= 0 && !visibleIds.includes(sessionId)) openBeside(sessionId, at);
+    else showSession(sessionId);
+  };
   const activeInspectProject = (pinnedInspectProjectId ? projectsById.get(pinnedInspectProjectId) : undefined)
     ?? (focusedProjectId ? projectsById.get(focusedProjectId) : undefined)
     ?? sortedProjects[0];
@@ -996,7 +1004,7 @@ export function App() {
             <ProjectGroup
               key={project.id}
               project={project}
-              tasks={data.tasks.filter((t) => t.projectId === project.id && t.phase !== 'archived')}
+              tasks={data.tasks.filter((t) => t.projectId === project.id && (t.phase !== 'archived' || closedKid(t)))}
               sessionsById={sessionsById}
               activityById={data.activity ?? {}}
               visibleIds={visibleIds}
@@ -1015,6 +1023,7 @@ export function App() {
               onReorder={reorderProject}
               onQuick={(agent) => void quickCreate(project.id, agent)}
               onOpen={(id) => showSession(id)}
+              onOpenChild={openChild}
               onRemove={removeTask}
               onRemoveProject={() => void removeProject(project)}
               onRename={renameTask}
@@ -1023,7 +1032,7 @@ export function App() {
           ))}
           <ArchiveSection
             projects={sortedProjects}
-            tasks={data.tasks.filter((t) => t.phase === 'archived')}
+            tasks={data.tasks.filter((t) => t.phase === 'archived' && !closedKid(t))}
             sessionsById={sessionsById}
             visibleIds={visibleIds}
             focusedId={focusedSessionId}
@@ -1049,6 +1058,17 @@ export function App() {
           const project = task ? projectsById.get(task.projectId) : undefined;
           const paneAgent = task?.agent ?? session?.agent;
           const card = task ? data.cards.filter((c) => c.taskId === task.id && c.kind === 'result').at(-1) : undefined;
+          const delegates: DelegateView[] = task
+            ? data.tasks
+                .filter((t) => t.delegation?.parentTaskId === task.id
+                  && (t.phase !== 'archived' || now - (t.delegation.settledAt ?? 0) < DELEGATION_LINGER_MS))
+                .sort((a, b) => a.delegation!.createdAt - b.delegation!.createdAt)
+                .map((t) => {
+                  const ses = t.sessionId ? sessionsById.get(t.sessionId) : undefined;
+                  return { task: t, session: ses, activity: ses ? data.activity?.[ses.id] : undefined, state: delegationState(t, ses)! };
+                })
+            : [];
+          const parentTask = task?.delegation ? tasksById.get(task.delegation.parentTaskId) : undefined;
           return (
             <Pane
               key={i}
@@ -1089,6 +1109,11 @@ export function App() {
               }}
               handoff={task ? data.cards.filter((c) => c.taskId === task.id && c.kind === 'handoff').at(-1) : undefined}
               onDropSession={layout === 2 ? (sid) => showSession(sid, i) : undefined}
+              delegates={delegates}
+              onOpenDelegate={(sid) => openBeside(sid, i)}
+              parentTask={parentTask}
+              onOpenParent={parentTask?.sessionId ? () => showSession(parentTask.sessionId!) : undefined}
+              onOpenPath={(p) => void post('/api/open', { target: p }).catch((e: Error) => setNotice(`无法打开对话记录：${e.message}`))}
             />
           );
         })}
@@ -1247,7 +1272,7 @@ function BranchChip({ git, onInspect }: { git: GitInfo; onInspect?: () => void }
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onOpenChild, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -1268,6 +1293,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   onReorder(dragged: string, target: string, after: boolean): void;
   onQuick(agent: AgentKind): void;
   onOpen(sessionId: string): void;
+  onOpenChild(sessionId: string, parentTaskId: string): void; // a delegated task's row: open it beside its main task
   onRemove(task: Task): void;
   onRemoveProject(): void;
   onRename(task: Task, title: string): void;
@@ -1277,31 +1303,37 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<'before' | 'after' | null>(null); // insertion line while another project is dragged over
   const [menu, setMenu] = useState(false);
+  const [expandedKids, setExpandedKids] = useState<ReadonlySet<string>>(() => new Set()); // main tasks listing every closed delegation
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
-  const reviewing = tasks.filter((t) => t.phase === 'review').length;
+  const reviewing = tasks.filter((t) => t.phase === 'review' && !t.delegation).length;
   const working = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'working').length;
   // Running tasks first, then approved (done, session still open), stopped last; most recently active first within each.
   // Status changes inside a live band (working / needs you / review) never move a row under the cursor.
   tasks = sortProjectTasks(tasks, sessionsById);
+  // Delegated tasks sit under their main task: folding, the 已退出 count and ordering apply to the top-level rows only.
+  const { top, childrenOf } = nestDelegated(tasks);
   // 活跃 hides all non-review stopped tasks; 全部 keeps the latest 2 stopped tasks visible and locally folds older ones.
-  const stopped = (t: Task) => taskBand(t, t.sessionId ? sessionsById.get(t.sessionId) : undefined) === 2 && t.phase !== 'review';
-  const stoppedTasks = tasks.filter(stopped);
+  // Closed delegated tasks are listed too (folded under their main task); only open ones keep a main task from folding.
+  const openKids = (t: Task) => (childrenOf.get(t.id) ?? []).some((k) => k.phase !== 'archived');
+  const stopped = (t: Task) => taskBand(t, t.sessionId ? sessionsById.get(t.sessionId) : undefined) === 2 && t.phase !== 'review' && !openKids(t);
+  const stoppedTasks = top.filter(stopped);
   const visibleLimit = filter === 'active' ? 0 : RECENT_STOPPED_LIMIT;
   let seenStopped = 0;
   const shown = historyExpanded
-    ? tasks
-    : tasks.filter((t) => {
+    ? top
+    : top.filter((t) => {
         if (!stopped(t)) return true;
         seenStopped++;
         return seenStopped <= visibleLimit;
       });
-  const hidden = tasks.length - shown.length;
+  const hidden = top.length - shown.length;
   const canCollapseBack = historyExpanded && stoppedTasks.length > visibleLimit;
   const showArchiveStopped = stoppedTasks.length >= 2 || (filter === 'active' && stoppedTasks.length >= 1);
-  const row = (task: Task) => (
+  const row = (task: Task, nested = false) => (
     <TaskRow
       key={task.id}
       task={task}
+      nested={nested}
       session={task.sessionId ? sessionsById.get(task.sessionId) : undefined}
       activity={task.sessionId ? activityById[task.sessionId] : undefined}
       inPane={!!task.sessionId && visibleIds.includes(task.sessionId)}
@@ -1309,13 +1341,42 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
       paneMark={task.sessionId && visibleIds.length === 2 ? (['左', '右'] as const)[visibleIds.indexOf(task.sessionId)] : undefined}
       draggable={visibleIds.length === 2}
       now={now}
-      onOpen={onOpen}
+      onOpen={nested && task.delegation ? (sid) => onOpenChild(sid, task.delegation!.parentTaskId) : onOpen}
       onRemove={() => onRemove(task)}
       onRename={(title) => onRename(task, title)}
       onResume={() => onResume(task)}
       onUnarchive={() => {}}
     />
   );
+  // A main task's delegated tasks, oldest dispatch first. Closed ones stay listed as compact rows; past CLOSED_KIDS_SHOWN
+  // the earlier closed ones fold behind a toggle.
+  const kidRows = (parent: Task) => {
+    const kids = childrenOf.get(parent.id);
+    if (!kids?.length) return [];
+    const closed = kids.filter((k) => k.phase === 'archived')
+      .sort((a, b) => (b.delegation?.settledAt ?? 0) - (a.delegation?.settledAt ?? 0));
+    const all = expandedKids.has(parent.id);
+    const keep = new Set(all ? closed : closed.slice(0, CLOSED_KIDS_SHOWN));
+    const rows = kids.filter((k) => k.phase !== 'archived' || keep.has(k)).map((k) => row(k, true));
+    if (closed.length > CLOSED_KIDS_SHOWN) {
+      rows.push(
+        <button
+          key={`${parent.id}-kids`}
+          type="button"
+          className="kids-toggle"
+          data-testid="delegation-kids-toggle"
+          onClick={() => setExpandedKids((s) => {
+            const n = new Set(s);
+            if (n.has(parent.id)) n.delete(parent.id); else n.add(parent.id);
+            return n;
+          })}
+        >
+          {all ? '收起已关闭的委派' : `还有 ${closed.length - CLOSED_KIDS_SHOWN} 个已关闭的委派`}
+        </button>,
+      );
+    }
+    return rows;
+  };
   return (
     <section className={`group ${dragging ? 'dragging' : ''} ${edge ? 'drop-' + edge : ''}`} data-testid="project-group" data-project-id={project.id} data-collapsed={collapsed ? 'true' : 'false'}>
       <div
@@ -1357,7 +1418,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
         {collapsed && working > 0 && <span className="group-live" data-testid="group-live">{working} 工作中</span>}
         {collapsed && waiting > 0 && <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>}
         {collapsed && reviewing > 0 && <span className="group-review" data-testid="group-review">{reviewing} 待验收</span>}
-        {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.length || ''}</span>}
+        {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.filter((t) => t.phase !== 'archived').length || ''}</span>}
         <button className="icon-btn remove-project" data-testid="project-remove" title="从工作台移除项目" onClick={onRemoveProject}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8h6l.5-8M7 7v3.5M9 7v3.5" /></svg>
         </button>
@@ -1385,7 +1446,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
           )}
         </div>
       </div>
-      {!collapsed && shown.map(row)}
+      {!collapsed && shown.flatMap((t) => [row(t), ...kidRows(t)])}
       {!collapsed && (hidden > 0 || canCollapseBack || showArchiveStopped) && (
         <div className="group-foot" data-testid="group-foot">
           {hidden > 0 && (
@@ -1410,7 +1471,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
           )}
         </div>
       )}
-      {!collapsed && !tasks.length && <div className="group-empty">没有任务，点右边的 + 新建</div>}
+      {!collapsed && !top.length && <div className="group-empty">没有任务，点右边的 + 新建</div>}
     </section>
   );
 }
@@ -1513,8 +1574,9 @@ function QuickMenu({ agents, defaultAgent, onPick, onClose }: {
   );
 }
 
-function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, draggable, now, onOpen, onRemove, onRename, onResume, onUnarchive }: {
+function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMark, draggable, now, onOpen, onRemove, onRename, onResume, onUnarchive }: {
   task: Task;
+  nested?: boolean; // shown under its main task (delegated tasks only)
   session?: SessionInfo;
   activity?: SessionActivity;
   inPane: boolean;
@@ -1530,6 +1592,13 @@ function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, dragg
 }) {
   const status = session?.status ?? 'exited';
   const glyph = rowGlyph(task, session);
+  const delegState = delegationState(task, session);
+  const round = task.delegation?.round ?? 1;
+  const delegStatus = delegState && (
+    <span className={`status st-deleg st-deleg-${delegState}`} data-testid="task-delegation-status">
+      {task.delegation?.mode === 'review' ? '评审 · ' : ''}{DELEGATION_LABEL[delegState]}{round > 1 ? ` · 第${round}轮` : ''}
+    </span>
+  );
   const [editing, setEditing] = useState(false);
   const liveAct = task.phase === 'active' && status === 'working' ? activity : undefined;
   const actIdleSec = liveAct ? Math.max(0, Math.floor((now - liveAct.lastProgressAt) / 1000)) : 0;
@@ -1541,10 +1610,12 @@ function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, dragg
   // The latest prompt as a second line, unless the row is closed or it only repeats the title.
   const lastPrompt = task.lastPrompt ?? '';
   const preview = !showLiveAct && task.phase !== 'archived' && status !== 'exited' && lastPrompt && !lastPrompt.startsWith(task.title.replace(/…$/, '')) ? lastPrompt : '';
+  // Delegated rows under a main task are a smaller version of a row; closed ones (archived) have no second line.
+  const compact = !!nested && !!delegState;
   const hasSecondLine = showLiveAct || !!preview;
   return (
     <div
-      className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''} ${hasSecondLine ? 'has-preview' : ''}`}
+      className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''} ${hasSecondLine ? 'has-preview' : ''} ${compact ? 'nested' : ''}`}
       style={{ '--c': task.color } as CSSProperties}
       data-testid="task-row"
       data-task-id={task.id}
@@ -1552,6 +1623,9 @@ function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, dragg
       data-status={status}
       data-phase={task.phase}
       data-limit={session?.limit ? '1' : undefined}
+      data-delegated={delegState ? 'true' : undefined}
+      data-delegation-state={delegState ?? undefined}
+      data-nested={compact ? 'true' : undefined}
       draggable={draggable && !!session}
       onDragStart={(e) => {
         if (!session) return;
@@ -1560,14 +1634,17 @@ function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, dragg
       }}
       onClick={() => session && onOpen(session.id)}
     >
+      {compact && <span className="nest-mark" aria-hidden="true" />}
       <span className={`row-glyph g-${glyph}`} data-testid="row-glyph" data-glyph={glyph} />
       {inPane && <span className="task-swatch" data-testid="task-swatch" />}
-      <EditableTitle className="task-title" title={task.title} onSave={onRename} editing={editing} onEditingChange={setEditing} />
+      <EditableTitle className="task-title" title={delegState ? delegationDisplayTitle(task.title) : task.title} onSave={onRename} editing={editing} onEditingChange={setEditing} />
       {paneMark && <span className="pane-mark" data-testid="pane-mark">{paneMark}</span>}
       {!!session?.queued && status !== 'exited' && (
         <span className="queued-mark" data-testid="task-queued" title="有消息排队，agent 空闲后自动发送">排队</span>
       )}
-      {task.phase === 'archived' ? (
+      {task.phase === 'archived' && delegStatus ? (
+        delegStatus
+      ) : task.phase === 'archived' ? (
         <button
           className="resume-chip"
           data-testid="task-unarchive"
@@ -1580,7 +1657,7 @@ function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, dragg
       ) : status === 'exited' ? (
         <>
         {/* The process ending does not settle the result: 待验收 stays until it is approved. */}
-        {task.phase === 'review' && <span className="status st-review" data-testid="status">待验收</span>}
+        {delegStatus || (task.phase === 'review' && <span className="status st-review" data-testid="status">待验收</span>)}
         <button
           className="resume-chip"
           data-testid="task-resume"
@@ -1593,6 +1670,8 @@ function TaskRow({ task, session, activity, inPane, paneFocused, paneMark, dragg
         </>
       ) : session?.limit ? (
         <span className="status st-needs_you" data-testid="status">额度用完</span>
+      ) : delegStatus ? (
+        delegStatus
       ) : task.phase === 'review' ? (
         <span className="status st-review" data-testid="status">待验收</span>
       ) : task.phase === 'approved' ? (

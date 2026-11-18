@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { agyConversationState, agyResumeId, agyTranscriptFile, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
+import { agyConversationState, agyResumeId, agyTranscriptFile, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, codexHasUserDeveloperInstructions, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
 import { pickColor } from './store.ts';
 import { TASK_COLORS } from '../shared/protocol.ts';
 
@@ -25,6 +25,50 @@ describe('buildLaunch', () => {
       'do it',
     ]);
     expect(args.join(' ')).not.toContain('--dangerously-bypass-hook-trust');
+  });
+
+  it('instructions: claude appends a system prompt, codex sets developer_instructions unless the user config has its own, agy gets an always-on AGENTS.md folder', () => {
+    const prevHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-codex-home-'));
+    process.env.CODEX_HOME = home;
+    try {
+      const withInstr = (agent: 'claude' | 'codex' | 'agy' | 'fake') =>
+        buildLaunch({ agent, sessionId: 's', prompt: 'do it', stateDir, instructions: 'be nice "quoted"' }).args;
+
+      const c = withInstr('claude');
+      const ci = c.indexOf('--append-system-prompt');
+      expect(c[ci + 1]).toBe('be nice "quoted"');
+      expect(ci).toBeLessThan(c.indexOf('do it'));
+      expect(c.at(-1)).toBe('do it');
+
+      const x = withInstr('codex');
+      expect(x).toContain(`developer_instructions=${JSON.stringify('be nice "quoted"')}`);
+      // The hook flags stay byte-identical: the instructions flag sits after them.
+      const plain = build('codex', 'do it').args;
+      expect(x.filter(a => a.startsWith('hooks.'))).toEqual(plain.filter(a => a.startsWith('hooks.')));
+      expect(x[x.findIndex(a => a.startsWith('developer_instructions')) - 1]).toBe('-c');
+
+      // agy has no flag for it: the text is an AGENTS.md in a folder added to the workspace, only when given.
+      const plainAgy = build('agy', 'do it').args;
+      const a = withInstr('agy');
+      const ruleDir = path.join(stateDir, 'agy-instructions');
+      expect(a.filter((v, i) => a[i - 1] === '--add-dir')).toEqual([...plainAgy.filter((v, i) => plainAgy[i - 1] === '--add-dir'), ruleDir]);
+      expect(fs.readFileSync(path.join(ruleDir, 'AGENTS.md'), 'utf8')).toBe('be nice "quoted"\n');
+      expect(a.slice(-2)).toEqual(['-i', 'do it']);
+      expect(plainAgy).not.toContain(ruleDir);
+      expect(withInstr('fake')).toEqual(build('fake', 'do it').args);
+      expect(plain.join(' ')).not.toContain('developer_instructions');
+      expect(build('claude', 'do it').args).not.toContain('--append-system-prompt');
+
+      expect(codexHasUserDeveloperInstructions()).toBe(false); // no config.toml
+      fs.writeFileSync(path.join(home, 'config.toml'), 'model = "x"\n  developer_instructions = "mine"\n');
+      expect(codexHasUserDeveloperInstructions()).toBe(true);
+      expect(withInstr('codex').join(' ')).not.toContain('developer_instructions');
+      fs.writeFileSync(path.join(home, 'config.toml'), '# developer_instructions = "commented"\nmodel = "x"\n');
+      expect(codexHasUserDeveloperInstructions()).toBe(false);
+    } finally {
+      if (prevHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevHome;
+    }
   });
 
   it('claude puts the prompt last and knows its native session id', () => {
@@ -368,9 +412,12 @@ describe('claude status line', () => {
 });
 
 describe('shoal collab hooks and agy collabDir', () => {
-  it('writeHookFiles writes shoal-cli.mjs, shoal.cmd, LF-only shoal, collab/, and syncs agy skill', () => {
+  it('writeHookFiles writes shoal-cli.mjs, shoal.cmd, LF-only shoal, collab/, and removes the agy skill older versions synced', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-shoal-'));
     const dir = path.join(root, 'state');
+    const staleSkill = path.join(dir, 'agy-hooks', '.agents', 'skills', 'shoal-collab', 'SKILL.md');
+    fs.mkdirSync(path.dirname(staleSkill), { recursive: true });
+    fs.writeFileSync(staleSkill, 'old');
     writeHookFiles(dir);
     expect(fs.existsSync(path.join(dir, 'bin', 'shoal-cli.mjs'))).toBe(true);
     expect(fs.existsSync(path.join(dir, 'bin', 'shoal.cmd'))).toBe(true);
@@ -378,9 +425,7 @@ describe('shoal collab hooks and agy collabDir', () => {
     const shoalSh = fs.readFileSync(path.join(dir, 'bin', 'shoal'), 'utf8');
     expect(shoalSh).not.toContain('\r\n');
     expect(shoalSh).toContain('shoal-cli.mjs');
-    const syncedSkill = path.join(dir, 'agy-hooks', '.agents', 'skills', 'shoal-collab', 'SKILL.md');
-    expect(fs.existsSync(syncedSkill)).toBe(true);
-    expect(fs.readFileSync(syncedSkill, 'utf8')).toContain('WORKBENCH_PEERS_FILE');
+    expect(fs.existsSync(staleSkill)).toBe(false);
   });
 
   it('buildLaunch passes raw --add-dir <collabDir> for agy even when path contains spaces', () => {

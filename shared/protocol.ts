@@ -54,7 +54,55 @@ export interface Task {
   phaseSince: number; // ms epoch of the last phase change (待验收 sorts by it)
   lastActiveAt?: number; // ms epoch of the latest user-initiated session/turn activity (sidebar sorts by it within a band)
   lastPrompt?: string; // one-line preview of the latest prompt typed into the current session (see promptPreview); shown under the title
+  delegation?: TaskDelegation; // set on a task dispatched by another task's `shoal delegate`
 }
+
+// ---- Cross-CLI delegation ----
+// A delegated task belongs to the main task that dispatched it, not to that task's session or agent, so switching the
+// main task's agent keeps its children. Only one level: a delegated task cannot delegate.
+export interface TaskDelegation {
+  parentTaskId: string; // the main task (it may have been deleted since)
+  brief: string; // one-line preview of the dispatched brief
+  round: number; // 1 on dispatch, +1 on every `shoal rework`
+  createdAt: number;
+  // Written when the delegation is closed. Read only while the task's phase is 'archived'.
+  outcome?: 'accepted' | 'canceled';
+  settledAt?: number; // ms epoch of the close
+  mode?: 'review'; // read-only reviewer dispatched with `shoal delegate --review`; missing = executor
+}
+
+// working: running its first round. rework: running round 2 or later.
+// needs_you: stopped where only the user can continue (permission or startup dialog, Ctrl+C, out of quota).
+// review: a round finished and its result is waiting for the main task. failed: its process is gone without a result.
+// accepted / canceled: closed, the task is archived.
+export type DelegationState = 'working' | 'rework' | 'needs_you' | 'review' | 'failed' | 'accepted' | 'canceled';
+
+export const DELEGATION_LABEL: Record<DelegationState, string> = {
+  working: '执行中', rework: '返工中', needs_you: '等你处理', review: '待验收', failed: '已中断', accepted: '已通过', canceled: '已取消',
+};
+
+// Derived, never stored: null for a task that was not delegated.
+export function delegationState(
+  task: Pick<Task, 'phase' | 'phaseSince' | 'delegation'>,
+  session: Pick<SessionInfo, 'status' | 'statusSince' | 'blocked' | 'limit'> | undefined,
+): DelegationState | null {
+  const d = task.delegation;
+  if (!d) return null;
+  if (task.phase === 'archived') return d.outcome ?? 'canceled';
+  if (task.phase === 'review' || task.phase === 'approved') return 'review';
+  if (!session || session.status === 'exited') return 'failed';
+  if (session.blocked || session.limit) return 'needs_you';
+  // A rework note puts the task back to 'active' while its session still shows the previous round's stop until the
+  // note is delivered. Only a stop that came after the phase change (Ctrl+C in the child) is the user's to handle.
+  if (session.status === 'needs_you' && session.statusSince >= task.phaseSince) return 'needs_you';
+  return d.round > 1 ? 'rework' : 'working';
+}
+
+// Title of a delegated task for display: tasks dispatched before titles were cleaned up start with a redundant '委派：'.
+export const delegationDisplayTitle = (title: string): string => title.replace(/^委派[：:]\s*/, '') || title;
+
+// Short id the main agent uses in `shoal rework / done / cancel`: '#n' indexes shift when tasks are archived.
+export const delegationHandle = (taskId: string): string => taskId.slice(0, 8);
 
 // Git state of a project directory, polled by the server. Derived: never persisted.
 // branch: current branch, or the short commit id when detached. dirty: changed + untracked entries.
@@ -158,6 +206,9 @@ export interface Card {
     replyBack?: boolean;
     isAutoReply?: boolean;
     peerHop?: number;
+    // Set on a forward card written by delegation: a child's round result or blocked notice sent to the main task,
+    // or the rework note sent to the child.
+    delegation?: 'result' | 'rework' | 'blocked';
   };
 }
 
@@ -232,8 +283,49 @@ export interface SessionActivity {
 export interface Settings {
   aiTitles: boolean; // replace a task's first-line title with one written by a short headless call of its agent
   agyModel?: string; // default model slug passed to new Antigravity tasks ('' or undefined = follow global settings.json)
+  // Tell Claude Code, Codex and Antigravity sessions at launch how to delegate work to another CLI with `shoal` (see
+  // DELEGATION_INSTRUCTIONS). Off: `shoal` still works, but an agent only uses it when the user asks. Missing = on.
+  autoDelegate?: boolean;
+  // Which kind of work goes to which CLI and when to ask the other two for a joint review; appended to the standing
+  // delegation instructions. undefined = the built-in DEFAULT_DELEGATION_RULES, '' = inject no rules.
+  delegationRules?: string;
 }
-export const DEFAULT_SETTINGS: Settings = { aiTitles: false };
+export const DELEGATION_RULES_MAX = 4000;
+// Built-in division of labor, from each vendor's own docs (Nov 2026). Names capabilities, not model versions, so it
+// ages slowly; users replace it in Settings.
+export const DEFAULT_DELEGATION_RULES = [
+  '三个 CLI 各用各的订阅额度，按长处分工，互相补位、互相把关。下面只列各家官方资料里明确写到的长处；具体模型以各 CLI 当前设置为准。',
+  '',
+  '### 谁擅长什么',
+  '- Claude Code：长时间、多步骤的编码和重构，终端操作，需求澄清和方案设计，代码评审，中英文写作。弱项：不能生成图片，网络安全类任务常被拦截。',
+  '- Codex：复杂工程实现、数据库迁移，数学、科学计算和算法推导，大批量重复改动（选低档模型更省额度）。自带 `/review` 评审改动的能力，适合当第二评审。弱项：渗透测试、漏洞利用这类安全任务会被拒绝；默认沙箱关闭网络访问。',
+  '- Antigravity：前端和 UI 实现，看懂截图、设计稿、PDF、图表和视频，超长上下文的全库通读，用内置浏览器点击、截图、验收页面，以及速度要求高的小改动。弱项：复杂终端任务和大型工程改动不如前两家稳，容易编造细节，需要有人复核。',
+  '',
+  '### 什么时候委派',
+  '- 当前 CLI 明显不擅长、而另一家擅长时委派。例如 Claude 会话遇到设计稿还原或要在浏览器里验收页面，交给 Antigravity；任何会话遇到算法证明、数值计算或大批量同类改动，交给 Codex；Antigravity 会话遇到复杂重构或终端排障，交给 Claude Code 或 Codex。',
+  '- 想要一份独立实现或换个思路时委派，比如修了两轮还没修好的 bug。',
+  '- 几次工具调用就能做完的小事自己做，委派的开销比收益大。',
+  '- 只能委派给上面列出的已安装 CLI；没装的就自己做，并在汇报里说明原因。',
+  '- 委派只交出执行；需求理解、最终验收和向用户汇报留在本会话。同一批文件不要同时交给两个执行者改。',
+  '',
+  '### 什么时候评审',
+  '用 `shoal delegate <agent> --review` 派出只读评审者。以下情况主动发起，不必等用户开口：',
+  '- 动手前，需求或方案涉及跨模块设计、数据迁移、安全、计费、权限或公开接口。',
+  '- 交付前，改动较大（例如超过约 300 行或跨多个模块），或修改的是很难回滚的东西。',
+  '- 用户说「评审一下」「三方评审」「大家一起看看」。',
+  '一般改动请一位评审者，挑与本会话不同家的 CLI。上面列出的高风险情况，或用户明确要求时，做三方评审。',
+  '',
+  '### 三方评审怎么做',
+  '1. 写一份自包含的评审 brief 并存成项目内文件。内容包括：评审对象（需求、方案或 diff 范围）、背景、验收标准、要重点检查的角度、已知风险。评审者看不到本对话。',
+  '2. 同时运行 `shoal delegate <另外两个 CLI> --review --file <brief>`。',
+  '3. 等待期间自己先独立评审，写下自己的结论，再看对方的结论，避免被带偏。',
+  '4. 对每条意见逐条裁决：认可就修改；有异议就写明依据；信息不够就补充后再请评审者确认。BLOCKING 全部解决后才能继续。',
+  '5. 对评审者执行 `shoal done <id>`，然后向用户汇报三方结论、各自的分歧和最终裁决。',
+  '',
+  '### 额度',
+  '三家都按 5 小时窗口加每周上限计量。别让一家的额度耗尽：同类工作在空闲的 CLI 之间轮换，大批量的机械改动用便宜的模型，评审 brief 写清范围，不要让评审者通读整个仓库。',
+].join('\n');
+export const DEFAULT_SETTINGS: Settings = { aiTitles: false, autoDelegate: true };
 
 export interface AgyOptimizeStatus {
   optimized: boolean;
@@ -500,6 +592,8 @@ export interface PeerTaskSummary {
   isSelf: boolean;
   lastPrompt?: string;
   latestReplyFile?: string;
+  // Set on a delegated task.
+  delegation?: { parentTaskId: string; state: DelegationState; round: number };
 }
 
 export interface PeerListResult {
@@ -527,6 +621,154 @@ export interface PeerSendResult {
   queued: boolean;
   replyBack: boolean;
   hop: number;
+}
+
+export interface PeerDelegateBody {
+  agent: string; // 'claude' | 'codex' | 'agy'
+  title?: string;
+  note?: string;
+  stdinText?: string;
+  filePath?: string;
+  review?: boolean; // dispatch a read-only reviewer instead of an executor
+}
+
+export interface DelegationSummary {
+  id: string;
+  handle: string; // delegationHandle(id)
+  title: string;
+  agent: AgentKind;
+  state: DelegationState;
+  round: number;
+  brief: string;
+  status: SessionStatus | 'none';
+  createdAt: number;
+  mode?: 'review';
+  latestReplyFile?: string;
+}
+
+export interface PeerDelegateResult {
+  task: DelegationSummary;
+  hop: number;
+}
+
+// The caller's delegated tasks, newest last. `parent` is set when the caller is itself a delegated task.
+export interface PeerDelegationList {
+  projectName: string;
+  selfTaskId: string;
+  parent?: { id: string; title: string };
+  tasks: DelegationSummary[];
+}
+
+export interface PeerDelegationActionBody {
+  target: string; // handle / task id prefix, '#n' from `shoal peers`, or a unique title fragment
+  note?: string;
+  stdinText?: string;
+  filePath?: string;
+}
+
+export interface PeerDelegationActionResult {
+  task: DelegationSummary;
+  queued?: boolean; // rework only: the note waits for the child's current turn
+}
+
+// Standing instructions of every session that is not a delegated task, when Settings.autoDelegate is on. Each CLI gets
+// them its own way (see buildLaunch): claude --append-system-prompt, codex developer_instructions, agy an always-on AGENTS.md.
+export const DELEGATION_INSTRUCTIONS = [
+  '## Shoal delegation',
+  'You run inside Shoal, a workbench that hosts the Claude Code, Codex and Antigravity CLIs side by side on the user\'s own subscriptions. The `shoal` command is on PATH.',
+  '- Ordinary work needs no shoal command. Work your own CLI\'s subagents can do stays with them.',
+  '- Delegate to another vendor\'s CLI with `shoal delegate <claude|codex|agy>` when the user asks for it, when the user\'s instruction files route that kind of work to that agent, or when an independent implementation or review by a different model is worth a separate session. Do not switch to a different agent than the one asked for.',
+  '- The child sees only your brief, not this conversation. Write it self-contained: goal, files to read, behavior that must not change, checks to run. Pass it with `--stdin` or `--file <path inside the project>`; `-m` is for a single line.',
+  '- `shoal delegate <agent> --review` dispatches a read-only reviewer: it changes no files and only returns a PASS/FAIL verdict with BLOCKING / NON-BLOCKING findings. Use it for an independent review of a requirement, plan or change. A three-way review means dispatching it to both other CLIs, reviewing independently yourself, then ruling on every finding and summarizing.',
+  '- After delegating, do not wait or poll. Continue other work or end your turn: the child\'s result is pasted into this session when its round finishes.',
+  '- Review each result yourself. Then `shoal done <id>` accepts and closes the child, `shoal rework <id> --stdin` sends it back with specific findings, and `shoal cancel <id>` drops it. Fix small findings yourself instead of sending them back.',
+  '- `shoal status` lists your delegated tasks; `shoal help` lists every command.',
+  '- When the user asks about another task in this project: `shoal peers` lists them with the file holding each one\'s latest reply, `shoal send <target>` messages one, and `shoal ask <target>` also brings its reply back.',
+].join('\n');
+
+// Standing instructions plus the installed-CLI line and the user-editable division-of-labor rules.
+export function composeDelegationInstructions(opts: { host: AgentKind; available: AgentKind[]; rules: string }): string {
+  const rules = opts.rules.trim();
+  return [
+    DELEGATION_INSTRUCTIONS,
+    '',
+    `This session runs ${AGENT_LABEL[opts.host]}. CLIs installed in this Shoal: ${opts.available.map(a => AGENT_LABEL[a]).join(', ')}. Only these can be delegated to.`,
+    ...(rules ? ['', '## 分工与评审规则（Shoal 设置，用户可修改）', rules] : []),
+  ].join('\n');
+}
+
+// First prompt of a delegated task; `review` makes it a read-only reviewer.
+export function delegationPrompt(parent: { title: string; agent: AgentKind }, brief: string, opts?: { review?: boolean }): string {
+  if (opts?.review) {
+    return [
+      `你是任务「${parent.title}」（${AGENT_LABEL[parent.agent]}）请来的独立评审者。只按下面「任务」里给的评审对象和角度评审。`,
+      '',
+      '- 只读：不修改、创建或删除项目文件，不提交，不安装依赖，不运行会改动工作区或外部状态的命令；可以读文件、搜索、运行只读检查。',
+      '- 用一条回复交付：第一行写「结论：PASS」或「结论：FAIL」，然后列 BLOCKING（必须改才能继续的问题）和 NON-BLOCKING（建议）。每条写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
+      '- 需要更多信息就在回复里提问并结束本轮，主任务会补充。',
+      '- 不要再把任务委派或转发给其他 agent。',
+      '',
+      '## 任务',
+      brief.trim(),
+    ].join('\n');
+  }
+  return [
+    `你是任务「${parent.title}」（${AGENT_LABEL[parent.agent]}）委派的子任务执行者。只做下面「任务」里的事。`,
+    '',
+    '- 完成后用一条回复交付：做了什么、改了哪些文件、跑了哪些检查和结果、还有什么没解决。这条回复会自动送回主任务验收，不需要你自己回传。',
+    '- 需求不清楚时直接在回复里提问并结束本轮，主任务会补充。',
+    '- 工作目录和主任务共用：只改任务范围内的文件；除非任务明确要求，不要提交、推送或发版。',
+    '- 不要再把任务委派或转发给其他 agent。',
+    '',
+    '## 任务',
+    brief.trim(),
+  ].join('\n');
+}
+
+// Pasted into the main task when a delegated task finishes a round.
+export function delegationResultText(child: { id: string; title: string; agent: AgentKind; round: number; mode?: 'review' }, reply: string): string {
+  const h = delegationHandle(child.id);
+  if (child.mode === 'review') {
+    return [
+      `评审者「${child.title}」（${AGENT_LABEL[child.agent]}，第 ${child.round} 轮）给出了评审结论。它是只读的，修改由你来做。`,
+      '',
+      '## 评审结论',
+      reply.trim() || '（没有拿到这一轮的回复，请打开子任务的终端查看）',
+      '',
+      '## 下一步',
+      '- 逐条裁决：认可的自己修改；有异议的写明依据；BLOCKING 全部解决后再继续。',
+      `- 需要它复核修改或补充意见：\`shoal rework ${h} --stdin\`，写清改了什么、请它看什么`,
+      `- 评审结束：\`shoal done ${h}\``,
+    ].join('\n');
+  }
+  return [
+    `委派任务「${child.title}」（${AGENT_LABEL[child.agent]}，第 ${child.round} 轮）交付了结果，请验收。`,
+    '',
+    '## 结果',
+    reply.trim() || '（没有拿到这一轮的回复，请打开子任务的终端查看）',
+    '',
+    '## 下一步',
+    `- 通过并关闭：\`shoal done ${h}\``,
+    `- 打回返工：\`shoal rework ${h} --stdin\`，写清具体问题；小问题直接自己改`,
+    `- 放弃：\`shoal cancel ${h}\``,
+    '改动在同一个工作目录里，可以用 git status / git diff 查看。',
+  ].join('\n');
+}
+
+// Pasted into a delegated task by `shoal rework`.
+export function delegationReworkText(parent: { title: string }, round: number, feedback: string): string {
+  return [
+    `主任务「${parent.title}」验收没有通过，这是第 ${round} 轮。请按下面的意见修改，完成后同样用一条回复说明改动和检查结果。`,
+    '',
+    '## 验收意见',
+    feedback.trim(),
+  ].join('\n');
+}
+
+// Pasted into the main task once per round when a delegated task stops at a dialog only the user can answer.
+export function delegationBlockedText(child: { title: string; agent: AgentKind }, blocked: NonNullable<SessionInfo['blocked']>): string {
+  const what = blocked === 'startup' ? '启动确认' : '权限确认';
+  return `委派任务「${child.title}」（${AGENT_LABEL[child.agent]}）停在${what}提示上，需要用户到它的终端里处理，你无法代为确认。请告诉用户，然后继续其他工作。这一轮里同类提示不再重复通知。`;
 }
 
 export const FORWARD_NOTE = '下面是另一个任务的结果，供你参考。';
@@ -693,7 +935,7 @@ export type ServerMsg =
   | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
   | { t: 'session'; session: SessionInfo }
-  | { t: 'replay'; id: string; d: string } // buffered history, sent once per session right after snapshot
+  | { t: 'replay'; id: string; d: string } // buffered history, sent once per running session right after snapshot, or on 'want-replay'
   | { t: 'out'; id: string; d: string }
   | { t: 'pong'; ts: number; via: MobileRouteVia }
   | { t: 'revoked' };
@@ -703,5 +945,6 @@ export type ClientMsg =
   | { t: 'resize'; id: string; cols: number; rows: number }
   | { t: 'watch-term'; id: string }
   | { t: 'unwatch-term' }
+  | { t: 'want-replay'; id: string } // saved output of a session that is not running (answered with 'replay', d may be '')
   | { t: 'term-key'; id: string; d: string }
   | { t: 'ping'; ts: number };

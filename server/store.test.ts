@@ -149,13 +149,17 @@ describe('file store', () => {
 
   it('settings default to aiTitles off, survive a reload, and fall back to the default for missing or invalid values', () => {
     const a = createFileStore(file);
-    expect(a.settings()).toEqual({ aiTitles: false });
+    expect(a.settings()).toEqual({ aiTitles: false, autoDelegate: true });
     a.setSettings({ aiTitles: true });
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: true });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: true, autoDelegate: true });
     const base = { version: 1, projects: [], tasks: [], sessions: [] };
     fs.writeFileSync(file, JSON.stringify(base));
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: false });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, autoDelegate: true });
     fs.writeFileSync(file, JSON.stringify({ ...base, settings: { aiTitles: 'yes' } }));
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: false });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, autoDelegate: true });
+    a.setSettings({ aiTitles: false, autoDelegate: false });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, autoDelegate: false });
+    fs.writeFileSync(file, JSON.stringify({ ...base, settings: { autoDelegate: 'no' } }));
+    expect(createFileStore(file).settings().autoDelegate).toBe(true);
   });
 });

@@ -45,7 +45,7 @@ async function createUntitled(request: APIRequestContext, projectId: string, pro
 }
 
 test('off by default: first-line title stays; the ? tip explains the cost only when hovered', async ({ page, request }) => {
-  expect((await state(request)).settings).toEqual({ aiTitles: false });
+  expect((await state(request)).settings).toEqual({ aiTitles: false, autoDelegate: true });
   const project = await createProject(request, token('aioff'));
   await page.goto('/');
   await page.getByTestId('settings-btn').click();
@@ -147,5 +147,5 @@ test('a manual title wins over a slow generator; a failed one keeps the first li
 
   const bad = await request.post('/api/settings', { data: { aiTitles: 'yes' } });
   expect(bad.status()).toBe(400);
-  expect((await state(request)).settings).toEqual({ aiTitles: true });
+  expect((await state(request)).settings).toEqual({ aiTitles: true, autoDelegate: true });
 });

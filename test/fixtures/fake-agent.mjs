@@ -6,6 +6,9 @@
 // /resume: not a prompt, prints `RESUMED <id>`, sends SessionStart source=resume with the new id); anything else is a 300 ms turn.
 // `limits <5h %> <7d %> [5h reset in seconds]` (pipes a claude-style status line with rate_limits through hooks/statusline.mjs, then ends the turn).
 // `agylimits <5h %> <7d %> [5h reset in seconds]` (pipes an agy-style status line with Gemini `quota` buckets through hooks/statusline.mjs).
+// `menu` (3-item numbered permission menu + PermissionRequest; answered by 1/2/3), `[[trust]] <prompt>` as the first prompt (prints a
+// folder-trust startup prompt before any turn and waits for Enter, then runs <prompt>). Keys answering `ask` / `menu` / the trust
+// prompt are appended to `<FAKE_AGENT_LOG>.keys` as {sessionId, key}.
 // Keeps its own transcript (one JSON line per turn) at <tmp>/shoal-fake/<native id>.jsonl and reports it as transcript_path.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -56,6 +59,9 @@ let queued = false; // Enter pressed while working
 let workTimer = null;
 let ctrlCAt = 0;
 
+const logKey = (k) => {
+  if (process.env.FAKE_AGENT_LOG) fs.appendFileSync(`${process.env.FAKE_AGENT_LOG}.keys`, JSON.stringify({ sessionId: sid, key: k, at: Date.now() }) + '\r\n');
+};
 const showPrompt = () => out('\r\n> ' + line);
 
 function finishTurn(text) {
@@ -111,6 +117,11 @@ function submit() {
   record('user', text);
   hook('UserPromptSubmit', { prompt: text });
   const [cmd, arg, ...rest] = text.trim().split(/\s+/);
+  // `[[sleep N]]` / `[[ask]]` anywhere in the text act like the `sleep N` / `ask` commands, for prompts that wrap the
+  // test's text in other words (a delegated task's brief). The reply drops the marker so the task it is sent back to
+  // does not act on it too.
+  const marker = /\[\[(sleep|ask)(?:\s+(\d+))?\]\]/.exec(text);
+  const echo = marker ? text.replace(marker[0], '').trim() : text;
   if (cmd === 'quota') {
     workTimer = setTimeout(() => {
       const msg = "You've hit your session limit · resets 5pm";
@@ -170,11 +181,16 @@ function submit() {
   } else if (cmd === 'exit') {
     out('bye\r\n');
     process.exit(Number(arg) || 0); // like a crash: hooks still queued are lost
-  } else if (cmd === 'ask') {
+  } else if (cmd === 'ask' || (cmd !== 'shoal' && marker?.[1] === 'ask')) {
     hook('PermissionRequest', { tool_name: 'Fake' });
     out('Allow? (y/n)');
     mode = 'ask';
-    askText = text;
+    askText = echo;
+  } else if (cmd === 'menu') {
+    hook('PermissionRequest', { tool_name: 'Fake' });
+    out("Do you want to proceed?\r\n 1. Yes\r\n 2. Yes, and don't ask again\r\n 3. No, keep asking");
+    mode = 'menu';
+    askText = echo;
   } else if (cmd === 'shoal') {
     const cliArgs = splitShellArgs(text.trim().slice(5).trim());
     const p = process.platform === 'win32'
@@ -186,8 +202,8 @@ function submit() {
     p.on('error', e => finishTurn(`shoal(err): ${e.message}`));
     p.on('exit', code => finishTurn(`shoal(${code ?? 1}): ${captured.trim()}`));
   } else {
-    const ms = cmd === 'sleep' ? (Number(arg) || 0) * 1000 : 300;
-    workTimer = setTimeout(() => finishTurn(text), ms);
+    const ms = cmd === 'sleep' ? (Number(arg) || 0) * 1000 : marker?.[1] === 'sleep' ? (Number(marker[2]) || 0) * 1000 : 300;
+    workTimer = setTimeout(() => finishTurn(echo), ms);
   }
 }
 let askText = '';
@@ -216,8 +232,27 @@ function key(ch) {
   }
   if (mode === 'ask') {
     if (ch === 'y' || ch === 'n') {
+      logKey(ch);
       out(ch);
       finishTurn(askText);
+    }
+    return;
+  }
+  if (mode === 'menu') {
+    if (ch === '1' || ch === '2' || ch === '3') {
+      logKey(ch);
+      out(ch);
+      finishTurn(`${askText} [${ch}]`);
+    }
+    return;
+  }
+  if (mode === 'trust') {
+    if (ch === '\r') {
+      logKey('\r');
+      mode = 'idle';
+      line = trustPrompt;
+      out('\r\n> ' + line);
+      submit();
     }
     return;
   }
@@ -298,7 +333,14 @@ process.stdin.resume();
 out('\x1b[?2004h'); // bracketed paste on, like the real CLIs
 out(`FAKE AGENT ${sid.slice(0, 8)}${resumeId ? ` RESUMED ${resumeId}` : ''}\r\n> `);
 hook('SessionStart', { source: resumeId ? 'resume' : 'startup' });
-if (initialPrompt) {
+const TRUST_MARK = '[[trust]]';
+let trustPrompt = '';
+if (initialPrompt?.startsWith(TRUST_MARK)) {
+  // Startup folder-trust prompt: printed before any turn, so the server flags the session as blocked (startup).
+  trustPrompt = initialPrompt.slice(TRUST_MARK.length).trim();
+  mode = 'trust';
+  out('Do you trust the files in this folder?\r\nPress Enter to continue');
+} else if (initialPrompt) {
   setTimeout(() => {
     line = initialPrompt;
     out(line);

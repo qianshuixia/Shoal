@@ -1,9 +1,13 @@
 import { useMemo, useState } from 'react';
-import type { MobileRouteVia, Snapshot, Task } from '../../../shared/protocol.ts';
+import type { MobileRouteVia, Snapshot } from '../../../shared/protocol.ts';
 import { AGENT_LABEL } from '../../../shared/protocol.ts';
 import { AgentIcon } from '../agentIcons.tsx';
 import { liveWindows, QUOTA_AGENTS, QUOTA_WARN, quotaTitle } from '../quota.ts';
-import { sortProjectTasks, STATUS_LABEL, waitText } from '../util.ts';
+import { needsList, reviewList, sortProjectTasks, STATUS_LABEL, waitText } from '../util.ts';
+import { setPrivacy, usePrivacy } from '../privacy.ts';
+import { ConfirmSheet } from './ConfirmSheet.tsx';
+import { ConnBar } from './ConnBar.tsx';
+import { useBackLayer } from './useBackLayer.ts';
 
 const VIA_NAME: Record<MobileRouteVia, string> = {
   lan: '同 Wi-Fi',
@@ -11,13 +15,17 @@ const VIA_NAME: Record<MobileRouteVia, string> = {
   local: '本机',
 };
 
-function taskNeedLabel(task: Task, status?: string, blocked?: string, hasLimit?: boolean, interrupted?: boolean): string | null {
-  if (blocked === 'permission') return '待终端授权';
-  if (blocked === 'startup') return '待确认启动';
+// 「需要你」「待验收」与桌面同源（util.ts 的 needsList / reviewList）；其余是手机端额外提醒（额度、上次中断）。
+function needLabel(need: boolean, review: boolean, blocked?: string, hasLimit?: boolean, interrupted?: boolean): string | null {
+  if (need) {
+    if (blocked === 'permission') return '待终端授权';
+    if (blocked === 'startup') return '待确认启动';
+    if (hasLimit) return '额度已用完';
+    return '需要你';
+  }
+  if (review) return '待验收';
   if (hasLimit) return '额度已用完';
   if (interrupted) return '上次中断';
-  if (status === 'needs_you') return '需要你';
-  if (task.phase === 'review') return '待验收';
   return null;
 }
 
@@ -26,6 +34,7 @@ export function MobileHome({
   via,
   rttMs,
   wsConnected,
+  lastSyncAt,
   now,
   onSelectTask,
   onOpenNewTask,
@@ -35,31 +44,45 @@ export function MobileHome({
   via: MobileRouteVia;
   rttMs: number | null;
   wsConnected: boolean;
+  lastSyncAt: number | null;
   now: number;
   onSelectTask(taskId: string): void;
   onOpenNewTask(): void;
-  onLogout(): void;
+  onLogout(): Promise<void>;
 }) {
   const [showArchived, setShowArchived] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [confirmLogout, setConfirmLogout] = useState(false);
+  const [logoutError, setLogoutError] = useState('');
+  const menuLayer = useBackLayer(menuOpen, () => setMenuOpen(false));
+  const privacy = usePrivacy();
 
   const sessionsById = useMemo(() => new Map(state.sessions.map((s) => [s.id, s])), [state.sessions]);
   const projectsById = useMemo(() => new Map(state.projects.map((p) => [p.id, p])), [state.projects]);
 
+  const needIds = useMemo(() => needsList(state), [state]);
+  const reviewIds = useMemo(() => reviewList(state), [state]);
   const attention = useMemo(() => {
+    const needRank = new Map(needIds.map((id, i) => [id, i]));
+    const reviewRank = new Map(reviewIds.map((id, i) => [id, i]));
     const items = state.tasks
       .filter((t) => t.phase !== 'archived')
       .map((t) => {
         const s = t.sessionId ? sessionsById.get(t.sessionId) : undefined;
-        const need = taskNeedLabel(t, s?.status, s?.blocked, Boolean(s?.limit), Boolean(s?.interrupted));
+        const nr = s ? needRank.get(s.id) : undefined;
+        const rr = s ? reviewRank.get(s.id) : undefined;
+        const need = needLabel(nr !== undefined, rr !== undefined, s?.blocked, Boolean(s?.limit), Boolean(s?.interrupted));
         if (!need) return null;
-        const prio = s?.blocked ? 0 : s?.status === 'needs_you' ? 1 : t.phase === 'review' ? 2 : 3;
+        // 置顶顺序同桌面：先需要你（终端按键优先），再待验收，各自按等待时间从久到近。
+        const prio = nr !== undefined ? (s?.blocked ? 0 : 1) : rr !== undefined ? 2 : 3;
+        const rank = nr ?? rr ?? 0;
         const since = s?.statusSince ?? t.phaseSince;
-        return { task: t, session: s, need, prio, waitMs: Math.max(0, now - since) };
+        return { task: t, session: s, need, prio, rank, waitMs: Math.max(0, now - since) };
       })
       .filter((x): x is NonNullable<typeof x> => x !== null);
-    items.sort((a, b) => a.prio - b.prio || a.waitMs - b.waitMs);
+    items.sort((a, b) => a.prio - b.prio || a.rank - b.rank || b.waitMs - a.waitMs);
     return items;
-  }, [state.tasks, sessionsById, now]);
+  }, [state.tasks, sessionsById, needIds, reviewIds, now]);
 
   const quotaChips = useMemo(() => {
     return QUOTA_AGENTS.flatMap((agent) => {
@@ -82,7 +105,11 @@ export function MobileHome({
       <header className="mob-header">
         <div className="mob-title-wrap">
           <span className="mob-title">Shoal</span>
-          <span className="mob-sub">{state.projects.length} 个项目 · {state.tasks.filter((t) => t.phase !== 'archived').length} 个进行中</span>
+          <span className="mob-sub" data-testid="mobile-home-sub">
+            {needIds.length > 0 || reviewIds.length > 0
+              ? [needIds.length > 0 && `${needIds.length} 需要你`, reviewIds.length > 0 && `${reviewIds.length} 待验收`].filter(Boolean).join(' · ')
+              : `${state.projects.length} 个项目 · ${state.tasks.filter((t) => t.phase !== 'archived').length} 个进行中`}
+          </span>
         </div>
         <span className={`mob-pill ${wsConnected ? 'is-online' : 'is-warn'}`} data-testid="mobile-conn-pill">
           <span className="dot" />
@@ -91,10 +118,11 @@ export function MobileHome({
         <button type="button" className="mob-btn compact primary" data-testid="mobile-new-task-btn" onClick={onOpenNewTask}>
           + 新建
         </button>
-        <button type="button" className="mob-btn compact ghost" data-testid="mobile-logout-btn" onClick={onLogout} title="解除当前手机配对">
-          退出
+        <button type="button" className="mob-btn compact ghost" data-testid="mobile-home-more-btn" onClick={() => setMenuOpen(true)} aria-label="更多">
+          ⋯
         </button>
       </header>
+      <ConnBar wsConnected={wsConnected} lastSyncAt={lastSyncAt} />
 
       <div className="mob-scroll">
         {quotaChips.length > 0 && (
@@ -115,7 +143,7 @@ export function MobileHome({
 
         <section>
           <div className="mob-section-title">
-            <span>需要你 / 待验收（{attention.length}）</span>
+            <span data-testid="mobile-attention-title">需要你 {needIds.length} · 待验收 {reviewIds.length}</span>
           </div>
           <div className="mob-card-list" data-testid="mobile-attention-list" style={{ marginTop: '0.375rem' }}>
             {attention.length === 0 ? (
@@ -135,14 +163,14 @@ export function MobileHome({
                     <div className="mob-task-top">
                       <span className="mob-swatch" style={{ background: task.color }} />
                       <AgentIcon agent={session?.agent ?? task.agent} className="agent-icon" />
-                      <span className="mob-task-name">{task.title}</span>
+                      <span className="mob-task-name" data-private="">{task.title}</span>
                       <span className="mob-pill is-warn">{need}</span>
                     </div>
                     {(act?.summary || task.lastPrompt) && (
-                      <div className="mob-task-summary">{act?.summary ?? task.lastPrompt}</div>
+                      <div className="mob-task-summary" data-private="">{act?.summary ?? task.lastPrompt}</div>
                     )}
                     <div className="mob-task-meta">
-                      <span>{proj?.name ?? '未知项目'}</span>
+                      <span data-private="">{proj?.name ?? '未知项目'}</span>
                       <span>·</span>
                       <span>{waitText(waitMs)}</span>
                       {session?.blocked && <span>· 需终端按键确认</span>}
@@ -168,8 +196,8 @@ export function MobileHome({
             return (
               <section key={proj.id}>
                 <div className="mob-section-title">
-                  <span>{proj.name}</span>
-                  <span>
+                  <span data-private="">{proj.name}</span>
+                  <span data-private="">
                     {git ? `${git.branch}${git.dirty > 0 ? ` · ${git.dirty} 改动` : ''}` : '非 Git 目录'}
                   </span>
                 </div>
@@ -192,13 +220,13 @@ export function MobileHome({
                           <div className="mob-task-top">
                             <span className="mob-swatch" style={{ background: task.color }} />
                             <AgentIcon agent={session?.agent ?? task.agent} className="agent-icon" />
-                            <span className="mob-task-name">{task.title}</span>
+                            <span className="mob-task-name" data-private="">{task.title}</span>
                             <span className="mob-pill">
                               {task.phase === 'approved' ? '已通过' : task.phase === 'review' ? '待验收' : stLabel}
                             </span>
                           </div>
                           {(act?.summary || task.lastPrompt) && (
-                            <div className="mob-task-summary">{act?.summary ?? task.lastPrompt}</div>
+                            <div className="mob-task-summary" data-private="">{act?.summary ?? task.lastPrompt}</div>
                           )}
                           {session?.queued ? (
                             <div className="mob-task-meta">
@@ -238,11 +266,11 @@ export function MobileHome({
                     <div className="mob-task-top">
                       <span className="mob-swatch" style={{ background: task.color }} />
                       <AgentIcon agent={task.agent} className="agent-icon" />
-                      <span className="mob-task-name">{task.title}</span>
+                      <span className="mob-task-name" data-private="">{task.title}</span>
                       <span className="mob-pill">已归档</span>
                     </div>
                     <div className="mob-task-meta">
-                      <span>{projectsById.get(task.projectId)?.name ?? ''}</span>
+                      <span data-private="">{projectsById.get(task.projectId)?.name ?? ''}</span>
                     </div>
                   </button>
                 ))}
@@ -251,6 +279,43 @@ export function MobileHome({
           </section>
         )}
       </div>
+
+      {menuOpen && (
+        <div className="mob-sheet-backdrop" onMouseDown={(e) => e.target === e.currentTarget && menuLayer.close()}>
+          <div className="mob-sheet" data-testid="mobile-home-more-sheet">
+            <h3>设置</h3>
+            <button
+              type="button"
+              className={`mob-btn ${privacy ? 'primary' : ''}`}
+              data-testid="mobile-privacy-toggle"
+              aria-pressed={privacy}
+              onClick={() => setPrivacy(!privacy)}
+            >
+              {privacy ? '隐私模式：开（项目名、标题和对话已模糊）' : '隐私模式：关'}
+            </button>
+            {logoutError && <div className="form-error" data-testid="mobile-logout-error">{logoutError}</div>}
+            <button type="button" className="mob-btn danger" data-testid="mobile-logout-btn" onClick={() => setConfirmLogout(true)}>
+              退出并解除本机配对
+            </button>
+            <button type="button" className="mob-btn ghost" onClick={menuLayer.close}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {confirmLogout && (
+        <ConfirmSheet
+          title="解除本机配对？"
+          message="解除后这台手机需要在电脑桌面端重新扫码配对，才能继续遥控。"
+          confirmLabel="退出并解除配对"
+          danger
+          onCancel={() => setConfirmLogout(false)}
+          onConfirm={() => {
+            setConfirmLogout(false);
+            setLogoutError('');
+            onLogout().catch((e: Error) => setLogoutError(`退出失败：${e.message}。仍保持已配对状态。`));
+          }}
+        />
+      )}
     </div>
   );
 }

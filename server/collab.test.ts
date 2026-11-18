@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import pty from 'node-pty';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DELEGATION_INSTRUCTIONS, DELEGATION_RULES_MAX, composeDelegationInstructions, delegationState } from '../shared/protocol.ts';
 import { writeHookFiles } from './agents.ts';
+import { MAX_DELEGATION_ROUNDS, MAX_OPEN_DELEGATIONS } from './collab.ts';
 import { createApp } from './http.ts';
 import { SessionManager } from './sessions.ts';
 import { createFileStore } from './store.ts';
@@ -18,6 +20,7 @@ interface SpawnRec {
   sessionId: string;
   peerToken: string;
   written: string[];
+  killed: boolean;
   emitExit: (code: number) => void;
 }
 
@@ -82,6 +85,7 @@ async function setupHarness() {
       sessionId: env.WORKBENCH_SESSION_ID ?? '',
       peerToken: env.WORKBENCH_PEER_TOKEN ?? '',
       written,
+      killed: false,
       emitExit: code => exitCb({ exitCode: code }),
     };
     spawns.push(rec);
@@ -99,7 +103,7 @@ async function setupHarness() {
       },
       write(data: string) { written.push(data); },
       resize() {},
-      kill() {},
+      kill() { rec.killed = true; },
       pause() {},
       resume() {},
       clear() {},
@@ -532,6 +536,387 @@ describe('cross-CLI collaboration (Layers 1-3)', () => {
       await sessions.killAll();
       await new Promise<void>(resolve => (app.server.listening ? app.server.close(() => resolve()) : resolve()));
       fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('cross-CLI delegation', () => {
+  const prevFake = process.env.WORKBENCH_FAKE_AGENT;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (prevFake === undefined) delete process.env.WORKBENCH_FAKE_AGENT; else process.env.WORKBENCH_FAKE_AGENT = prevFake;
+  });
+
+  type Harness = Awaited<ReturnType<typeof setupHarness>>;
+
+  async function startMain(h: Harness, projectId: string, title: string) {
+    const m = (await h.api('POST', '/api/tasks', { projectId, agent: 'fake', title, prompt: 'init main' })).json;
+    await h.hook(m.session.id, 'fake', 'Stop', { last_assistant_message: 'main ready' });
+    return { id: m.task.id as string, sid: m.session.id as string, rec: h.spawnBySession.get(m.session.id)! };
+  }
+
+  const delegate = (h: Harness, main: { rec: SpawnRec }, body: Record<string, unknown>) =>
+    h.peer('POST', '/api/peer/delegate', main.rec.peerToken, { body: { agent: 'fake', ...body } });
+
+  // Returns once the text was pasted and Enter was sent (the system-delivery markers the existing tests also wait for).
+  const waitDelivered = (rec: SpawnRec, marker: string) => vi.waitFor(() => {
+    expect(rec.written.join('')).toContain(marker);
+    expect(rec.written.at(-1)).toBe('\r');
+  }, { timeout: 9000, interval: 100 });
+
+  const childOf = (h: Harness, id: string) => {
+    const task = h.store.getTask(id)!;
+    return { task, sid: task.sessionId!, rec: h.spawnBySession.get(task.sessionId!)! };
+  };
+
+  it('delegationState maps phase, session and outcome to one state', () => {
+    const d = { parentTaskId: 'p', brief: 'b', round: 1, createdAt: 1 };
+    // The task's phase changed at 100; a session status is older (50) or newer (150) than that.
+    const run = (phase: any, delegation: any, session: any) =>
+      delegationState({ phase, phaseSince: 100, delegation }, session && { statusSince: 150, ...session });
+    const table: Array<[string, any, any, any, string | null]> = [
+      ['not delegated', 'active', undefined, { status: 'idle' }, null],
+      ['first round', 'active', d, { status: 'working' }, 'working'],
+      ['later round', 'active', { ...d, round: 2 }, { status: 'working' }, 'rework'],
+      ['blocked', 'active', d, { status: 'needs_you', blocked: 'permission' }, 'needs_you'],
+      ['quota', 'active', d, { status: 'idle', limit: { kind: 'x' } }, 'needs_you'],
+      ['stopped for the user', 'active', d, { status: 'needs_you' }, 'needs_you'],
+      ['rework note not delivered yet', 'active', { ...d, round: 2 }, { status: 'needs_you', statusSince: 50 }, 'rework'],
+      ['process gone', 'active', d, { status: 'exited' }, 'failed'],
+      ['no session', 'active', d, undefined, 'failed'],
+      ['result waiting', 'review', d, { status: 'idle' }, 'review'],
+      ['approved by the user', 'approved', d, { status: 'exited' }, 'review'],
+      ['accepted', 'archived', { ...d, outcome: 'accepted' }, undefined, 'accepted'],
+      ['canceled', 'archived', { ...d, outcome: 'canceled' }, { status: 'exited' }, 'canceled'],
+      ['archived without outcome', 'archived', d, undefined, 'canceled'],
+    ];
+    for (const [name, phase, delegation, session, want] of table) expect(run(phase, delegation, session), name).toBe(want);
+  });
+
+  it('delegate creates a child; results return each round and rework loops past MAX_AUTO_HOPS up to MAX_DELEGATION_ROUNDS', { timeout: 120_000 }, async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Deleg', path: h.projDir })).json;
+      const main = await startMain(h, p.id, 'Main A');
+
+      const d = await delegate(h, main, { title: 'Impl X', note: 'one line brief', stdinText: 'BRIEF-BODY-MARKER' });
+      expect(d.status).toBe(200);
+      expect(d.json.hop).toBe(1);
+      expect(d.json.task).toMatchObject({ title: 'Impl X', agent: 'fake', round: 1, state: 'working', brief: 'one line brief' });
+      const child = childOf(h, d.json.task.id);
+      expect(child.task.delegation).toMatchObject({ parentTaskId: main.id, round: 1, brief: 'one line brief' });
+      expect(child.task.lastPrompt).toBe('one line brief');
+      expect(child.rec.args.some(a => a.includes('BRIEF-BODY-MARKER') && a.includes('Main A'))).toBe(true);
+      expect(fs.readFileSync(path.join(h.stateDir, 'collab', p.id, 'PEERS.md'), 'utf8')).toContain('Delegated by: Main A');
+
+      // Without --title the title comes from the brief's first line, without the label and paths around it.
+      const untitled = await delegate(h, main, { note: '任务：在项目根目录（C:\\work\\demo）下新建 `hello.txt`\n第二行细节' });
+      expect(untitled.status).toBe(200);
+      expect(untitled.json.task.title).toBe('在项目根目录下新建 hello.txt');
+      expect((await h.peer('POST', '/api/peer/cancel', main.rec.peerToken, { body: { target: untitled.json.task.handle } })).status).toBe(200);
+
+      // A delegated task cannot delegate; unknown agents and empty briefs are refused.
+      const nested = await delegate(h, child, { note: 'x' });
+      expect(nested.status).toBe(403);
+      expect((await delegate(h, main, { agent: 'nope', note: 'x' })).status).toBe(400);
+      expect((await delegate(h, main, {})).status).toBe(400);
+      // The HTTP task API cannot create a delegated task.
+      const forged = (await h.api('POST', '/api/tasks', {
+        projectId: p.id, agent: 'fake', title: 'forged', prompt: 'x', delegation: { parentTaskId: main.id, brief: 'x', round: 1, createdAt: 1 },
+      })).json;
+      expect(h.store.getTask(forged.task.id)!.delegation).toBeUndefined();
+
+      const handle = d.json.task.handle as string;
+      for (let round = 1; round <= MAX_DELEGATION_ROUNDS; round++) {
+        if (round > 1) await waitDelivered(child.rec, `FIX-${round - 1}`);
+        await h.hook(child.sid, 'fake', 'UserPromptSubmit', { prompt: 'turn' });
+        const running = await h.peer('GET', '/api/peer/delegations', main.rec.peerToken);
+        expect(running.json.tasks[0]).toMatchObject({ state: round > 1 ? 'rework' : 'working', round });
+        await h.hook(child.sid, 'fake', 'Stop', { last_assistant_message: `CHILD-RESULT-${round}` });
+
+        await waitDelivered(main.rec, `CHILD-RESULT-${round}`);
+        const mainText = main.rec.written.join('');
+        expect(mainText).toContain(`shoal done ${handle}`);
+        expect(mainText).toContain(`第 ${round} 轮`);
+        const resultCards = h.store.cards().filter(c => c.taskId === main.id && c.meta?.delegation === 'result');
+        expect(resultCards).toHaveLength(round);
+        expect(resultCards.at(-1)!.meta).toMatchObject({ sourceTaskId: child.task.id, isAutoReply: true });
+        await h.hook(main.sid, 'fake', 'UserPromptSubmit', { prompt: 'result pasted' });
+        await h.hook(main.sid, 'fake', 'Stop', { last_assistant_message: `main review ${round}` });
+
+        const list = await h.peer('GET', '/api/peer/delegations', main.rec.peerToken);
+        expect(list.json.tasks[0]).toMatchObject({ handle, state: 'review', round });
+
+        if (round === MAX_DELEGATION_ROUNDS) break;
+        const rw = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: handle, stdinText: `FIX-${round}` } });
+        expect(rw.status).toBe(200);
+        expect(rw.json.task.round).toBe(round + 1);
+        expect(h.store.getTask(child.task.id)!.delegation!.round).toBe(round + 1);
+      }
+      expect(h.store.cards().filter(c => c.taskId === child.task.id && c.meta?.delegation === 'rework')).toHaveLength(MAX_DELEGATION_ROUNDS - 1);
+
+      const tooMany = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: handle, note: 'again' } });
+      expect(tooMany.status).toBe(409);
+      expect(tooMany.json.error).toContain('返工');
+      expect(h.store.getTask(child.task.id)!.delegation!.round).toBe(MAX_DELEGATION_ROUNDS);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('done needs a delivered result, closes the child once, and handles are resolved strictly', { timeout: 30_000 }, async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Settle', path: h.projDir })).json;
+      const main = await startMain(h, p.id, 'Main S');
+      const c1 = (await delegate(h, main, { title: 'Build it', note: 'task one' })).json.task;
+      const c2 = (await delegate(h, main, { title: 'Cancel Me', note: 'task two' })).json.task;
+      const post = (action: string, target: string) => h.peer('POST', `/api/peer/${action}`, main.rec.peerToken, { body: { target } });
+
+      const early = await post('done', c1.handle);
+      expect(early.status).toBe(409);
+      expect(early.json.error).toContain('shoal cancel');
+
+      // Target resolution: the main task itself is not delegated, nothing matches, an id prefix that is too short.
+      expect((await post('done', '#1')).status).toBe(400);
+      expect((await post('done', 'zzz-nothing')).status).toBe(404);
+      expect((await post('done', '')).status).toBe(400);
+
+      const k1 = childOf(h, c1.id);
+      await h.hook(k1.sid, 'fake', 'Stop', { last_assistant_message: 'built' });
+      const ok = await post('done', c1.handle);
+      expect(ok.status).toBe(200);
+      expect(ok.json.task.state).toBe('accepted');
+      const closed = h.store.getTask(c1.id)!;
+      expect(closed).toMatchObject({ phase: 'archived', delegation: { outcome: 'accepted' } });
+      expect(closed.delegation!.settledAt).toBeGreaterThan(0);
+      expect(k1.rec.killed).toBe(true);
+
+      const again = await post('done', c1.handle);
+      expect(again.status).toBe(200);
+      expect(again.json.task.state).toBe('accepted');
+      expect((await post('cancel', c1.handle)).json.task.state).toBe('accepted');
+      const reworkClosed = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: c1.handle, note: 'more' } });
+      expect(reworkClosed.status).toBe(409);
+
+      // Cancel works while the child is still running, found by a title fragment.
+      const cancel = await post('cancel', 'cancel me');
+      expect(cancel.status).toBe(200);
+      expect(cancel.json.task.state).toBe('canceled');
+      expect(childOf(h, c2.id).rec.killed).toBe(true);
+      expect(h.store.getTask(c2.id)!.delegation!.outcome).toBe('canceled');
+
+      const list = (await h.peer('GET', '/api/peer/delegations', main.rec.peerToken)).json;
+      expect(list.tasks.map((t: any) => [t.title, t.state])).toEqual([['Build it', 'accepted'], ['Cancel Me', 'canceled']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('archiving or deleting the main task cancels its open children; archiving a child cancels only that child', { timeout: 30_000 }, async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Cascade', path: h.projDir })).json;
+      const mainA = await startMain(h, p.id, 'Main A');
+      const kidsA = [];
+      for (let i = 0; i < MAX_OPEN_DELEGATIONS; i++) kidsA.push((await delegate(h, mainA, { title: `Kid ${i}`, note: `n${i}` })).json.task);
+      const over = await delegate(h, mainA, { note: 'one too many' });
+      expect(over.status).toBe(409);
+      expect(over.json.error).toContain('shoal done');
+
+      expect((await h.api('POST', `/api/tasks/${mainA.id}/archive`, {})).status).toBe(200);
+      for (const k of kidsA) {
+        expect(h.store.getTask(k.id)).toMatchObject({ phase: 'archived', delegation: { outcome: 'canceled' } });
+        expect(childOf(h, k.id).rec.killed).toBe(true);
+      }
+
+      const mainB = await startMain(h, p.id, 'Main B');
+      const kidB = (await delegate(h, mainB, { title: 'Kid B', note: 'b' })).json.task;
+      expect((await h.api('DELETE', `/api/tasks/${mainB.id}`)).status).toBe(200);
+      expect(h.store.getTask(mainB.id)).toBeUndefined();
+      expect(h.store.getTask(kidB.id)).toMatchObject({ phase: 'archived', delegation: { outcome: 'canceled' } });
+      expect(childOf(h, kidB.id).rec.killed).toBe(true);
+
+      const mainC = await startMain(h, p.id, 'Main C');
+      const kidC1 = (await delegate(h, mainC, { title: 'Kid C1', note: 'c1' })).json.task;
+      const kidC2 = (await delegate(h, mainC, { title: 'Kid C2', note: 'c2' })).json.task;
+      expect((await h.api('POST', `/api/tasks/${kidC1.id}/archive`, {})).status).toBe(200);
+      expect(h.store.getTask(kidC1.id)).toMatchObject({ phase: 'archived', delegation: { outcome: 'canceled' } });
+      expect(h.store.getTask(kidC2.id)!.phase).not.toBe('archived');
+      expect(h.store.getTask(mainC.id)!.phase).not.toBe('archived');
+
+      // Reopening a closed child clears its outcome.
+      await h.api('POST', `/api/tasks/${kidC1.id}/unarchive`, {});
+      const reopened = h.store.getTask(kidC1.id)!;
+      expect(reopened.phase).toBe('active');
+      expect(reopened.delegation!.outcome).toBeUndefined();
+      expect(reopened.delegation!.settledAt).toBeUndefined();
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a blocked child is reported to the main task once per round', { timeout: 30_000 }, async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Blocked', path: h.projDir })).json;
+      const main = await startMain(h, p.id, 'Main K');
+      const d = (await delegate(h, main, { title: 'Needs perm', note: 'do it' })).json.task;
+      const child = childOf(h, d.id);
+      const blockedCards = () => h.store.cards().filter(c => c.taskId === main.id && c.meta?.delegation === 'blocked');
+
+      await h.hook(child.sid, 'fake', 'UserPromptSubmit', { prompt: 'go' });
+      await h.hook(child.sid, 'fake', 'PermissionRequest', {});
+      expect(blockedCards()).toHaveLength(1);
+      await waitDelivered(main.rec, '权限确认');
+      expect(main.rec.written.join('')).toContain('Needs perm');
+
+      // Same round: unblock and block again without a new notice.
+      await h.hook(child.sid, 'fake', 'UserPromptSubmit', { prompt: 'continue' });
+      await h.hook(child.sid, 'fake', 'PermissionRequest', {});
+      expect(blockedCards()).toHaveLength(1);
+
+      const rw = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: d.handle, note: 'again please' } });
+      expect(rw.status).toBe(200);
+      await h.hook(child.sid, 'fake', 'UserPromptSubmit', { prompt: 'round two' });
+      await h.hook(child.sid, 'fake', 'PermissionRequest', {});
+      expect(blockedCards()).toHaveLength(2);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('shoal CLI: delegate --stdin, status, peers annotation and done', { timeout: 30_000 }, async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Cli', path: h.projDir })).json;
+      const main = await startMain(h, p.id, 'Main CLI');
+      const cli = path.join(h.stateDir, 'bin', 'shoal-cli.mjs');
+      const run = (args: string[], stdin?: string) => runCli(process.execPath, [cli, ...args], { cwd: h.projDir, env: main.rec.env, stdin });
+
+      const empty = await run(['status']);
+      expect(empty.code).toBe(0);
+      expect(empty.stdout).toContain('还没有委派任务');
+
+      const dg = await run(['delegate', 'fake', '--title', 'CLI child', '--stdin'], 'first line\nsecond line\n');
+      expect(dg.code).toBe(0);
+      const task = h.store.tasks().find(t => t.delegation)!;
+      const handle = task.id.slice(0, 8);
+      expect(dg.stdout).toContain(handle);
+      expect(dg.stdout).toContain('不要等待或轮询');
+      expect(dg.stdout).toContain(`shoal done ${handle}`);
+      expect(task.title).toBe('CLI child');
+      expect(h.spawnBySession.get(task.sessionId!)!.args.some(a => a.includes('second line'))).toBe(true);
+
+      const status = await run(['status']);
+      expect(status.code).toBe(0);
+      expect(status.stdout).toContain(handle);
+      expect(status.stdout).toContain('执行中');
+      expect(status.stdout).toContain('CLI child');
+
+      const early = await run(['done', handle]);
+      expect(early.code).toBe(1);
+      expect(early.stderr).toContain('还没有交付结果');
+
+      await h.hook(task.sessionId!, 'fake', 'Stop', { last_assistant_message: 'cli result' });
+      expect((await run(['status'])).stdout).toContain('待验收');
+      expect((await run(['peers'])).stdout).toContain('委派 · 待验收 · 第 1 轮');
+
+      const rw = await run(['rework', handle, '--stdin'], 'please fix');
+      expect(rw.code).toBe(0);
+      expect(rw.stdout).toContain('第 2 轮');
+      expect(rw.stdout).toContain('不要等待或轮询');
+
+      await h.hook(task.sessionId!, 'fake', 'Stop', { last_assistant_message: 'cli result 2' });
+      const done = await run(['done', handle]);
+      expect(done.code).toBe(0);
+      expect(done.stdout).toContain('已通过');
+      expect(done.stdout).toContain(handle);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('delegate --review makes a read-only reviewer child; without it there is no mode', async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Deleg', path: h.projDir })).json;
+      const main = await startMain(h, p.id, 'Main R');
+      const r = await delegate(h, main, { title: 'Rev', note: 'review the plan', review: true });
+      expect(r.status).toBe(200);
+      expect(r.json.task.mode).toBe('review');
+      const rc = childOf(h, r.json.task.id);
+      expect(rc.task.delegation?.mode).toBe('review');
+      expect(rc.rec.args.some(a => a.includes('只读') && a.includes('结论：PASS') && a.includes('review the plan'))).toBe(true);
+      // A reviewer's verdict reaches the main task as findings to rule on, not as work to accept.
+      await h.hook(rc.sid, 'fake', 'UserPromptSubmit', { prompt: 'turn' });
+      await h.hook(rc.sid, 'fake', 'Stop', { last_assistant_message: '结论：FAIL\nBLOCKING-MARKER' });
+      await waitDelivered(main.rec, 'BLOCKING-MARKER');
+      const relayed = main.rec.written.join('');
+      expect(relayed).toContain('给出了评审结论');
+      expect(relayed).toContain(`shoal done ${r.json.task.handle}`);
+      expect(relayed).not.toContain('请验收');
+      const e = await delegate(h, main, { title: 'Exec', note: 'do it' });
+      expect(e.json.task.mode).toBeUndefined();
+      const ec = childOf(h, e.json.task.id);
+      expect(ec.task.delegation && 'mode' in ec.task.delegation).toBe(false);
+      expect(ec.rec.args.some(a => a.includes('结论：PASS'))).toBe(false);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('settings validate, store and reset delegationRules', async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      expect(h.store.settings().delegationRules).toBeUndefined();
+      expect((await h.api('POST', '/api/settings', { delegationRules: 5 })).status).toBe(400);
+      expect((await h.api('POST', '/api/settings', { delegationRules: 'x'.repeat(DELEGATION_RULES_MAX + 1) })).status).toBe(400);
+      expect(h.store.settings().delegationRules).toBeUndefined();
+      expect((await h.api('POST', '/api/settings', { delegationRules: 'x'.repeat(DELEGATION_RULES_MAX) })).status).toBe(200);
+      expect((await h.api('POST', '/api/settings', { delegationRules: '' })).status).toBe(200);
+      expect(h.store.settings().delegationRules).toBe('');
+      await h.api('POST', '/api/settings', { delegationRules: 'my rules' });
+      expect(h.store.settings().delegationRules).toBe('my rules');
+      expect(h.store.settings().autoDelegate).toBe(true);
+      const reset = await h.api('POST', '/api/settings', { delegationRules: null });
+      expect(reset.status).toBe(200);
+      expect('delegationRules' in h.store.settings()).toBe(false);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('composeDelegationInstructions lists only installed CLIs and the custom rules', () => {
+    const withRules = composeDelegationInstructions({ host: 'claude', available: ['claude', 'codex'], rules: '  RULE-MARKER  ' });
+    expect(withRules).toContain(DELEGATION_INSTRUCTIONS);
+    expect(withRules).toContain('This session runs Claude Code. CLIs installed in this Shoal: Claude Code, Codex. Only these');
+    expect(withRules).not.toContain('Antigravity.');
+    expect(withRules.endsWith('## 分工与评审规则（Shoal 设置，用户可修改）\nRULE-MARKER')).toBe(true);
+    const none = composeDelegationInstructions({ host: 'codex', available: ['codex'], rules: '  ' });
+    expect(none).not.toContain('分工与评审规则');
+  });
+
+  it('settings accept a boolean autoDelegate and keep it on by default', async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      expect(h.store.settings().autoDelegate).toBe(true);
+      expect((await h.api('POST', '/api/settings', { autoDelegate: 'no' })).status).toBe(400);
+      const off = await h.api('POST', '/api/settings', { autoDelegate: false });
+      expect(off.status).toBe(200);
+      expect(off.json.autoDelegate).toBe(false);
+      expect(h.store.settings().autoDelegate).toBe(false);
+    } finally {
+      await h.close();
     }
   });
 });

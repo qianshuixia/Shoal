@@ -20,6 +20,35 @@ interface Entry {
 
 const registry = new Map<string, Entry>();
 
+// Terminals that hold output, sessions whose saved output was asked for, and sessions the server had none for.
+const filled = new Set<string>();
+const wanted = new Set<string>();
+const empty = new Set<string>();
+const emptyListeners = new Set<() => void>();
+const changedEmpty = () => { for (const fn of emptyListeners) fn(); };
+
+// An exited session's terminal is empty after a page load or a Shoal restart; ask the server for the saved output.
+// Requests made while disconnected are sent again by resendWantedReplays() once the socket opens.
+export function requestReplay(id: string): void {
+  if (filled.has(id) || empty.has(id)) return;
+  wanted.add(id);
+  send({ t: 'want-replay', id });
+}
+
+export function resendWantedReplays(): void {
+  for (const id of wanted) send({ t: 'want-replay', id });
+}
+
+// True once the server answered that it has no saved output for the session.
+export function isReplayEmpty(id: string): boolean {
+  return empty.has(id) && !filled.has(id);
+}
+
+export function subscribeReplayEmpty(fn: () => void): () => void {
+  emptyListeners.add(fn);
+  return () => { emptyListeners.delete(fn); };
+}
+
 const BASE_FONT = 14;
 let scale = 1;
 const fontSize = () => Math.round(BASE_FONT * scale);
@@ -209,9 +238,24 @@ function getEntry(id: string): Entry {
 
 export function writeOut(id: string, d: string): void {
   getEntry(id).term.write(d);
+  if (!filled.has(id)) {
+    filled.add(id);
+    if (empty.has(id)) changedEmpty();
+  }
 }
 
 export function replay(id: string, d: string): void {
+  wanted.delete(id);
+  if (!d) {
+    if (!filled.has(id) && !empty.has(id)) {
+      empty.add(id);
+      changedEmpty();
+    }
+    return;
+  }
+  const wasEmpty = empty.delete(id);
+  filled.add(id);
+  if (wasEmpty) changedEmpty();
   const entry = getEntry(id);
   entry.term.reset();
   entry.replaying = true;
@@ -226,6 +270,9 @@ export function dispose(id: string): void {
   entry.term.dispose();
   entry.el.remove();
   registry.delete(id);
+  filled.delete(id);
+  wanted.delete(id);
+  if (empty.delete(id)) changedEmpty();
 }
 
 export function disposeExcept(keep: Set<string>): void {

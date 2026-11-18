@@ -108,7 +108,7 @@ export function ReadOnlyDiffDrawer({
                   style={{ flex: 'none', fontFamily: 'Consolas, monospace', fontSize: '0.75rem' }}
                 >
                   <span>[{f.status}]</span>
-                  <span>{f.path}</span>
+                  <span data-private="">{f.path}</span>
                   {f.added !== null && f.deleted !== null && (
                     <span style={{ opacity: 0.75 }}>+{f.added}/-{f.deleted}</span>
                   )}

@@ -7,10 +7,10 @@ import { pipeline } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerSendBody, Project,
-  GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskPhase,
+  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, Project,
+  GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
-import { canResume, feedbackPrompt, forwardText, isValidAgyModel } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isValidAgyModel } from '../shared/protocol.ts';
 import { createActivityTracker } from './activity.ts';
 import { clipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
@@ -201,7 +201,12 @@ export function createApp(cfg: AppConfig) {
     store,
     sessions,
     availableAgents,
-    createPeerTask: ({ projectId, agent, title, prompt }) => createTask({ projectId, agent, title, prompt }),
+    createPeerTask: ({ projectId, agent, title, prompt, delegation, retitleFrom }) => {
+      const created = createTask({ projectId, agent, title, prompt }, { delegation });
+      if (retitleFrom) aiRetitle(created.task.id, created.task.title, retitleFrom);
+      return created;
+    },
+    closeDelegation,
     deliverToTask: ({ targetTask, project, text, system, onDelivered, cardMeta }) => {
       const prev = targetTask.sessionId ? sessions.list().find(s => s.id === targetTask.sessionId) : undefined;
       const msg = '目标任务没有可续接的对话，无法投递协作消息';
@@ -228,6 +233,7 @@ export function createApp(cfg: AppConfig) {
       if (task && task.sessionId === m.session.id) {
         if (m.session.status === 'working' && task.phase !== 'active') setPhase(task, 'active');
         else if (saved?.status !== m.session.status) collab.syncProjectPeers(task.projectId);
+        if (task.delegation && m.session.blocked) collab.onChildBlocked(task, m.session);
       }
       return;
     }
@@ -285,7 +291,15 @@ export function createApp(cfg: AppConfig) {
     return out;
   }
 
-  function createTask(b: Record<string, unknown>) {
+  // Standing delegation instructions for a new session; a delegated task never gets them (it cannot delegate).
+  function delegationInstructions(task: Pick<Task, 'delegation' | 'agent'>): string | undefined {
+    const settings = store.settings();
+    if (settings.autoDelegate === false || task.delegation) return undefined;
+    return composeDelegationInstructions({ host: task.agent, available: availableAgents(), rules: settings.delegationRules ?? DEFAULT_DELEGATION_RULES });
+  }
+
+  // `extra.delegation` comes only from collab.delegate, never from the HTTP body.
+  function createTask(b: Record<string, unknown>, extra?: { delegation?: TaskDelegation }) {
     const body = b as Partial<CreateTaskBody>;
     const project = typeof body.projectId === 'string' ? store.getProject(body.projectId) : undefined;
     if (!project) throw new HttpError(400, '项目不存在');
@@ -301,7 +315,7 @@ export function createApp(cfg: AppConfig) {
     const prompt = files.length
       ? (rawPrompt.trim() ? `${rawPrompt.trim()}\n${files.join(' ')}` : files.join(' '))
       : rawPrompt;
-    const lastPrompt = promptPreview(rawPrompt.trim() ? rawPrompt : prompt);
+    const lastPrompt = extra?.delegation ? extra.delegation.brief : promptPreview(rawPrompt.trim() ? rawPrompt : prompt);
     let title = typeof body.title === 'string' ? body.title.trim() : '';
     let titleAuto = false;
     let fromPrompt = false;
@@ -318,11 +332,13 @@ export function createApp(cfg: AppConfig) {
       id: crypto.randomUUID(), projectId: project.id, title, titleAuto, prompt, color: pickColor(store.tasks()),
       agent, ...(model && { model }), sessionId: null, createdAt: now,
       phase: 'active', phaseSince: now, lastActiveAt: now, ...(lastPrompt && { lastPrompt }),
+      ...(extra?.delegation && { delegation: extra.delegation }),
     };
     let session;
     try {
       session = sessions.spawn({
         taskId: task.id, projectId: project.id, agent, cwd: project.path, prompt, model,
+        instructions: delegationInstructions(task),
         cols: typeof body.cols === 'number' ? body.cols : undefined,
         rows: typeof body.rows === 'number' ? body.rows : undefined,
       });
@@ -361,6 +377,25 @@ export function createApp(cfg: AppConfig) {
     return next;
   }
 
+  // Ends the process of a delegated task and archives it with its outcome (the session record stays).
+  function closeDelegation(task: Task, outcome: 'accepted' | 'canceled'): Task {
+    if (task.sessionId) sessions.kill(task.sessionId);
+    const now = Date.now();
+    const next: Task = { ...task, phase: 'archived', phaseSince: now, ...(task.delegation && { delegation: { ...task.delegation, outcome, settledAt: now } }) };
+    store.updateTask(next);
+    collab.syncProjectPeers(next.projectId);
+    broadcast({ t: 'task', task: next });
+    return next;
+  }
+
+  // A main task that is archived or deleted takes its open delegated tasks with it.
+  function cancelChildrenOf(parentIds: ReadonlySet<string>): void {
+    if (!parentIds.size) return;
+    for (const t of [...store.tasks()]) {
+      if (t.delegation && t.phase !== 'archived' && parentIds.has(t.delegation.parentTaskId)) closeDelegation(t, 'canceled');
+    }
+  }
+
   // Approved tasks left alone past the limit (default 1 day), or unapproved active exited tasks untouched for 14 days,
   // with no running session, move to 已归档 (待验收 is never auto-archived).
   const archiveMs = autoArchiveMs(process.env.WORKBENCH_AUTO_ARCHIVE_DAYS);
@@ -375,6 +410,7 @@ export function createApp(cfg: AppConfig) {
     store.updateTasks(updated);
     for (const pid of new Set(updated.map(t => t.projectId))) collab.syncProjectPeers(pid);
     for (const task of updated) broadcast({ t: 'task', task });
+    cancelChildrenOf(new Set(updated.map(t => t.id)));
   }
   autoArchive();
   for (const p of store.projects()) collab.syncProjectPeers(p.id);
@@ -393,6 +429,7 @@ export function createApp(cfg: AppConfig) {
     store.updateTasks(updated);
     collab.syncProjectPeers(project.id);
     for (const task of updated) broadcast({ t: 'task', task });
+    cancelChildrenOf(new Set(updated.map(t => t.id)));
     return { tasks: updated };
   }
 
@@ -407,7 +444,7 @@ export function createApp(cfg: AppConfig) {
       : undefined;
     let session;
     try {
-      session = sessions.spawn({ taskId: task.id, projectId: project.id, agent: merged.agent, cwd: project.path, model, ...o });
+      session = sessions.spawn({ taskId: task.id, projectId: project.id, agent: merged.agent, cwd: project.path, model, instructions: delegationInstructions(merged), ...o });
     } catch (e) {
       throw new HttpError(500, `启动失败：${(e as Error).message}`);
     }
@@ -710,6 +747,8 @@ export function createApp(cfg: AppConfig) {
     const session = sessions.list().find(s => s.id === body.sessionId);
     const old = session ? store.getTask(session.taskId) : undefined;
     if (!old || old.sessionId !== body.sessionId) return;
+    // A delegated task's launch prompt opens with the same boilerplate for every task: keep showing its brief.
+    if (old.delegation && typeof text === 'string' && text.trim() === old.prompt.trim()) return;
     const nextPreview = preview || old.lastPrompt;
     const nextActive = userTurn ? Date.now() : old.lastActiveAt;
     if (nextPreview === old.lastPrompt && nextActive === old.lastActiveAt) return;
@@ -865,13 +904,21 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
     if (method === 'POST' && pathname === '/api/settings') {
       if (body.aiTitles !== undefined && typeof body.aiTitles !== 'boolean') throw new HttpError(400, '设置值无效');
+      if (body.autoDelegate !== undefined && typeof body.autoDelegate !== 'boolean') throw new HttpError(400, '设置值无效');
+      if (body.delegationRules !== undefined && body.delegationRules !== null) {
+        if (typeof body.delegationRules !== 'string') throw new HttpError(400, '设置值无效');
+        if ([...body.delegationRules].length > DELEGATION_RULES_MAX) throw new HttpError(400, `分工规则过长（上限 ${DELEGATION_RULES_MAX} 字）`);
+      }
       if (body.agyModel !== undefined && (typeof body.agyModel !== 'string' || !isValidAgyModel(body.agyModel))) {
         throw new HttpError(400, '设置值无效');
       }
       const settings: Settings = {
         ...store.settings(),
         ...(typeof body.aiTitles === 'boolean' ? { aiTitles: body.aiTitles } : {}),
+        ...(typeof body.autoDelegate === 'boolean' ? { autoDelegate: body.autoDelegate } : {}),
       };
+      if (typeof body.delegationRules === 'string') settings.delegationRules = body.delegationRules;
+      else if (body.delegationRules === null) delete settings.delegationRules;
       if (typeof body.agyModel === 'string') {
         if (body.agyModel) settings.agyModel = body.agyModel;
         else delete settings.agyModel;
@@ -906,8 +953,20 @@ export function createApp(cfg: AppConfig) {
       if (act[2] === 'feedback') return send(res, 200, feedback(act[1], body));
       const task = store.getTask(act[1]);
       if (!task) throw new HttpError(404, '任务不存在');
+      if (act[2] === 'archive' && task.delegation && task.phase !== 'archived') {
+        const closed = closeDelegation(task, 'canceled');
+        cancelChildrenOf(new Set([task.id]));
+        return send(res, 200, closed);
+      }
       if (act[2] === 'archive' && task.sessionId) sessions.kill(task.sessionId);
-      return send(res, 200, setPhase(task, act[2] === 'approve' ? 'approved' : act[2] === 'archive' ? 'archived' : 'active'));
+      let base = task;
+      if (act[2] === 'unarchive' && task.delegation) {
+        const { outcome: _o, settledAt: _s, ...open } = task.delegation;
+        base = { ...task, delegation: open };
+      }
+      const moved = setPhase(base, act[2] === 'approve' ? 'approved' : act[2] === 'archive' ? 'archived' : 'active');
+      if (act[2] === 'archive') cancelChildrenOf(new Set([task.id]));
+      return send(res, 200, moved);
     }
     const m = pathname.match(/^\/api\/tasks\/([^/]+)$/);
     if (method === 'PATCH' && m) return send(res, 200, renameTask(m[1], body));
@@ -915,6 +974,7 @@ export function createApp(cfg: AppConfig) {
       const task = store.getTask(m[1]);
       if (!task) throw new HttpError(404, '任务不存在');
       cfg.usage.scan(); // records which task its sessions belonged to before they are dropped
+      cancelChildrenOf(new Set([task.id]));
       if (task.sessionId) {
         collab.clearSessionState(task.sessionId);
         activity.onRemove(task.sessionId);
@@ -1009,6 +1069,21 @@ export function createApp(cfg: AppConfig) {
       if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) throw new HttpError(415, '需要 application/json');
       const body = parseJson(await readBody(req)) as unknown as PeerSendBody;
       return send(res, 200, collab.sendPeer(caller.session.id, body));
+    }
+    if (method === 'GET' && pathname === '/api/peer/delegations') {
+      return send(res, 200, collab.listDelegations(caller.session.id));
+    }
+    const delegationPost = pathname.match(/^\/api\/peer\/(delegate|rework|done|cancel)$/);
+    if (method === 'POST' && delegationPost) {
+      if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) throw new HttpError(415, '需要 application/json');
+      const body = parseJson(await readBody(req)) as unknown;
+      const sid = caller.session.id;
+      switch (delegationPost[1]) {
+        case 'delegate': return send(res, 200, collab.delegate(sid, body as PeerDelegateBody));
+        case 'rework': return send(res, 200, collab.rework(sid, body as PeerDelegationActionBody));
+        case 'done': return send(res, 200, collab.settle(sid, body as PeerDelegationActionBody, 'accepted'));
+        default: return send(res, 200, collab.settle(sid, body as PeerDelegationActionBody, 'canceled'));
+      }
     }
     throw new HttpError(404, '未找到协作接口');
   }
@@ -1203,6 +1278,9 @@ export function createApp(cfg: AppConfig) {
       if (!m || typeof m !== 'object') return;
       if (m.t === 'in' && typeof m.id === 'string' && typeof m.d === 'string') sessions.input(m.id, m.d);
       else if (m.t === 'resize' && typeof m.id === 'string') sessions.resize(m.id, Number(m.cols), Number(m.rows));
+      else if (m.t === 'want-replay' && typeof m.id === 'string' && !sessions.hasLiveBuffer(m.id)) {
+        ws.send(JSON.stringify({ t: 'replay', id: m.id, d: sessions.replayOf(m.id) ?? '' } satisfies ServerMsg));
+      }
     });
   });
 

@@ -12,6 +12,7 @@ import type { StatusEvent } from './status.ts';
 const BUF_KEEP = 1024 * 1024;
 const BUF_MAX = BUF_KEEP + 256 * 1024; // trim in batches so we do not re-slice on every chunk
 const QUIET_MS = 4000;
+const SCROLL_SAVE_MS = 30_000; // how often changed terminal output is written to `<stateDir>/scrollback`
 const QUEUE_TICK_MS = 250;
 const TYPING_QUIET_MS = 5000; // no user keystrokes this long before a queued message is pasted
 const DELIVERY_GAP_MS = 2000; // between two deliveries to the same session
@@ -74,6 +75,7 @@ interface QueuedMessage {
 interface Live {
   info: SessionInfo;
   cwd: string;
+  collabDir?: string; // `<stateDir>/collab/<projectId>`, passed to the CLI as an extra workspace folder
   peerToken: string;
   proc: pty.IPty;
   buf: string;
@@ -91,6 +93,9 @@ interface Live {
   lastDeliveryAt: number;
   deliveringUntil: number;
   inputSeq: number;
+  // Bumped by anything that can answer or replace an on-screen prompt (input, delivery, a new permission request,
+  // a detected startup prompt). A phone answer carries the value it saw, so it only lands on that same wait.
+  waitSeq: number;
   enterTimer: NodeJS.Timeout | null;
   enterWasSystem: boolean;
   systemInjectedPending: number;
@@ -99,6 +104,7 @@ interface Live {
   modes: Map<number, boolean>; // last state of each REPLAY_MODES mode the CLI set
   tail: string; // end of the previous PTY chunk, so a mode switch split across chunks is still seen
   trimmed: boolean; // buf has lost its start
+  scrollDirty: boolean; // buf changed since it was last written to disk
   firstOutAt: number; // 0 until the PTY first writes
   initialPromptPending: boolean; // true until the launch prompt's first hook arrives, so spawn jitter cannot reorder tasks
 }
@@ -133,6 +139,7 @@ export interface SpawnOptions {
   cols?: number;
   rows?: number;
   resume?: string; // native session id to reopen
+  instructions?: string; // standing instructions appended to the CLI's system prompt (see buildLaunch)
 }
 
 // Hook events that mean a prompt was submitted, i.e. the CLI now has a saved conversation.
@@ -157,10 +164,18 @@ const normPath = (p: string) => {
 
 // Interactive agy sessions launched by Shoal carry both the project cwd and `<stateDir>/agy-hooks` in workspacePaths.
 // A nested `agy -p` run inside a shell tool (or a branched worker workspace) lacks the project cwd.
-export function agyPrimaryWorkspaces(cwd: string, stateDir: string, workspacePaths: unknown): boolean {
+// agy leaves a folder it does not trust yet out of workspacePaths, so a session started in a new folder lists only the
+// folders Shoal added (agy-hooks, the project's collab folder, agy-instructions). It counts as primary only when it
+// lists our collab folder and nothing else: a branched worker lists its copy of the project.
+export function agyPrimaryWorkspaces(cwd: string, stateDir: string, workspacePaths: unknown, collabDir?: string): boolean {
   if (!Array.isArray(workspacePaths)) return true;
   const have = new Set(workspacePaths.filter((x): x is string => typeof x === 'string' && x.length > 0).map(normPath));
-  return have.has(normPath(cwd)) && have.has(normPath(path.join(stateDir, 'agy-hooks')));
+  const hooks = normPath(path.join(stateDir, 'agy-hooks'));
+  if (!have.has(hooks)) return false;
+  if (have.has(normPath(cwd))) return true;
+  if (!collabDir || !have.has(normPath(collabDir))) return false;
+  const ours = new Set([hooks, normPath(collabDir), normPath(path.join(stateDir, 'agy-instructions'))]);
+  return [...have].every(p => ours.has(p));
 }
 
 // agy emits Stop with `fullyIdle: false` (or `continuationActive: true`) when the main agent pauses its turn solely to
@@ -185,20 +200,21 @@ export function agyHookDisposition(opts: {
   payload: Record<string, unknown>;
   cwd: string;
   stateDir: string;
+  collabDir?: string;
 }): AgyHookAction {
-  const { currentId, event, payload: p, cwd, stateDir } = opts;
+  const { currentId, event, payload: p, cwd, stateDir, collabDir } = opts;
   if (event === 'RateLimits') return { kind: 'primary' };
   const conv = typeof p.conversationId === 'string' ? p.conversationId : '';
   if (!conv) return { kind: 'ignore' };
   if (currentId === null) {
-    if (!agyPrimaryWorkspaces(cwd, stateDir, p.workspacePaths)) return { kind: 'ignore' };
+    if (!agyPrimaryWorkspaces(cwd, stateDir, p.workspacePaths, collabDir)) return { kind: 'ignore' };
     if (agyConversationState(conv).kind === 'subagent') return { kind: 'ignore' };
     if (event === 'Stop' && isAgyIntermediateStop(p)) return { kind: 'intermediate-stop', nativeId: conv };
     return { kind: 'primary', nativeId: conv };
   }
   if (conv !== currentId) {
     if (event !== 'SessionStart' && event !== 'PreInvocation') return { kind: 'ignore' };
-    if (!agyPrimaryWorkspaces(cwd, stateDir, p.workspacePaths)) return { kind: 'ignore' };
+    if (!agyPrimaryWorkspaces(cwd, stateDir, p.workspacePaths, collabDir)) return { kind: 'ignore' };
     if (typeof p.lastUserInput !== 'string' || p.lastUserInput.trim() === '') return { kind: 'ignore' };
     const st = agyConversationState(conv);
     if (st.kind === 'subagent' && !st.hasUserTurn) return { kind: 'ignore' };
@@ -266,9 +282,40 @@ export class SessionManager {
   private cfg: SessionManagerConfig;
   private queueTimer: NodeJS.Timeout | null = null;
   private lastDesktopActive = 0;
+  private scrollTimer: NodeJS.Timeout | null = null;
 
   constructor(cfg: SessionManagerConfig) {
     this.cfg = cfg;
+  }
+
+  // Terminal output is kept on disk so an exited session can still be shown after Shoal restarts.
+  private scrollFile(id: string): string {
+    return path.join(this.cfg.stateDir, 'scrollback', `${id}.log`);
+  }
+
+  private saveScrollback(s: Live) {
+    s.scrollDirty = false;
+    if (!s.buf) return;
+    const file = this.scrollFile(s.info.id);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(`${file}.tmp`, (s.trimmed ? modePrefix(s.modes) : '') + s.buf);
+      fs.renameSync(`${file}.tmp`, file);
+    } catch (e) {
+      console.warn('[scrollback]', (e as Error).message);
+    }
+  }
+
+  private deleteScrollback(id: string) {
+    fs.rm(this.scrollFile(id), { force: true }, e => { if (e) console.warn('[scrollback]', e.message); });
+  }
+
+  private armScrollSave() {
+    if (this.scrollTimer) return;
+    this.scrollTimer = setInterval(() => {
+      for (const s of this.live.values()) if (s.scrollDirty && !s.removed) this.saveScrollback(s);
+    }, SCROLL_SAVE_MS);
+    this.scrollTimer.unref?.();
   }
 
   markDesktopActive(now = Date.now()): void {
@@ -297,8 +344,16 @@ export class SessionManager {
   }
 
   // Registers exited sessions loaded from the persisted state so they show up in snapshots.
+  // Scrollback files of sessions that are no longer in the state are deleted.
   restore(infos: SessionInfo[]) {
     for (const i of infos) this.dead.set(i.id, i);
+    const dir = path.join(this.cfg.stateDir, 'scrollback');
+    let names: string[] = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    for (const n of names) {
+      const id = n.replace(/.log(.tmp)?$/, '');
+      if (n.endsWith('.tmp') || (!this.dead.has(id) && !this.live.has(id))) fs.rmSync(path.join(dir, n), { force: true });
+    }
   }
 
   // Clears the `interrupted` flag on restored sessions (e.g. when the user dismisses the recovery banner or batch-resumes).
@@ -322,10 +377,38 @@ export class SessionManager {
     return [...this.live.values()].filter(s => s.buf).map(s => ({ id: s.info.id, d: (s.trimmed ? modePrefix(s.modes) : '') + s.buf }));
   }
 
+  // The wait a phone prompt answer is bound to: a live, blocked session's current waitSeq plus its replay at the same
+  // instant (info is a copy, so a later change cannot leak into a screen read from this instant). Null when nothing waits.
+  promptWait(id: string): { info: SessionInfo; waitSeq: number; replay: string | null } | null {
+    const s = this.live.get(id);
+    if (!s || s.removed || s.info.status === 'exited' || !s.info.blocked) return null;
+    return { info: { ...s.info }, waitSeq: s.waitSeq, replay: this.replayOf(id) };
+  }
+
+  // Writes a phone's prompt answer only if the same wait is still open: nothing typed, delivered or re-prompted since
+  // `waitSeq` was read. Synchronous, so no other input can slip between the check and the write.
+  answerPrompt(id: string, waitSeq: number, data: string): boolean {
+    const s = this.live.get(id);
+    if (!s || s.removed || s.info.status === 'exited' || !s.info.blocked || s.waitSeq !== waitSeq) return false;
+    this.input(id, data, { fromMobile: true });
+    return true;
+  }
+
+  // A live session's buffer, or the saved output of a session restored from disk.
   replayOf(id: string): string | null {
     const s = this.live.get(id);
-    if (!s || !s.buf) return null;
-    return (s.trimmed ? modePrefix(s.modes) : '') + s.buf;
+    if (s) return s.buf ? (s.trimmed ? modePrefix(s.modes) : '') + s.buf : null;
+    if (!this.dead.has(id)) return null;
+    try {
+      return fs.readFileSync(this.scrollFile(id), 'utf8') || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // True for sessions whose output `replays()` already sends on connect.
+  hasLiveBuffer(id: string): boolean {
+    return !!this.live.get(id)?.buf;
   }
 
   private log(obj: unknown) {
@@ -356,7 +439,7 @@ export class SessionManager {
     const collabDir = o.projectId ? path.join(this.cfg.stateDir, 'collab', o.projectId) : undefined;
     const launch = buildLaunch({
       agent: o.agent, sessionId: id, prompt: o.prompt, stateDir: this.cfg.stateDir,
-      resume: o.resume, model: o.model, collabDir,
+      resume: o.resume, model: o.model, collabDir, instructions: o.instructions,
     });
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP.test(k))) as Record<string, string>;
     prependEnvPath(env, path.join(this.cfg.stateDir, 'bin'));
@@ -385,16 +468,17 @@ export class SessionManager {
         id, taskId: o.taskId, agent: o.agent, nativeSessionId: launch.nativeSessionId, resumable: Boolean(o.resume || o.prompt),
         status: 'starting', statusSince: now, startedAt: now, exitCode: null, cols, rows,
       },
-      cwd: o.cwd, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
+      cwd: o.cwd, collabDir, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
       queue: [], permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '',
       hasDraft: false, interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
-      inputSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
-      modes: new Map(), tail: '', trimmed: false, firstOutAt: 0,
+      inputSeq: 0, waitSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
+      modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0,
       initialPromptPending: Boolean(o.prompt && !o.resume),
     };
     this.live.set(id, s);
     this.peerTokens.set(peerToken, id);
     this.armQuiet(s);
+    this.armScrollSave();
     proc.onData(d => {
       if (!s.firstOutAt) s.firstOutAt = Date.now();
       trackModes(s.modes, s.tail + d);
@@ -403,10 +487,12 @@ export class SessionManager {
         s.startupTail = (s.startupTail + d).slice(-1024);
         if (!s.startupBlocked && STARTUP_BLOCK_RE.test(stripAnsiForMatch(s.startupTail))) {
           s.startupBlocked = true;
+          s.waitSeq++;
           if (this.syncBlocked(s) && !s.removed) this.emit({ t: 'session', session: s.info });
         }
       }
       s.buf += d;
+      s.scrollDirty = true;
       if (s.buf.length > BUF_MAX) {
         let tail = s.buf.slice(-BUF_KEEP);
         const nl = tail.indexOf('\n');
@@ -427,6 +513,7 @@ export class SessionManager {
       s.deliveringUntil = 0;
       s.info.exitCode = e.exitCode;
       this.log({ kind: 'exit', sessionId: id, agent: o.agent, exitCode: e.exitCode, at: Date.now() });
+      if (!s.removed) this.saveScrollback(s);
       this.dropQueue(s);
       this.apply(s, { type: 'exit' });
       const waiters = s.exitWaiters.splice(0);
@@ -478,6 +565,7 @@ export class SessionManager {
         payload: p,
         cwd: s.cwd,
         stateDir: this.cfg.stateDir,
+        collabDir: s.collabDir,
       });
       if (act.kind === 'ignore') return false;
       if (act.nativeId && act.nativeId !== s.info.nativeSessionId) {
@@ -554,7 +642,10 @@ export class SessionManager {
       delete s.info.limit;
       changed = true;
     }
-    if (body.event === 'PermissionRequest') s.permBlocked = true;
+    if (body.event === 'PermissionRequest') {
+      s.permBlocked = true;
+      s.waitSeq++;
+    }
     else if (isStatusHook(body.event)) s.permBlocked = false;
     if (this.syncBlocked(s)) changed = true;
     const before = s.info.status;
@@ -574,6 +665,7 @@ export class SessionManager {
     const wasPermBlocked = s.permBlocked;
     s.lastInputAt = Date.now();
     s.inputSeq++;
+    s.waitSeq++;
     s.permBlocked = false;
     if (s.enterTimer) {
       clearTimeout(s.enterTimer);
@@ -643,6 +735,7 @@ export class SessionManager {
     s.lastDeliveryAt = now;
     s.deliveringUntil = now + DELIVERY_INFLIGHT_MS;
     s.permBlocked = false;
+    s.waitSeq++;
     this.syncBlocked(s);
     if (system) {
       s.systemInjectedPending++;
@@ -765,8 +858,13 @@ export class SessionManager {
     return new Promise(resolve => setTimeout(() => { void kill().then(resolve); }, wait));
   }
 
-  // Kills the PTY and forgets the session (no further broadcasts for it).
+  // Kills the PTY and forgets the session (no further broadcasts for it), including its saved output.
   remove(id: string): Promise<void> {
+    this.deleteScrollback(id);
+    return this.drop(id);
+  }
+
+  private drop(id: string): Promise<void> {
     this.dead.delete(id);
     const s = this.live.get(id);
     if (!s) return Promise.resolve();
@@ -788,6 +886,10 @@ export class SessionManager {
   async killAll(): Promise<void> {
     if (this.queueTimer) clearInterval(this.queueTimer);
     this.queueTimer = null;
-    await Promise.all([...this.live.keys()].map(id => this.remove(id)));
+    if (this.scrollTimer) clearInterval(this.scrollTimer);
+    this.scrollTimer = null;
+    // Saved before the kill, so the output survives a restart (onExit skips removed sessions).
+    for (const s of this.live.values()) if (s.scrollDirty) this.saveScrollback(s);
+    await Promise.all([...this.live.keys()].map(id => this.drop(id)));
   }
 }
