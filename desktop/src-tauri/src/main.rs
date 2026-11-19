@@ -1,19 +1,25 @@
-// Desktop shell for Shoal: a WebView2 window on the local server, plus tray and single instance.
-// The installer carries the whole server (resources\app: a pinned node.exe, server/, web/dist, node_modules), so it
-// needs nothing else on the machine except the agent CLIs. Quitting the shell stops the server along with the agents;
-// if the shell crashes or is killed, the server and agents keep running.
+// Desktop shell for Shoal: a webview window on the local server (WebView2 on Windows, WKWebView on macOS), plus tray and
+// single instance. The installer carries the whole server (resources/app: a pinned Node runtime, server/, web/dist,
+// node_modules), so it needs nothing else on the machine except the agent CLIs. Quitting the shell stops the server
+// along with the agents; if the shell crashes or is killed, the server and agents keep running.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::fs::File;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+#[cfg(target_os = "macos")]
+use tauri::menu::Submenu;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{AppHandle, Manager, Url, UserAttentionType, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
@@ -21,13 +27,29 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::StateFlags;
 
+// The bundled runtime under resources/app.
+#[cfg(windows)]
+const NODE_BIN: &str = "node.exe";
+#[cfg(not(windows))]
+const NODE_BIN: &str = "node";
+// Where the splash page (frontendDist) is served from: Tauri's custom protocol differs per platform.
+#[cfg(windows)]
+const SPLASH_URL: &str = "http://tauri.localhost/index.html";
+#[cfg(not(windows))]
+const SPLASH_URL: &str = "tauri://localhost/index.html";
+
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-const SPLASH_HOST: &str = "tauri.localhost";
+#[cfg(windows)]
 const SYNCHRONIZE: u32 = 0x0010_0000;
+#[cfg(windows)]
 const WAIT_OBJECT_0: u32 = 0;
+#[cfg(windows)]
 const ERROR_ACCESS_DENIED: u32 = 5;
 
+#[cfg(windows)]
 extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut std::ffi::c_void;
     fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
@@ -35,6 +57,129 @@ extern "system" {
     fn GetLastError() -> u32;
 }
 
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(unix)]
+const ESRCH: i32 = 3;
+
+// The server process this shell started. On Unix a child that has exited stays a zombie (and still answers
+// kill(pid, 0)) until it is waited for, so exits of our own child are read through this handle. It is only reaped under
+// this lock, and `status` records that: while it is None the child's PID (and so its process group ID) is still ours.
+struct OwnServer {
+    child: Child,
+    status: Option<std::process::ExitStatus>,
+}
+static SERVER_CHILD: Mutex<Option<OwnServer>> = Mutex::new(None);
+// Servers replaced by a restart while still running (one that closed its port and is still winding down): kept until
+// they exit so they are reaped rather than left as zombies. Never signalled.
+static RETIRED: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+// Serializes "spawn the server and record it" (start_server) with "stop it before exiting" (stop_server_for_exit), so
+// an exit never misses a server started a moment earlier and nothing is started once the stop has begun.
+static LIFECYCLE: Mutex<()> = Mutex::new(());
+// Set (under LIFECYCLE) when the final stop begins; the app exits after it, so it is never cleared.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+fn lifecycle() -> std::sync::MutexGuard<'static, ()> {
+    LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn server_child() -> std::sync::MutexGuard<'static, Option<OwnServer>> {
+    SERVER_CHILD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl OwnServer {
+    // Reaps the child once it has exited and remembers its status.
+    fn poll(&mut self) -> Option<std::process::ExitStatus> {
+        if self.status.is_none() {
+            self.status = self.child.try_wait().ok().flatten();
+        }
+        self.status
+    }
+}
+
+fn retired() -> std::sync::MutexGuard<'static, Vec<Child>> {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// Reaps retired servers that have exited since the last call.
+fn reap_retired() {
+    retired().retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+}
+
+// Exit status of our server child `pid` once it has exited; None while it runs or when `pid` is not our child.
+fn own_child_status(pid: u32) -> Option<std::process::ExitStatus> {
+    server_child().as_mut().filter(|c| c.child.id() == pid)?.poll()
+}
+
+#[cfg(unix)]
+fn pid_gone(pid: u32) -> bool {
+    if let Some(own) = server_child().as_mut().filter(|c| c.child.id() == pid) {
+        return own.poll().is_some();
+    }
+    let Ok(p) = i32::try_from(pid) else { return true };
+    // EPERM means it exists under another user: still running, like ERROR_ACCESS_DENIED on Windows.
+    let failed = unsafe { kill(p, 0) } != 0;
+    failed && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH)
+}
+
+#[cfg(unix)]
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pid_gone(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// The server leads its own process group (start_server), so signalling the group reaches the Node helpers it started.
+// Agent PTYs run in sessions of their own and get SIGHUP when the server's end of their terminal closes. SIGTERM first
+// gives the server a moment to stop its sessions itself.
+//
+// Only the server this shell started and has not reaped yet is signalled: under the SERVER_CHILD lock its PID, running
+// or a zombie, cannot be reused, so neither can the group ID it leads. Once reaped it is gone and gets nothing. A server
+// we did not start (one run from a terminal, known only from the PID /api/shutdown reported) is never signalled on
+// Unix: that PID carries no identity, so such a server only gets the HTTP shutdown.
+#[cfg(unix)]
+fn kill_pid_tree(pid: u32) {
+    let Ok(p) = i32::try_from(pid) else { return };
+    if p <= 0 {
+        return;
+    }
+    let signal = |sig: i32| -> bool {
+        let guard = server_child();
+        if !guard.as_ref().is_some_and(|c| c.child.id() == pid && c.status.is_none()) {
+            return false;
+        }
+        unsafe {
+            if kill(-p, sig) != 0 {
+                kill(p, sig);
+            }
+        }
+        true
+    };
+    if !signal(SIGTERM) || wait_for_pid_exit(pid, Duration::from_secs(3)) {
+        return;
+    }
+    if signal(SIGKILL) {
+        let _ = wait_for_pid_exit(pid, Duration::from_secs(5));
+    }
+}
+
+#[cfg(windows)]
 fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     if pid == 0 {
         return true;
@@ -51,6 +196,7 @@ fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     res == WAIT_OBJECT_0
 }
 
+#[cfg(windows)]
 fn kill_pid_tree(pid: u32) {
     if pid == 0 {
         return;
@@ -81,13 +227,37 @@ fn server_url() -> Url {
     Url::parse(&format!("http://127.0.0.1:{}/", port())).expect("valid server url")
 }
 
-// Same rule as server/main.ts: WORKBENCH_STATE_DIR, else %LOCALAPPDATA%\agent-workbench while an install from before the
-// rename left one and %LOCALAPPDATA%\Shoal has no state.json yet, else %LOCALAPPDATA%\Shoal. The Shoal folder alone says
-// nothing: the installer puts the app itself there. start_server passes the result on, so both sides use one folder.
+// Same rule as defaultStateDir in server/platform.ts: WORKBENCH_STATE_DIR; else on Windows
+// %LOCALAPPDATA%\agent-workbench while an install from before the rename left one and %LOCALAPPDATA%\Shoal has no
+// state.json yet, else %LOCALAPPDATA%\Shoal (the Shoal folder alone says nothing: the installer puts the app itself
+// there); on macOS ~/Library/Application Support/Shoal. start_server passes the result on, so both sides use one folder.
 fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WORKBENCH_STATE_DIR") {
         return PathBuf::from(dir);
     }
+    default_state_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn default_state_dir() -> PathBuf {
+    home_dir().join("Library").join("Application Support").join("Shoal")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn default_state_dir() -> PathBuf {
+    match std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("Shoal"),
+        None => home_dir().join(".local").join("share").join("Shoal"),
+    }
+}
+
+#[cfg(unix)]
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(windows)]
+fn default_state_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let (dir, old) = (base.join("Shoal"), base.join("agent-workbench"));
     if !dir.join("state.json").is_file() && old.is_dir() { old } else { dir }
@@ -137,15 +307,15 @@ fn tail(path: &PathBuf, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-// Starts resources\app\server\main.ts on the bundled node.exe, detached from the shell: own process group and a
-// hidden console, so agents keep running if the shell dies. Waits until the server answers.
+// Starts resources/app/server/main.ts on the bundled Node, detached from the shell: own process group (and a hidden
+// console on Windows), so agents keep running if the shell dies. Waits until the server answers.
 fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
     if port_taken(port) {
         return Err(format!("端口 {port} 被其他程序占用。\n可以用环境变量 WORKBENCH_PORT 换一个端口后再启动 Shoal。"));
     }
     let res = app.path().resource_dir().map_err(|e| format!("找不到安装目录：{e}"))?;
     let dir = PathBuf::from(res.to_string_lossy().trim_start_matches(r"\\?\")).join("app");
-    let node = dir.join("node.exe");
+    let node = dir.join(NODE_BIN);
     if !node.is_file() {
         return Err(format!("安装不完整，缺少 {}。\n请重新安装 Shoal。", node.display()));
     }
@@ -166,8 +336,8 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
     };
     let out = open_log(&out_path, "server.restart.log")?;
     let err = open_log(&err_path, "server.err.restart.log")?;
-    let mut child = Command::new(&node)
-        .args(["server/main.ts", "--port", &port.to_string()])
+    let mut cmd = Command::new(&node);
+    cmd.args(["server/main.ts", "--port", &port.to_string()])
         .current_dir(&dir)
         // Only the bundled runtime decides how the server runs: no inherited Node flags, preloads or module paths.
         .env_remove("NODE_OPTIONS")
@@ -175,21 +345,39 @@ fn start_server(app: &AppHandle, port: u16) -> Result<(), String> {
         .env("WORKBENCH_BUNDLED", "1")
         // The server must use the folder this shell reads its logs from.
         .env("WORKBENCH_STATE_DIR", &state)
-        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::null())
         .stdout(out)
-        .stderr(err)
-        .spawn()
-        .map_err(|e| format!("无法启动 {}：{e}", node.display()))?;
-    SERVER_PID.store(child.id(), Ordering::SeqCst);
+        .stderr(err);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    // Own process group: signals meant for the shell's group (Ctrl+C in a terminal that started it) skip the server.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let pid = {
+        let _lifecycle = lifecycle();
+        if STOPPING.load(Ordering::SeqCst) {
+            return Err("Shoal 正在退出。".into());
+        }
+        let child = cmd.spawn().map_err(|e| format!("无法启动 {}：{e}", node.display()))?;
+        let pid = child.id();
+        SERVER_PID.store(pid, Ordering::SeqCst);
+        // Replacing the handle of a server the watchdog restarts: reap it if it has exited, otherwise keep its handle
+        // until it does, so it never stays behind as a zombie.
+        if let Some(mut old) = server_child().replace(OwnServer { child, status: None }) {
+            if old.poll().is_none() {
+                retired().push(old.child);
+            }
+        }
+        pid
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     while !server_ready(port) {
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Some(status) = own_child_status(pid) {
             SERVER_PID.store(0, Ordering::SeqCst);
             return Err(format!("服务启动失败（{status}），日志：{}\n\n{}", err_path.display(), tail(&err_path, 20)));
         }
         if Instant::now() > deadline {
-            kill_pid_tree(child.id());
+            kill_pid_tree(pid);
             SERVER_PID.store(0, Ordering::SeqCst);
             return Err(format!("30 秒内服务没有就绪，日志：{}", out_path.display()));
         }
@@ -262,11 +450,21 @@ fn quit(app: &AppHandle) {
         if let Some(w) = app.get_webview_window("main") {
             let _ = w.hide();
         }
-        if live.is_some() || SERVER_PID.load(Ordering::SeqCst) != 0 {
-            stop_server(port, live.unwrap_or(0) > 0);
-        }
+        stop_server_for_exit(port, live);
         app.exit(0);
     });
+}
+
+// `live`: what live_sessions(port) returned just before. Runs at most once; a second caller (macOS: RunEvent::Exit
+// while quit() is still stopping the server) waits for the first to finish and returns.
+fn stop_server_for_exit(port: u16, live: Option<usize>) {
+    let _lifecycle = lifecycle();
+    if STOPPING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if live.is_some() || SERVER_PID.load(Ordering::SeqCst) != 0 {
+        stop_server(port, live.unwrap_or(0) > 0);
+    }
 }
 
 fn call(w: &WebviewWindow, func: &str, text: &str) {
@@ -308,8 +506,14 @@ fn spawn_watchdog(app: AppHandle) {
         let mut failures: u32 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(3));
-            if QUITTING.load(Ordering::SeqCst) {
+            reap_retired();
+            if STOPPING.load(Ordering::SeqCst) {
                 break;
+            }
+            // A quit waiting for its confirmation may still be cancelled: skip this round, keep watching.
+            if QUITTING.load(Ordering::SeqCst) {
+                missed = 0;
+                continue;
             }
             if !WATCHDOG_ARMED.load(Ordering::SeqCst) || CONNECTING.load(Ordering::SeqCst) {
                 missed = 0;
@@ -352,9 +556,26 @@ fn show(app: &AppHandle) {
     }
 }
 
+fn splash_url() -> Url {
+    Url::parse(SPLASH_URL).expect("valid splash url")
+}
+
+#[cfg(windows)]
+fn is_splash(url: &Url) -> bool {
+    url.host_str() == splash_url().host_str()
+}
+
+#[cfg(not(windows))]
+fn is_splash(url: &Url) -> bool {
+    let splash = splash_url();
+    url.scheme() == splash.scheme() && url.host_str() == splash.host_str()
+}
+
 fn is_internal(url: &Url) -> bool {
+    if is_splash(url) {
+        return true;
+    }
     match url.host_str() {
-        Some(SPLASH_HOST) => true,
         Some("127.0.0.1") => url.port() == Some(port()),
         _ => url.scheme() == "about",
     }
@@ -374,9 +595,11 @@ fn waiting_count(title: &str) -> u32 {
 fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let nav_app = app.clone();
     let popup_app = app.clone();
+    #[allow(unused_mut)]
     let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()));
     // For the shell's e2e: expose CDP. Tauri passes its own browser args, so WebView2 ignores
     // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS; repeat Tauri's defaults when overriding them.
+    #[cfg(windows)]
     if let Ok(p) = std::env::var("WORKBENCH_DEVTOOLS_PORT") {
         builder = builder.additional_browser_args(&format!(
             "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={p}"
@@ -414,13 +637,15 @@ fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
             }
         })
         .on_page_load(|w, payload| {
-            if payload.event() == PageLoadEvent::Finished && payload.url().host_str() == Some(SPLASH_HOST) {
+            if payload.event() == PageLoadEvent::Finished && is_splash(payload.url()) {
                 connect(w.clone());
             }
         })
         .build()?;
 
-    // Hand Ctrl+F, Ctrl+P, Ctrl+R, F5 and the like to the page (and the terminal) instead of WebView2.
+    // Hand Ctrl+F, Ctrl+P, Ctrl+R, F5 and the like to the page (and the terminal) instead of WebView2. WKWebView has no
+    // such shortcuts of its own; on macOS only the app menu (create_app_menu) claims keys.
+    #[cfg(windows)]
     w.with_webview(|pw| unsafe {
         use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
         use windows_core::Interface;
@@ -435,7 +660,7 @@ fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     w.on_window_event(move |e| {
         if let WindowEvent::CloseRequested { api, .. } = e {
             api.prevent_close();
-            quit(&quit_app);
+            on_close_requested(&quit_app);
         }
     });
     w.show()?;
@@ -465,7 +690,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
                 if let Some(w) = app.get_webview_window("main") {
                     WATCHDOG_ARMED.store(false, Ordering::SeqCst);
                     // Back to the splash page, which reconnects (and restarts the server if it has stopped).
-                    let _ = w.navigate(Url::parse(&format!("http://{SPLASH_HOST}/index.html")).unwrap());
+                    let _ = w.navigate(splash_url());
                     show(app);
                 }
             }
@@ -481,6 +706,99 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+// Windows: closing the window quits (the tray icon keeps the workbench reachable only while it runs).
+#[cfg(not(target_os = "macos"))]
+fn on_close_requested(app: &AppHandle) {
+    quit(app);
+}
+
+// macOS: closing the window only hides it, as Mac apps do; the Dock icon brings it back (RunEvent::Reopen) and
+// Cmd+Q, the menu bar icon's 退出 or the Dock's Quit end the app.
+#[cfg(target_os = "macos")]
+fn on_close_requested(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MENU_QUIT: &str = "app-quit";
+
+// Tauri's default macOS menu, except Quit: the predefined item sends terminate: and the process ends at once, skipping
+// the confirmation for running agents. Without the Edit menu, Cmd+C / Cmd+V would not reach the webview.
+#[cfg(target_os = "macos")]
+fn create_app_menu(app: &AppHandle) -> tauri::Result<()> {
+    let app_menu = Submenu::with_items(
+        app,
+        "Shoal",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("关于 Shoal"), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::services(app, Some("服务"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, Some("隐藏 Shoal"))?,
+            &PredefinedMenuItem::hide_others(app, Some("隐藏其他"))?,
+            &PredefinedMenuItem::show_all(app, Some("全部显示"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, MENU_QUIT, "退出 Shoal", true, Some("CmdOrCtrl+Q"))?,
+        ],
+    )?;
+    let edit_menu = Submenu::with_items(
+        app,
+        "编辑",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, Some("撤销"))?,
+            &PredefinedMenuItem::redo(app, Some("重做"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, Some("剪切"))?,
+            &PredefinedMenuItem::copy(app, Some("拷贝"))?,
+            &PredefinedMenuItem::paste(app, Some("粘贴"))?,
+            &PredefinedMenuItem::select_all(app, Some("全选"))?,
+        ],
+    )?;
+    let window_menu = Submenu::with_items(
+        app,
+        "窗口",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, Some("最小化"))?,
+            &PredefinedMenuItem::maximize(app, Some("缩放"))?,
+            &PredefinedMenuItem::fullscreen(app, Some("切换全屏幕"))?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, Some("关闭窗口"))?,
+        ],
+    )?;
+    app.set_menu(Menu::with_items(app, &[&app_menu, &edit_menu, &window_menu])?)?;
+    app.on_menu_event(|app, event| {
+        if event.id().as_ref() == MENU_QUIT {
+            quit(app);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn on_run_event(app: &AppHandle, event: tauri::RunEvent) {
+    match event {
+        tauri::RunEvent::Reopen { .. } => show(app),
+        // Every exit ends here, also one that did not come through quit() or came while its confirmation was still open
+        // (the Dock's Quit, logging out): Tauri cannot cancel it, so stop the server, without asking, before the process
+        // ends. While quit() is stopping it this waits for that stop; after it, it returns at once.
+        tauri::RunEvent::Exit => {
+            QUITTING.store(true, Ordering::SeqCst);
+            let port = port();
+            let live = if STOPPING.load(Ordering::SeqCst) { None } else { live_sessions(port) };
+            stop_server_for_exit(port, live);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn on_run_event(_app: &AppHandle, _event: tauri::RunEvent) {}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
@@ -493,11 +811,14 @@ fn main() {
                 .build(),
         )
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            create_app_menu(app.handle())?;
             create_window(app.handle())?;
             create_tray(app.handle())?;
             spawn_watchdog(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Shoal");
+        .build(tauri::generate_context!())
+        .expect("error while running Shoal")
+        .run(on_run_event);
 }

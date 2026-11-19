@@ -158,6 +158,113 @@ test('live activity HUD: Chinese tool steps, zero PTY resize, file click -> Insp
   expect(await page.evaluate((id) => (window as any).__wbTermSize(id), sid)).toEqual(initialSize);
 });
 
+test('floating HUD shrinks its own composited layer tightly without ghost margins or narrow-pane overflow', async ({ page, request }) => {
+  const projName = token('hud-layer');
+  const project = await createProject(request, projName);
+  const { session } = await createFakeTask(request, project.id, '浮层合成层回归', 'sleep 60');
+  const sid = session.id;
+
+  await page.goto('/');
+  await expectStatus(page, sid, 'working');
+
+  const p0 = pane(page, 0);
+  await row(page, sid).click();
+  await expect(p0).toHaveAttribute('data-session-id', sid);
+
+  const hud = p0.getByTestId('activity-hud');
+  const pill = p0.getByTestId('activity-toggle');
+  await expect(hud).toBeVisible();
+
+  const initialSize = await page.evaluate((id) => (window as any).__wbTermSize(id), sid);
+  const transcriptPath = path.join(os.tmpdir(), 'shoal-fake', `fake-${sid}.jsonl`);
+  await expect.poll(() => fs.existsSync(transcriptPath)).toBe(true);
+
+  const appendStep = (stepIndex: number, toolSummary: string) => {
+    fs.appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        step_index: stepIndex,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date().toISOString(),
+        tool_calls: [{ name: 'default_api:run_command', args: { CommandLine: '"echo ok"', toolSummary: JSON.stringify(toolSummary) } }],
+      }) + '\n',
+    );
+  };
+
+  // Ultra-long summary (> 34rem cap): HUD container must cap at 34rem tightly with 0px transparent apron on the left!
+  appendStep(
+    1,
+    '已将修复清单、85/85 自测日志及 7/7 实机 GPU 验证结果写入汇总报告并完成多轮复核确认所有合成层宽度精确贴合胶囊边缘不再留出透明区域',
+  );
+  await expect(p0.getByTestId('activity-summary')).toContainText('已将修复清单');
+  const stageBox = (await p0.locator('.pane-stage').boundingBox())!;
+  const wideHudBox = (await hud.boundingBox())!;
+  const widePillBox = (await pill.boundingBox())!;
+  expect(wideHudBox.width).toBeLessThanOrEqual(widePillBox.width + 2);
+  expect(wideHudBox.width).toBeLessThanOrEqual(550);
+  expect(wideHudBox.width).toBeLessThan(stageBox.width - 100);
+  expect(wideHudBox.height).toBeCloseTo(widePillBox.height, 1);
+
+  const pillCss = await pill.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    const hudCs = getComputedStyle(el.closest('.activity-hud')!);
+    return {
+      backdropFilter: cs.backdropFilter,
+      boxShadow: cs.boxShadow,
+      hudTransform: hudCs.transform,
+      dotAnim: getComputedStyle(el.querySelector('.activity-dot')!).animationName,
+    };
+  });
+  expect(pillCss.backdropFilter).toBe('none');
+  expect(pillCss.boxShadow).toBe('none');
+  expect(pillCss.hudTransform).not.toBe('none');
+  expect(pillCss.dotAnim).toBe('hud-pulse');
+
+  // Shrink to a short summary -> HUD container itself shrinks with the pill so no transparent left apron stays over WebGL.
+  appendStep(2, '正在推理');
+  await expect(p0.getByTestId('activity-summary')).toHaveText('正在推理');
+  const narrowHudBox = (await hud.boundingBox())!;
+  const narrowPillBox = (await pill.boundingBox())!;
+  expect(narrowHudBox.width).toBeLessThan(wideHudBox.width - 120);
+  expect(narrowHudBox.width).toBeCloseTo(narrowPillBox.width, 1);
+  expect(narrowHudBox.height).toBeCloseTo(narrowPillBox.height, 1);
+
+  // Open popover on wide pane -> expands cleanly to ~28rem and stays inside .pane-stage; closing shrinks HUD back.
+  await pill.click();
+  const pop = p0.getByTestId('activity-popover');
+  await expect(pop).toBeVisible();
+  const widePopBox = (await pop.boundingBox())!;
+  expect(widePopBox.width).toBeGreaterThan(360);
+  expect(widePopBox.x).toBeGreaterThanOrEqual(stageBox.x);
+  expect(widePopBox.x + widePopBox.width).toBeLessThanOrEqual(stageBox.x + stageBox.width + 1);
+
+  // Narrow viewport + dual pane: switching layout closes popover via outside mousedown; reopen and verify clamping.
+  await page.setViewportSize({ width: 920, height: 700 });
+  await page.getByTestId('layout-2').click();
+  await expect(pop).toHaveCount(0);
+  await pill.click();
+  await expect(pop).toBeVisible();
+  const narrowStageBox = (await p0.locator('.pane-stage').boundingBox())!;
+  const clampedPopBox = (await pop.boundingBox())!;
+  expect(clampedPopBox.x).toBeGreaterThanOrEqual(narrowStageBox.x);
+  expect(clampedPopBox.x + clampedPopBox.width).toBeLessThanOrEqual(narrowStageBox.x + narrowStageBox.width + 1);
+
+  await pill.click();
+  await expect(pop).toHaveCount(0);
+  const afterCloseBox = (await hud.boundingBox())!;
+  expect(afterCloseBox.height).toBeCloseTo((await pill.boundingBox())!.height, 1);
+
+  // Restore viewport & single-pane layout and verify zero stray PTY resize during HUD shrink on steady viewport.
+  await page.getByTestId('layout-1').click();
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await expect.poll(async () => (await page.evaluate((id) => (window as any).__wbTermSize(id), sid))).toEqual(initialSize);
+  appendStep(3, '收尾');
+  await expect(p0.getByTestId('activity-summary')).toHaveText('收尾');
+  expect(await page.evaluate((id) => (window as any).__wbTermSize(id), sid)).toEqual(initialSize);
+});
+
 test('settings dialog: Antigravity model tier selector persists Orchestrator (Carbon) and excludes 3.8-flash', async ({ page, request }) => {
   await page.goto('/');
   await page.getByTestId('settings-btn').click();

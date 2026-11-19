@@ -292,7 +292,18 @@ async function waitUp(api: APIRequestContext) {
   throw new Error('restart server did not come up');
 }
 
-const hardKill = (p: ChildProcess) => spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { stdio: 'ignore' });
+// Windows: kill the whole tree (the server's ConPTY children too). POSIX: SIGKILL the server and wait for it to exit,
+// so the next server can bind the same port.
+async function hardKill(p: ChildProcess) {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { stdio: 'ignore' });
+    return;
+  }
+  if (p.exitCode !== null || p.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => p.once('exit', () => resolve()));
+  p.kill('SIGKILL');
+  await exited;
+}
 
 test('待验收重启：强杀后卡片、阶段和反馈记录都还在，续接后可以继续反馈', async ({ page }) => {
   fs.rmSync(RDIR, { recursive: true, force: true });
@@ -309,7 +320,7 @@ test('待验收重启：强杀后卡片、阶段和反馈记录都还在，续�
     await api.post(`/api/tasks/${b.task.id}/archive`, { data: {} });
     page.on('dialog', (d) => d.accept());
 
-    hardKill(srv);
+    await hardKill(srv);
     srv = startServer(2);
     await waitUp(api);
 
@@ -336,6 +347,6 @@ test('待验收重启：强杀后卡片、阶段和反馈记录都还在，续�
     await page.screenshot({ path: path.join(RDIR, 'after-restart.png') });
   } finally {
     await api.dispose();
-    hardKill(srv);
+    await hardKill(srv);
   }
 });

@@ -25,7 +25,7 @@ export function findCloudflaredBinary(): string | null {
         'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe',
         'C:\\Program Files\\cloudflared\\cloudflared.exe',
       ]
-    : ['/usr/local/bin/cloudflared', '/usr/bin/cloudflared'];
+    : ['/opt/homebrew/bin/cloudflared', '/usr/local/bin/cloudflared', '/usr/bin/cloudflared'];
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }

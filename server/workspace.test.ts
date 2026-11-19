@@ -41,15 +41,23 @@ describe('resolveProjectPath security boundaries', () => {
     fs.writeFileSync(path.join(root, 'src', 'index.ts'), 'export {};\n');
     fs.writeFileSync(path.join(outside, 'secret.txt'), 'top-secret');
 
-    const ok = resolveProjectPath(root, 'src\\index.ts');
+    // A backslash only separates path parts on Windows; on POSIX it is part of a file name.
+    const bs = (p: string) => (path.sep === '\\' ? p : p.replaceAll('\\', '/'));
+    const ok = resolveProjectPath(root, bs('src\\index.ts'));
     expect(ok.relPosix).toBe('src/index.ts');
 
     expect(() => resolveProjectPath(root, '../outside/secret.txt')).toThrow(WorkspaceError);
     expect(() => resolveProjectPath(root, 'src/../../outside/secret.txt')).toThrow(WorkspaceError);
     expect(() => resolveProjectPath(root, '\\\\evil\\share\\a.txt')).toThrow(WorkspaceError);
-    expect(() => resolveProjectPath(root, path.join(outside, 'secret.txt'))).toThrow(WorkspaceError);
+    if (process.platform === 'win32') {
+      expect(() => resolveProjectPath(root, path.join(outside, 'secret.txt'))).toThrow(WorkspaceError);
+    } else {
+      // A drive path is refused on Windows; on POSIX a leading / is dropped, so it can only land inside the project.
+      const inside = resolveProjectPath(root, path.join(outside, 'secret.txt'));
+      expect(inside.absPath.startsWith(inside.realRoot + path.sep)).toBe(true);
+    }
     expect(() => resolveProjectPath(root, '.git/config')).toThrow(WorkspaceError);
-    expect(() => resolveProjectPath(root, '.GIT\\HEAD')).toThrow(WorkspaceError);
+    expect(() => resolveProjectPath(root, bs('.GIT\\HEAD'))).toThrow(WorkspaceError);
 
     // Directory junction pointing outside project root (works on Windows without admin rights)
     const linkDir = path.join(root, 'linked-out');
@@ -204,16 +212,24 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
 
   it('parses terminal file links and matches deepest in-project files while leaving external/exe links untouched', () => {
     expect(parseLocalFileLink('file:///G:/Workspace/app/src/%E4%B8%AD%E6%96%87.ts#L12C3')).toEqual({
-      winPath: 'G:\\Workspace\\app\\src\\中文.ts',
+      localPath: 'G:\\Workspace\\app\\src\\中文.ts',
       line: 12,
       col: 3,
     });
     expect(parseLocalFileLink('G:\\Workspace\\app\\src\\auth.ts:42:5')).toEqual({
-      winPath: 'G:\\Workspace\\app\\src\\auth.ts',
+      localPath: 'G:\\Workspace\\app\\src\\auth.ts',
       line: 42,
       col: 5,
     });
     expect(parseLocalFileLink('\\\\evil-host\\share\\a.ts')).toBeNull();
+
+    // POSIX links: file URL with fragment, bare path with colon suffix, lexical .. folding, //-rooted and remote rejected
+    expect(parseLocalFileLink('file:///Users/a/b%20c.ts#L3C1')).toEqual({ localPath: '/Users/a/b c.ts', line: 3, col: 1 });
+    expect(parseLocalFileLink('/Users/a/./x/../b.ts:12:3')).toEqual({ localPath: '/Users/a/b.ts', line: 12, col: 3 });
+    expect(parseLocalFileLink('/Users/a/b.ts#L7')).toEqual({ localPath: '/Users/a/b.ts', line: 7 });
+    expect(parseLocalFileLink('//host/a.ts')).toBeNull();
+    expect(parseLocalFileLink('file://host/Users/a.ts')).toBeNull();
+    expect(parseLocalFileLink('relative/a.ts')).toBeNull();
 
     const projects = [
       { id: 'p-outer', name: 'outer', path: 'G:\\Workspace', createdAt: 1 },
@@ -229,6 +245,24 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     expect(matchProjectFileLink('G:\\Workspace\\app\\tool.exe', projects)).toBeNull();
     expect(matchProjectFileLink('G:\\Workspace\\app\\.git\\config', projects)).toBeNull();
     expect(matchProjectFileLink('C:\\Temp\\random.ts#L3', projects)).toBeNull();
+
+    // POSIX projects: deepest wins, case-sensitive, .git and app bundles / installers stay external, Windows links never match
+    const posixProjects = [
+      { id: 'q-outer', name: 'outer', path: '/Users/a/work/', createdAt: 1 },
+      { id: 'q-inner', name: 'inner', path: '/Users/a/work/app', createdAt: 2 },
+    ];
+    const posixHit = matchProjectFileLink('/Users/a/work/app/src/Auth.ts:42:5', posixProjects);
+    expect(posixHit?.project.id).toBe('q-inner');
+    expect(posixHit?.relPosix).toBe('src/Auth.ts');
+    expect(posixHit?.line).toBe(42);
+    expect(matchProjectFileLink('file:///Users/a/work/readme.md#L2', posixProjects)?.project.id).toBe('q-outer');
+    expect(matchProjectFileLink('/users/a/work/app/src/a.ts', posixProjects)).toBeNull();
+    expect(matchProjectFileLink('/Users/a/work/app/.git/config', posixProjects)).toBeNull();
+    for (const f of ['Foo.app', 'run.command', 'x.dmg', 'x.pkg', 'x.exe']) {
+      expect(matchProjectFileLink('/Users/a/work/' + f, posixProjects)).toBeNull();
+    }
+    expect(matchProjectFileLink('G:\\Workspace\\app\\src\\auth.ts', posixProjects)).toBeNull();
+    expect(matchProjectFileLink('/Users/a/work/app/src/a.ts', projects)).toBeNull();
   });
 });
 

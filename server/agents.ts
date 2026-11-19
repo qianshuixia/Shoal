@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import type { AgentKind } from '../shared/protocol.ts';
 import { isValidAgyModel } from '../shared/protocol.ts';
+import { findExecutable } from './platform.ts';
 
 // Hook commands go through shells that quote badly (agy uses `cmd /c`), so a path with spaces falls back to its
 // 8.3 short form when the volume has one. Shorten only the directory when the filename has no spaces: `%~sI` on a >8-char
@@ -50,6 +51,60 @@ const localAppdata = () => process.env.LOCALAPPDATA ?? '';
 const claudeExe = () => path.join(appdata(), 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
 const codexJs = () => path.join(appdata(), 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
 const agyExe = () => path.join(localAppdata(), 'agy', 'bin', 'agy.exe');
+
+// POSIX CLI lookup: PATH first, then the usual install locations (a GUI launch may not have the user's PATH).
+// win32 keeps the fixed npm / agy paths above and never goes through the lookups.
+export interface CliEnv {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+  delimiter?: string; // PATH separator, only overridden by tests that build PATH from Windows temp dirs
+}
+const firstExisting = (cands: string[]) => cands.find(p => fs.existsSync(p)) ?? null;
+const ctx = (c: CliEnv) => ({ platform: c.platform ?? process.platform, env: c.env ?? process.env, home: c.home ?? os.homedir(), delimiter: c.delimiter });
+
+export function resolveClaude(c: CliEnv = {}): string | null {
+  const { platform, env, home, delimiter } = ctx(c);
+  if (platform === 'win32') return claudeExe();
+  return findExecutable('claude', env, platform, delimiter) ?? firstExisting([
+    path.posix.join(home, '.local', 'bin', 'claude'),
+    path.posix.join(home, '.claude', 'local', 'claude'),
+    '/opt/homebrew/bin/claude',
+    '/usr/local/bin/claude',
+  ]);
+}
+
+export function resolveAgy(c: CliEnv = {}): string | null {
+  const { platform, env, home, delimiter } = ctx(c);
+  if (platform === 'win32') return agyExe();
+  return findExecutable('agy', env, platform, delimiter) ?? firstExisting([path.posix.join(home, '.local', 'bin', 'agy')]);
+}
+
+// Where the codex entry point is: on win32 the npm-installed codex.js; on POSIX whatever `codex` resolves to.
+export function resolveCodex(c: CliEnv = {}): string | null {
+  const { platform, env, home, delimiter } = ctx(c);
+  if (platform === 'win32') return codexJs();
+  return findExecutable('codex', env, platform, delimiter) ?? firstExisting([
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+    path.posix.join(home, '.local', 'bin', 'codex'),
+  ]);
+}
+
+// An npm-installed codex is a symlink to @openai/codex/bin/codex.js: run that on the bundled Node like on Windows.
+// Anything else (e.g. Homebrew's native binary) is executed by the path found, not its target: version-manager shims
+// (Volta, mise, asdf) are links to one binary that tells the tools apart by argv[0].
+export function codexLaunchFor(resolved: string): { file: string; prefix: string[] } {
+  let real = resolved;
+  try { real = fs.realpathSync(resolved); } catch { /* keep as is */ }
+  return real.toLowerCase().endsWith('.js') ? { file: process.execPath, prefix: [real] } : { file: resolved, prefix: [] };
+}
+
+export function codexLaunch(c: CliEnv = {}): { file: string; prefix: string[] } {
+  if ((c.platform ?? process.platform) === 'win32') return { file: process.execPath, prefix: [codexJs()] };
+  const found = resolveCodex(c);
+  return found ? codexLaunchFor(found) : { file: 'codex', prefix: [] };
+}
 
 const CLAUDE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure', 'Notification', 'PermissionRequest'];
 const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PermissionRequest'];
@@ -267,9 +322,10 @@ export function claudeResumeId(native: string | null, transcriptPath: string | u
 
 export function availableAgents(): AgentKind[] {
   const out: AgentKind[] = [];
-  if (fs.existsSync(claudeExe())) out.push('claude');
-  if (fs.existsSync(codexJs())) out.push('codex');
-  if (fs.existsSync(agyExe()) && agyUsable()) out.push('agy');
+  const claude = resolveClaude(), codex = resolveCodex(), agy = resolveAgy();
+  if (claude && fs.existsSync(claude)) out.push('claude');
+  if (codex && fs.existsSync(codex)) out.push('codex');
+  if (agy && fs.existsSync(agy) && agyUsable()) out.push('agy');
   if (process.env.WORKBENCH_FAKE_AGENT === '1') out.push('fake');
   return out;
 }
@@ -396,10 +452,11 @@ export function buildLaunch(opts: {
       const args = [resume ? '--resume' : '--session-id', native, '--settings', path.join(stateDir, 'claude-hooks.json').replaceAll('\\', '/'), FULL_ACCESS.claude];
       if (instructions) args.push('--append-system-prompt', instructions);
       if (prompt) args.push(prompt);
-      return { file: claudeExe(), args, nativeSessionId: native };
+      return { file: resolveClaude() ?? 'claude', args, nativeSessionId: native };
     }
     case 'codex': {
-      const args = [codexJs()];
+      const { file, prefix } = codexLaunch();
+      const args = [...prefix];
       if (resume) args.push('resume', resume);
       // Byte-identical to spikes/probe.mjs: Codex stores trust hashes of these strings.
       for (const ev of CODEX_EVENTS) args.push('-c', `hooks.${ev}=[{hooks=[{type="command",command='${hookCmd('codex', ev)}',timeout=5}]}]`);
@@ -407,7 +464,7 @@ export function buildLaunch(opts: {
       if (instructions && !codexHasUserDeveloperInstructions()) args.push('-c', `developer_instructions=${JSON.stringify(instructions)}`);
       args.push('-c', 'check_for_update_on_startup=false', FULL_ACCESS.codex);
       if (prompt) args.push(prompt);
-      return { file: process.execPath, args, nativeSessionId: resume ?? null };
+      return { file, args, nativeSessionId: resume ?? null };
     }
     case 'agy': {
       const args = resume ? ['--conversation', resume] : [];
@@ -427,7 +484,7 @@ export function buildLaunch(opts: {
       args.push(FULL_ACCESS.agy);
       if (model && isValidAgyModel(model)) args.push('--model', model);
       if (prompt) args.push('-i', prompt);
-      return { file: agyExe(), args, nativeSessionId: resume ?? null };
+      return { file: resolveAgy() ?? 'agy', args, nativeSessionId: resume ?? null };
     }
     case 'fake': {
       const args = [FAKE_AGENT];
@@ -452,13 +509,15 @@ export interface GeneratorLaunch {
 export function buildGenerator(agent: AgentKind, prompt: string, outFile: string): GeneratorLaunch | null {
   switch (agent) {
     case 'claude':
-      return { file: claudeExe(), args: ['-p', '--model', 'haiku', '--tools', '', '--no-session-persistence'], stdin: prompt, outFile: null };
-    case 'codex':
+      return { file: resolveClaude() ?? 'claude', args: ['-p', '--model', 'haiku', '--tools', '', '--no-session-persistence'], stdin: prompt, outFile: null };
+    case 'codex': {
+      const { file, prefix } = codexLaunch();
       return {
-        file: process.execPath,
-        args: [codexJs(), 'exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '-c', 'model_reasoning_effort="low"', '-o', outFile, '-'],
+        file,
+        args: [...prefix, 'exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '-c', 'model_reasoning_effort="low"', '-o', outFile, '-'],
         stdin: prompt, outFile,
       };
+    }
     case 'agy':
       return null;
     case 'fake':

@@ -5,7 +5,8 @@ import type {
 } from '../../shared/protocol.ts';
 import { AGENT_LABEL, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
 import { connect, send } from './ws.ts';
-import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termText, writeOut } from './terms.ts';
+import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
+import type { TermGlDebug } from './terms.ts';
 import { ACTIVITY_STALL_MS, Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
 import { matchProjectFileLink } from './linkParse.ts';
@@ -32,6 +33,7 @@ declare global {
     __wbTermText?: (sessionId: string) => string;
     __wbTermFontSize?: (sessionId: string) => number | null;
     __wbTermSize?: (sessionId: string) => { cols: number; rows: number } | null;
+    __wbTermGlState?: (sessionId: string, opts?: { fireWindowChange?: boolean }) => TermGlDebug;
   }
 }
 
@@ -423,9 +425,11 @@ export function App() {
   }, []);
 
   const inspectActivityFile = useCallback(async (rawPath: string, fallbackProject?: Project) => {
-    const candidate = /^[A-Za-z]:[\\/]|^file:/i.test(rawPath.trim()) || !fallbackProject
+    // A POSIX project (path starts with /) also treats a leading / as absolute and joins with /.
+    const posixProject = fallbackProject?.path.startsWith('/') === true;
+    const candidate = /^[A-Za-z]:[\\/]|^file:/i.test(rawPath.trim()) || (posixProject && rawPath.trim().startsWith('/')) || !fallbackProject
       ? rawPath
-      : `${fallbackProject.path.replace(/[\\/]+$/, '')}\\${rawPath.replace(/^[\\/]+/, '')}`;
+      : `${fallbackProject.path.replace(/[\\/]+$/, '')}${posixProject ? '/' : '\\'}${rawPath.replace(/^[\\/]+/, '')}`;
     const match = matchProjectFileLink(candidate, live.current.data.projects);
     if (match) {
       try {
@@ -452,6 +456,7 @@ export function App() {
     window.__wbTermText = termText;
     window.__wbTermFontSize = termFontSize;
     window.__wbTermSize = sizeOf;
+    window.__wbTermGlState = termGlDebug;
     setTermNotice(setNotice);
     setTermFileLinkHandler(async (uri: string) => {
       const match = matchProjectFileLink(uri, live.current.data.projects);

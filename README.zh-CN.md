@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-本机多 agent 工作台：在一个网页（或 Tauri 桌面端）里同时管理 Claude Code、Codex、agy 的原生交互式会话（node-pty + ConPTY），用颜色区分任务，用 hooks 判断每个会话是在工作还是在等你。版本更新记录见 [CHANGELOG.md](CHANGELOG.md)，需求与方案见 [docs/v1-spec.md](docs/v1-spec.md)（[English](docs/v1-spec.en.md)）、[docs/inspector-spec.md](docs/inspector-spec.md) 与 [docs/collab-spec.md](docs/collab-spec.md)。
+本机多 agent 工作台（Windows 和 macOS）：在一个网页（或 Tauri 桌面端）里同时管理 Claude Code、Codex、agy 的原生交互式会话（node-pty，Windows 上走 ConPTY），用颜色区分任务，用 hooks 判断每个会话是在工作还是在等你。版本更新记录见 [CHANGELOG.md](CHANGELOG.md)，需求与方案见 [docs/v1-spec.md](docs/v1-spec.md)（[English](docs/v1-spec.en.md)）、[docs/inspector-spec.md](docs/inspector-spec.md) 与 [docs/collab-spec.md](docs/collab-spec.md)。
 
 > [!WARNING]
 > 三家 CLI 都以完全权限启动（跳过审批，codex 关闭沙箱），agent 可以直接改文件、跑命令。只在你信任的项目目录里使用，详见下文「权限」。
@@ -11,15 +11,15 @@
 
 ## 运行
 
-要求：Windows，Node 24（直接运行 `.ts`），已安装并登录要用的 CLI；工作台路径不能含空格（agy 的 hook 命令不能加引号）。
+要求：Windows 或 macOS 13.5 及以上，Node 24（直接运行 `.ts`），已安装并登录要用的 CLI；工作台路径不能含空格（agy 的 hook 命令不能加引号）。
 
 ```sh
 npm install
 npm run build
-npm start            # 打开 http://127.0.0.1:47800
+npm start            # 在 http://127.0.0.1:47800 提供服务，用浏览器打开
 ```
 
-一键启动 / 停止：双击项目根目录的 `start.cmd`、`stop.cmd`，或在 PowerShell 里运行：
+一键启动 / 停止（仅 Windows；macOS 上运行 `npm start` 后在浏览器打开 http://127.0.0.1:47800，`Ctrl+C` 停止）：双击项目根目录的 `start.cmd`、`stop.cmd`，或在 PowerShell 里运行：
 
 ```powershell
 scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser]
@@ -30,30 +30,36 @@ scripts\workbench.ps1 start|stop|restart|status [-Port <n>] [-Force] [-NoBrowser
 - `status`：显示 PID、启动时间和在运行的会话数；未运行时退出码 3。
 - 日志：`<stateDir>\server.log`、`server.err.log`；上一次运行的日志保留为 `server.prev.log`、`server.err.prev.log`，崩溃原因不会随重启丢失。端口被别的程序占用时会报出占用者。
 
-桌面端（Tauri 2 外壳，`desktop/`）：在 WebView2 窗口里打开工作台。安装包自包含：自带 Node 运行时（版本固定在 `scripts/stage-desktop.mjs`）、服务端、构建好的前端和生产依赖 `node_modules`，本机不需要 clone 仓库，也不需要 Node 或 npm；只需装好并登录要用的 CLI（Claude Code、Codex CLI、agy）。
+桌面端（Tauri 2 外壳，`desktop/`）：在 WebView2（Windows）或 WKWebView（macOS）窗口里打开工作台。安装包自包含：自带 Node 运行时（版本固定在 `scripts/stage-desktop.mjs`）、服务端、构建好的前端和生产依赖 `node_modules`，本机不需要 clone 仓库，也不需要 Node 或 npm；只需装好并登录要用的 CLI（Claude Code、Codex CLI、agy）。
 
 ```sh
 npm run desktop:build   # 需要 Rust；产出 desktop\src-tauri\target\release\bundle\nsis\Shoal_<版本>_x64-setup.exe
+                        # macOS 上产出 bundle/macos/Shoal.app 和 bundle/dmg/Shoal_<版本>_<aarch64|x64>.dmg（本机架构）
 build-desktop.cmd       # 同样的构建，先升版本号：默认 patch，也可传 minor / major / x.y.z / keep
+build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 macOS runner 构建后下载到本机；arm64（默认）/ x64 / all
 ```
 
 `build-desktop.cmd`（或 `node scripts/build-desktop.mjs`）把新版本号写入 `tauri.conf.json`、`Cargo.toml` 和 `Cargo.lock`，构建后打开安装包所在目录；构建失败会恢复原版本号。不提交也不打 tag。
 
-构建会先运行 `scripts/stage-desktop.mjs`：下载固定版本的 `node.exe`（校验 SHA-256），构建 `web/dist`，把所有内容放进 `desktop/bundle`（安装后位于 `resources\app`）。运行 `npm run desktop:dev` 或 `cargo check` 前需先手动跑一次。
+`.dmg` 只能在 Mac 上构建，所以 `build-desktop.cmd mac`（或 `node scripts/build-mac.mjs`）让 `.github/workflows/mac-build.yml` 去构建，再把镜像下载到 `desktop\src-tauri	argeteleaseundle\mac-ci`。它构建的是已推送到 GitHub 的 HEAD，所以要先推送分支；未提交的改动不在其中，版本号取该提交里的版本。这个提交已有正在跑的 run，或者已跑完且镜像还能下载的 run，会直接复用。需要装好 GitHub CLI（`gh`），并登录一个有权在该仓库运行工作流的账号。`mac-build.yml` 合进 `main` 之前，GitHub 只会在推送到其他分支时运行它，所以要从这样的分支构建。
+
+构建会先运行 `scripts/stage-desktop.mjs`：按构建目标下载固定版本的 Node（Windows 是 `node.exe`，macOS 是 `node`，都校验 SHA-256），构建 `web/dist`，只保留目标平台的 node-pty 预编译，把所有内容放进 `desktop/bundle`（安装后位于 `resources\app`，macOS 上是 `Shoal.app/Contents/Resources/app`）。运行 `npm run desktop:dev` 或 `cargo check` 前需先手动跑一次。在 Apple silicon 上构建 Intel 版：先 `rustup target add x86_64-apple-darwin`，再在 `desktop/src-tauri` 里运行 `npx tauri build --target x86_64-apple-darwin`。
 
 也可以从 [Releases](https://github.com/qianshuixia/Shoal/releases) 下载编好的安装包。安装包没有代码签名，SmartScreen 可能拦截（更多信息 → 仍要运行）。
 
-- 启动时服务没在运行，就在后台用自带的 `node.exe` 运行 `server/main.ts`（失败时窗口里显示原因和「重试」），已在运行就直接连上；窗口打开期间后台守护线程会在服务意外退出时自动重拉，页面自动重连。端口同样读 `WORKBENCH_PORT`，状态目录与服务端规则相同（见下文）；继承来的 `NODE_OPTIONS`、`NODE_PATH` 会被清掉。
-- 关窗口或托盘「退出」会连服务一起停掉（不管服务是外壳还是 `start` 拉起的）；还有 agent 在跑时先弹确认，「全部退出」走和服务端 `Ctrl+C` 相同的流程，之后可在面板里续接。外壳崩溃或被强杀时服务和 agent 继续运行。托盘菜单另有显示、在浏览器中打开、重新加载。再次启动会唤出已有窗口。
-- `Ctrl+W`、`Ctrl+F`、`Ctrl+R`、`F5`、`Ctrl+P` 等交给页面和终端，不再被浏览器拦截；刷新用托盘的「重新加载」。终端里的网页链接用默认浏览器打开。
-- 桌面端启动的会话，hook 用自带的 `node.exe` 运行，`PATH` 里没有 Node 也能用。agy 要求 hook 路径不含空格：安装路径有空格（比如用户名带空格）且该盘没有 8.3 短文件名时，agy 会被禁用。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
+macOS：下载对应芯片的 `.dmg`（Apple silicon 选 `aarch64`，Intel 选 `x64`），把 Shoal 拖进「应用程序」。应用只做了 ad-hoc 签名、没有经过 Apple 公证，第一次打开会提示「无法验证开发者」或「已损坏」：在终端运行 `xattr -cr /Applications/Shoal.app` 后再打开，或者先打开一次，再到「系统设置 → 隐私与安全性」里点「仍要打开」。
 
-- `--port <n>` 或 `WORKBENCH_PORT` 改端口；`WORKBENCH_STATE_DIR` 改状态目录（默认 `%LOCALAPPDATA%\Shoal`；该目录里还没有 `state.json` 而改名前的 `%LOCALAPPDATA%\agent-workbench` 存在时，沿用旧目录；里面有 hook 配置和 `events.jsonl`，后者超过 10 MB 时移为 `events.1.jsonl`）。
+- 启动时服务没在运行，就在后台用自带的 Node（Windows 上是 `node.exe`）运行 `server/main.ts`（失败时窗口里显示原因和「重试」），已在运行就直接连上；窗口打开期间后台守护线程会在服务意外退出时自动重拉，页面自动重连。端口同样读 `WORKBENCH_PORT`，状态目录与服务端规则相同（见下文）；继承来的 `NODE_OPTIONS`、`NODE_PATH` 会被清掉。
+- 关窗口或托盘「退出」会连服务一起停掉（不管服务是外壳还是 `start` 拉起的；macOS 上关窗口只隐藏，点 Dock 图标重新显示，`Cmd+Q`、菜单栏「退出 Shoal」或托盘「退出」才会退出，有 agent 在跑时会先确认；从 Dock 退出或注销无法拦住，会不经确认直接停掉服务）；还有 agent 在跑时先弹确认，「全部退出」走和服务端 `Ctrl+C` 相同的流程，之后可在面板里续接。外壳崩溃或被强杀时服务和 agent 继续运行。托盘菜单另有显示、在浏览器中打开、重新加载。再次启动会唤出已有窗口。
+- `Ctrl+W`、`Ctrl+F`、`Ctrl+R`、`F5`、`Ctrl+P` 等交给页面和终端，不再被浏览器拦截；刷新用托盘的「重新加载」。终端里的网页链接用默认浏览器打开。
+- 桌面端启动的会话，hook 用自带的 Node 运行，`PATH` 里没有 Node 也能用。macOS 上从 Finder 或 Dock 启动的应用拿不到终端里的 `PATH`，服务启动时会读一次登录 shell（`$SHELL -ilc`）的 `PATH`，再补上 `/opt/homebrew/bin`、`/usr/local/bin` 和 `~/.local/bin`，装在这些位置的 `claude`、`codex`、`agy` 都能找到（`WORKBENCH_SKIP_SHELL_ENV=1` 跳过读取）。agy 要求 hook 路径不含空格：安装路径有空格（比如用户名带空格）且该盘没有 8.3 短文件名时，agy 会被禁用。缩放、折叠、隐私模式等存在浏览器本地的设置与 Chrome 里的不共享。
+
+- `--port <n>` 或 `WORKBENCH_PORT` 改端口；`WORKBENCH_STATE_DIR` 改状态目录（macOS 默认 `~/Library/Application Support/Shoal`；Windows 默认 `%LOCALAPPDATA%\Shoal`，该目录里还没有 `state.json` 而改名前的 `%LOCALAPPDATA%\agent-workbench` 存在时，沿用旧目录；里面有 hook 配置和 `events.jsonl`，后者超过 10 MB 时移为 `events.1.jsonl`）。
 - 服务只监听 `127.0.0.1`，校验 Host 和 Origin；hook 回调用每次启动随机生成的 token。
 - 开发前端：用 `npm start` 跑服务端（不要用 `node --watch`，重启会杀掉所有在跑的 agent），`WORKBENCH_DEV=1` 时允许 `npm run dev:web`（Vite，5173 端口）。
 - 项目、任务和会话元数据写入 `<stateDir>/state.json`；服务重启后旧任务显示「已退出」，不会静默自启（避免一次性消耗额度），若上次服务停止前仍有运行中的可续接会话，顶部会提示「一键全部续接」或「忽略」。文件损坏时会改名为 `state.json.corrupt-<时间戳>` 并从空状态启动。
 
-每次推送到 `main`（包括只改文档）都会排队发布 Windows 桌面端。CI 选择比源码和现有发布标签都大的 patch 版本，同步写入 `tauri.conf.json`、`Cargo.toml` 和 `Cargo.lock`，提交回 `main`，再从该提交编译安装包并公开 Release。自动生成的版本提交不会触发下一次构建。
+每次推送到 `main`（包括只改文档）都会排队发布桌面端。CI 选择比源码和现有发布标签都大的 patch 版本，同步写入 `tauri.conf.json`、`Cargo.toml` 和 `Cargo.lock`，提交回 `main`，再从该提交编译 Windows 安装包并公开 Release；随后 macOS runner 从同一提交编译 Apple silicon 和 Intel 两个 `.dmg`，追加到同一个 Release。macOS 构建失败不影响已发布的 Windows 版，可以在 Actions 里只重跑失败的 job。自动生成的版本提交不会触发下一次构建。推送到 `main` 以外的分支会运行 `.github/workflows/mac-build.yml`：在 macOS 上跑单元测试和 e2e，构建两个架构的应用，并启动 Apple silicon 版确认它能拉起自带的服务，不发布任何东西。
 
 ## 使用
 
@@ -68,8 +74,8 @@ build-desktop.cmd       # 同样的构建，先升版本号：默认 patch，也
   - 「用 AI 自动起任务标题」（默认关闭，保存在工作台服务端，对所有窗口生效），旁边的 `?` 悬停看说明。开启后，第一句需求发出时先用第一行当标题，同时在后台让 Claude（Haiku）或 Codex（默认模型和最低推理档）做一次短调用写更概括的标题换上（`agy` 任务保留第一行确定性标题，不调用无头 `agy -p`）；会消耗该 agent 的少量额度，不计入 Token 统计。手动填写或改过的标题不会被替换，生成失败或超过 60 秒保留第一行标题。
   - 「Antigravity 默认模型档位」：指定新开 `agy` 任务默认透传的 `--model` 档位。
   - 「Antigravity CLI 输出与排版优化」（完整方案与手动配置见 [docs/agy-output-optimization.md](docs/agy-output-optimization.md)）：点击「一键优化」→「确定」，自动备份原配置（生成 `.shoal.bak`）并无损写入 `~/.gemini/antigravity-cli/settings.json`（`verbosity: "low"` + `tokyo night` 配色）、全局常驻终端清爽排版与阶段心跳规则（`~/.gemini/config/rules/shoal-output-style.md`）以及内置零依赖 `fast-tools` 极速检索 MCP（`hooks/fast-tools.mjs`），完整保留已有模型、权限与其他 MCP 服务。
-- 贴图：`Ctrl+V` 或 `Alt+V` 粘贴剪贴板里的图片（交给 CLI 自己读系统剪贴板）；在资源管理器里复制的文件（视频、文档等）用 `Ctrl+V` 粘贴时插入它们的完整路径，含空格的加引号，多个用空格分隔（同 Windows Terminal）；拖入图片文件会保存到 `<state 目录>\attachments\` 并把路径粘贴进去（claude、codex 会识别为图片附件，agy 只收到路径文字）。Claude Code 的贴图键是 `chat:imagePaste`（默认 `alt+v`），改过绑定的话粘贴图片会失效。
-- 终端里的链接：属于已登记项目的文本、代码、Markdown 和图片文件点击后直接在右侧「文件」面板打开（带行号的自动定位到该行，右上角「外部打开」仍可用 VS Code 打开）；项目外的文件链接、大文件或二进制文件用 VS Code / 默认程序打开（程序和快捷方式只在资源管理器里选中，不会运行），网页链接在新标签页打开。可用环境变量 `WORKBENCH_EDITOR` 指定编辑器 exe。
+- 贴图：`Ctrl+V` 或 `Alt+V`（macOS 上是 `Cmd+V` 或 `Ctrl+V`）粘贴剪贴板里的图片（交给 CLI 自己读系统剪贴板）；在资源管理器或访达里复制的文件（视频、文档等）用 `Ctrl+V`（macOS 上 `Cmd+V`）粘贴时插入它们的完整路径，含空格的加引号，多个用空格分隔（同 Windows Terminal）；拖入图片文件会保存到 `<state 目录>\attachments\` 并把路径粘贴进去（claude、codex 会识别为图片附件，agy 只收到路径文字）。Claude Code 的贴图键是 `chat:imagePaste`（Windows 默认 `alt+v`，macOS 默认 `ctrl+v`），改过绑定的话粘贴图片会失效。
+- 终端里的链接：属于已登记项目的文本、代码、Markdown 和图片文件点击后直接在右侧「文件」面板打开（带行号的自动定位到该行，右上角「外部打开」仍可用 VS Code 打开）；项目外的文件链接、大文件或二进制文件用 VS Code / 默认程序打开（程序和快捷方式只在资源管理器或访达里选中，不会运行），网页链接在新标签页打开。可用环境变量 `WORKBENCH_EDITOR` 指定编辑器路径。
 - 选中即复制：在终端里拖选、双击选词或三击选行，松开鼠标就复制到系统剪贴板（同 Windows Terminal 的 copyOnSelect）；单击不复制。CLI 开了鼠标模式时按住 `Shift` 再拖选；不按 `Shift` 时由 CLI 自己选中，它通过 OSC 52 交来的文字同样会写进剪贴板。
 - 鼠标点选：Claude Code 的全屏模式（`/tui fullscreen`，或 settings 里 `"tui": "fullscreen"`）会开鼠标模式，选项菜单可以直接点，滚轮也交给它处理。Claude 会把“全屏启动后 10 秒内进程就消失”当作一次崩溃，累计两次后该版本自动退出全屏（`~/.claude.json` 里出现 `fullscreenAutoDisabled`），之后点击就失效了，在 Claude 里运行一次 `/tui fullscreen` 即可恢复。工作台删除或归档刚启动的 Claude 任务、正常停止服务时，会等它满 10 秒再结束进程；但 `stop`/`restart` 是强杀，刚启动的 Claude 照样会被记一次。
 - 点项目名折叠或展开；折叠状态保存在本机浏览器。折叠后项目名旁显示「N 个在等你」和「N 待验收」；用 ``Alt+` `` 跳过去时会自动展开。

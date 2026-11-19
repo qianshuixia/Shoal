@@ -9,6 +9,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { createFakeTask, expectStatus, pane, removeAllTasks, row, termText, token } from './helpers.ts';
 
+// CodeMirror binds save to Mod-s and the document end to Mod-End (Mod-ArrowDown on macOS), where Mod is Cmd there.
+const SAVE_KEY = 'ControlOrMeta+s';
+const DOC_END_KEY = process.platform === 'darwin' ? 'Meta+ArrowDown' : 'Control+End';
 const OUT = path.resolve('.tmp/inspector');
 const OPEN_LOG = path.resolve('.tmp/m1/open-log.jsonl');
 fs.mkdirSync(OUT, { recursive: true });
@@ -108,10 +111,10 @@ test('3-mode layout, branch chip linkage, diff/edit/save/discard, tree & Ctrl+P,
   await insp.getByTestId('mode-edit').click();
   const cm = insp.locator('.cm-content');
   await cm.click();
-  await page.keyboard.press('Control+End');
+  await page.keyboard.press(DOC_END_KEY);
   await page.keyboard.type('\nexport const savedFromInspector = 42;');
   await expect(insp.getByTestId('unsaved-dot')).toBeVisible();
-  await page.keyboard.press('Control+s');
+  await page.keyboard.press(SAVE_KEY);
   await expect(insp.getByTestId('unsaved-dot')).toHaveCount(0);
   expect(fs.readFileSync(path.join(dir, 'src', 'app.ts'), 'utf8')).toContain('savedFromInspector = 42');
 
@@ -199,7 +202,7 @@ test('concurrent external disk edits: clean editor hot-reloads silently; dirty d
   const paneBoxBefore = (await pane(page, 0).locator('.pane-body').boundingBox())!;
 
   await insp.locator('.cm-content').click();
-  await page.keyboard.press('Control+End');
+  await page.keyboard.press(DOC_END_KEY);
   await page.keyboard.type('\nexport const myUnsavedEdit = true;');
   await expect(insp.getByTestId('unsaved-dot')).toBeVisible();
 
@@ -224,7 +227,7 @@ test('concurrent external disk edits: clean editor hot-reloads silently; dirty d
 
   // Trigger another conflict and choose "重新加载磁盘版本"
   await insp.locator('.cm-content').click();
-  await page.keyboard.press('Control+End');
+  await page.keyboard.press(DOC_END_KEY);
   await page.keyboard.type('\n// discard this');
   const t3 = new Date(Date.now() + 30000);
   fs.writeFileSync(targetFile, 'export const port = 9000; // disk wins\n');

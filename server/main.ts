@@ -1,11 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { adoptLoginShellEnv, defaultStateDir } from './platform.ts';
 import { availableAgents, writeHookFiles } from './agents.ts';
 import { createApp } from './http.ts';
 import { SessionManager } from './sessions.ts';
 import { createFileStore } from './store.ts';
 import { createUsage } from './usage.ts';
+
+// Before anything resolves a CLI or spawns a child: a Finder-launched app has a minimal PATH.
+await adoptLoginShellEnv();
 
 const argIdx = process.argv.indexOf('--port');
 const port = Number(argIdx > 0 ? process.argv[argIdx + 1] : process.env.WORKBENCH_PORT ?? 47800);
@@ -14,14 +18,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   process.exit(2);
 }
 
-// Default %LOCALAPPDATA%\Shoal; installs from before the rename keep using %LOCALAPPDATA%\agent-workbench until Shoal has
-// its own state.json. The folder alone says nothing: the desktop installer puts the app itself in %LOCALAPPDATA%\Shoal.
-// Same rule in workbench.ps1 and desktop/src-tauri/src/main.rs (which also passes its choice in WORKBENCH_STATE_DIR).
-const defaultStateDir = () => {
-  const base = process.env.LOCALAPPDATA ?? '.';
-  const dir = path.join(base, 'Shoal'), old = path.join(base, 'agent-workbench');
-  return !fs.existsSync(path.join(dir, 'state.json')) && fs.existsSync(old) ? old : dir;
-};
+// Per-platform default (defaultStateDir in platform.ts); the desktop app passes its choice in WORKBENCH_STATE_DIR.
 const stateDir = path.resolve(process.env.WORKBENCH_STATE_DIR ?? defaultStateDir());
 fs.mkdirSync(stateDir, { recursive: true });
 writeHookFiles(stateDir);

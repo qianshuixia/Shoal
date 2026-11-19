@@ -6,7 +6,7 @@ import pty from 'node-pty';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from './http.ts';
 import {
-  agyHookDisposition, agyPrimaryWorkspaces, CODEX_NEWLINE, deliverable, isAgyIntermediateStop,
+  agyHookDisposition, agyPrimaryWorkspaces, CODEX_NEWLINE, deliverable, enterReady, isAgyIntermediateStop,
   isTerminalReportSequence, modePrefix, nativeIdUpdate, pasteFrame, prependEnvPath, sanitizePaste,
   SessionManager, STARTUP_BLOCK_RE, stripAnsiForMatch, trackModes,
 } from './sessions.ts';
@@ -116,13 +116,15 @@ describe('PTY input guards & env Path normalization', () => {
   });
 
   it('prependEnvPath deduplicates case-variant Path keys on Windows', () => {
-    const env: Record<string, string> = { Path: 'C:\\Windows', PATH: 'C:\\Legacy' };
-    prependEnvPath(env, 'C:\\Shoal\\bin');
+    const win = process.platform === 'win32';
+    const [sys, legacy, shoal] = win ? ['C:\\Windows', 'C:\\Legacy', 'C:\\Shoal\\bin'] : ['/usr/bin', '/legacy', '/shoal/bin'];
+    const env: Record<string, string> = { Path: sys, PATH: legacy };
+    prependEnvPath(env, shoal);
     const pathKeys = Object.keys(env).filter(k => k.toLowerCase() === 'path');
     expect(pathKeys).toHaveLength(1);
-    expect(env[pathKeys[0]]).toBe(`C:\\Shoal\\bin${path.delimiter}C:\\Windows`);
-    prependEnvPath(env, 'C:\\Shoal\\bin');
-    expect(env[pathKeys[0]]).toBe(`C:\\Shoal\\bin${path.delimiter}C:\\Windows`);
+    expect(env[pathKeys[0]]).toBe(`${shoal}${path.delimiter}${sys}`);
+    prependEnvPath(env, shoal);
+    expect(env[pathKeys[0]]).toBe(`${shoal}${path.delimiter}${sys}`);
   });
 
   it('blocks queued delivery on Ctrl+C / startup prompt, cancels 300ms Enter on typing, and marks systemInjected', async () => {
@@ -188,6 +190,94 @@ describe('PTY input guards & env Path normalization', () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it('enterReady scales floor for Codex, waits for PTY echo silence, and caps at max wait', () => {
+    expect(enterReady({ agent: 'claude', chars: 5000, injectAt: 1000, lastOutAt: 1000, now: 1000 })).toEqual({ ready: false, nextDelayMs: 300 });
+    expect(enterReady({ agent: 'claude', chars: 5000, injectAt: 1000, lastOutAt: 1000, now: 1300 })).toEqual({ ready: true, nextDelayMs: 0 });
+    expect(enterReady({ agent: 'claude', chars: 5000, injectAt: 1000, lastOutAt: 1220, now: 1300 })).toEqual({ ready: false, nextDelayMs: 70 });
+    expect(enterReady({ agent: 'claude', chars: 5000, injectAt: 1000, lastOutAt: 1220, now: 1370 })).toEqual({ ready: true, nextDelayMs: 0 });
+
+    expect(enterReady({ agent: 'codex', chars: 1747, injectAt: 1000, lastOutAt: 900, now: 1000 })).toEqual({ ready: false, nextDelayMs: 1174 });
+    expect(enterReady({ agent: 'codex', chars: 1747, injectAt: 1000, lastOutAt: 1280, now: 1300 })).toEqual({ ready: false, nextDelayMs: 874 });
+    expect(enterReady({ agent: 'codex', chars: 1747, injectAt: 1000, lastOutAt: 1746, now: 2174 })).toEqual({ ready: true, nextDelayMs: 0 });
+    expect(enterReady({ agent: 'codex', chars: 1747, injectAt: 1000, lastOutAt: 2100, now: 2174 })).toEqual({ ready: false, nextDelayMs: 176 });
+    expect(enterReady({ agent: 'codex', chars: 1747, injectAt: 1000, lastOutAt: 2100, now: 2350 })).toEqual({ ready: true, nextDelayMs: 0 });
+    expect(enterReady({ agent: 'codex', chars: 20_000, injectAt: 1000, lastOutAt: 12_990, now: 13_000 })).toEqual({ ready: true, nextDelayMs: 0 });
+  });
+
+  it('holds Codex rework Enter until paste echo drains, blocks queued interleave, and cancels on user input', async () => {
+    vi.useFakeTimers();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-codex-rework-'));
+    const writes: string[] = [];
+    let dataCb: (d: string) => void = () => {};
+    let exitCb: (e: { exitCode: number }) => void = () => {};
+    vi.spyOn(pty, 'spawn').mockImplementation((() => ({
+      pid: 9002, cols: 114, rows: 51, process: 'codex', handleFlowControl: false,
+      onData: (cb: (d: string) => void) => { dataCb = cb; return { dispose() {} }; },
+      onExit: (cb: (e: { exitCode: number }) => void) => { exitCb = cb; return { dispose() {} }; },
+      write: (d: string) => { writes.push(d); },
+      resize() {}, kill() { exitCb({ exitCode: 0 }); },
+      pause() {}, resume() {}, clear() {},
+    })) as typeof pty.spawn);
+
+    const mgr = new SessionManager({ port: 47899, token: 't', stateDir: tmp });
+    try {
+      const s = mgr.spawn({ taskId: 'tc', projectId: 'p1', agent: 'codex', cwd: tmp, prompt: 'round1' });
+      dataCb('\x1b[?2004h');
+      mgr.hook({ sessionId: s.id, agent: 'codex', event: 'SessionStart', at: Date.now(), payload: { session_id: 'c1', source: 'startup' } });
+      mgr.hook({ sessionId: s.id, agent: 'codex', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'c1' } });
+      mgr.hook({ sessionId: s.id, agent: 'codex', event: 'Stop', at: Date.now(), payload: { session_id: 'c1' } });
+      await vi.advanceTimersByTimeAsync(2000);
+
+      const reworkText = '返工复核意见\n' + 'x'.repeat(1740);
+      let firstDelivered = false;
+      expect(mgr.enqueue(s.id, reworkText, { system: true, onDelivered: () => { firstDelivered = true; } })).toBe(true);
+      expect(mgr.enqueue(s.id, 'second-queued', { system: true })).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(260);
+      expect(writes).toHaveLength(1);
+      // Codex only needs the win32-input-mode newline under ConPTY; elsewhere a plain \n separates lines.
+      expect(writes[0]).toContain(process.platform === 'win32' ? CODEX_NEWLINE : '\n');
+
+      for (let step = 0; step < 14; step++) {
+        await vi.advanceTimersByTimeAsync(100);
+        dataCb('echo-chunk');
+      }
+      expect(writes).toHaveLength(1);
+      expect(firstDelivered).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(200);
+      expect(writes).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(100);
+      expect(writes).toHaveLength(2);
+      expect(writes[1]).toBe('\r');
+      expect(firstDelivered).toBe(true);
+      const hk = mgr.hook({ sessionId: s.id, agent: 'codex', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'c1' } });
+      expect(hk).toEqual({ userTurn: false, systemInjected: true });
+
+      mgr.hook({ sessionId: s.id, agent: 'codex', event: 'Stop', at: Date.now(), payload: { session_id: 'c1' } });
+      // Codex sandbox init temporarily disables the composer right after Stop; queue must hold until Sandbox ready + settle.
+      dataCb('• Setting up sandbox... (0s)\r\n› Input disabled until setup completes.');
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(writes.some(w => w.includes('second-queued'))).toBe(false);
+
+      dataCb('\r\n• Sandbox ready');
+      await vi.advanceTimersByTimeAsync(300);
+      expect(writes.some(w => w.includes('second-queued'))).toBe(false);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(writes.some(w => w.includes('second-queued'))).toBe(true);
+      const countBeforeType = writes.filter(w => w === '\r').length;
+      mgr.input(s.id, 'a');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(writes.filter(w => w === '\r')).toHaveLength(countBeforeType);
+    } finally {
+      await mgr.killAll();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('trackModes / modePrefix', () => {
@@ -207,34 +297,28 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
   });
 
   it('agyPrimaryWorkspaces requires both project cwd and <stateDir>/agy-hooks across slash/case variants', () => {
-    expect(agyPrimaryWorkspaces(
-      'G:\\Workspace\\agent-workbench',
-      'C:\\Users\\Admin\\AppData\\Local\\wb',
-      ['C:/Users/Admin/AppData/Local/wb/agy-hooks', 'G:/Workspace/agent-workbench'],
-    )).toBe(true);
+    // Host-shaped absolute paths: normPath resolves against the host, so Windows drive paths mean nothing on POSIX.
+    const win = process.platform === 'win32';
+    const proj = win ? 'G:\\Workspace\\agent-workbench' : '/Workspace/agent-workbench';
+    const game = win ? 'G:\\H5-game\\x' : '/H5-game/x';
+    const state = win ? 'C:\\Users\\Admin\\AppData\\Local\\wb' : '/Users/Admin/Library/wb';
+    const fwd = (p: string) => p.replaceAll('\\', '/');
+    const hooks = `${fwd(state)}/agy-hooks`;
+    expect(agyPrimaryWorkspaces(proj, state, [hooks, fwd(proj)])).toBe(true);
     // Nested `agy -p` run from agy-hooks lacks project cwd.
-    expect(agyPrimaryWorkspaces(
-      'G:\\Workspace\\agent-workbench',
-      'C:\\Users\\Admin\\AppData\\Local\\wb',
-      ['C:/Users/Admin/AppData/Local/wb/agy-hooks'],
-    )).toBe(false);
+    expect(agyPrimaryWorkspaces(proj, state, [hooks])).toBe(false);
     // Branched worker workspace lacks main project cwd.
-    expect(agyPrimaryWorkspaces(
-      'G:\\Workspace\\agent-workbench',
-      'C:\\Users\\Admin\\AppData\\Local\\wb',
-      ['C:/Users/Admin/AppData/Local/wb/agy-hooks', 'G:/Workspace/agent-workbench-share-1'],
-    )).toBe(false);
+    expect(agyPrimaryWorkspaces(proj, state, [hooks, `${fwd(proj)}-share-1`])).toBe(false);
     // A folder agy does not trust yet is left out of workspacePaths: only the folders Shoal added remain.
-    const collab = 'C:\\Users\\Admin\\AppData\\Local\\wb\\collab\\p1';
-    const untrusted = ['C:/Users/Admin/AppData/Local/wb/agy-hooks', 'C:/Users/Admin/AppData/Local/wb/collab/p1'];
-    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', untrusted, collab)).toBe(true);
-    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb',
-      [...untrusted, 'C:/Users/Admin/AppData/Local/wb/agy-instructions'], collab)).toBe(true);
+    const collab = `${state}${win ? '\\' : '/'}collab${win ? '\\' : '/'}p1`;
+    const untrusted = [hooks, `${fwd(state)}/collab/p1`];
+    expect(agyPrimaryWorkspaces(game, state, untrusted, collab)).toBe(true);
+    expect(agyPrimaryWorkspaces(game, state, [...untrusted, `${fwd(state)}/agy-instructions`], collab)).toBe(true);
     // ...but not when the collab folder is another project's, missing, or joined by a folder Shoal did not add.
-    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', untrusted, collab.replace('p1', 'p2'))).toBe(false);
-    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', untrusted)).toBe(false);
-    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', [...untrusted, 'G:/H5-game/x-share-1'], collab)).toBe(false);
-    expect(agyPrimaryWorkspaces('G:\\H5-game\\x', 'C:\\Users\\Admin\\AppData\\Local\\wb', ['C:/Users/Admin/AppData/Local/wb/collab/p1'], collab)).toBe(false);
+    expect(agyPrimaryWorkspaces(game, state, untrusted, collab.replace('p1', 'p2'))).toBe(false);
+    expect(agyPrimaryWorkspaces(game, state, untrusted)).toBe(false);
+    expect(agyPrimaryWorkspaces(game, state, [...untrusted, `${fwd(game)}-share-1`], collab)).toBe(false);
+    expect(agyPrimaryWorkspaces(game, state, [`${fwd(state)}/collab/p1`], collab)).toBe(false);
     expect(isAgyIntermediateStop({ fullyIdle: false, continuationActive: false, error: '' })).toBe(true);
     expect(isAgyIntermediateStop({ fullyIdle: true, continuationActive: true, error: '' })).toBe(true);
     expect(isAgyIntermediateStop({ fullyIdle: false, error: 'RESOURCE_EXHAUSTED (code 429)' })).toBe(false);
@@ -254,8 +338,15 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
 
     const prevAgy = process.env.AGY_CONFIG_DIR;
     const prevLocal = process.env.LOCALAPPDATA;
+    const prevPath = process.env.PATH;
     process.env.AGY_CONFIG_DIR = agyCfg;
     process.env.LOCALAPPDATA = fakeLocal;
+    if (process.platform !== 'win32') {
+      // POSIX finds agy on PATH, not under LOCALAPPDATA.
+      const agyBin = path.join(fakeLocal, 'agy', 'bin');
+      fs.writeFileSync(path.join(agyBin, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+      process.env.PATH = `${agyBin}${path.delimiter}${prevPath ?? ''}`;
+    }
 
     const MAIN = 'ae1cac0a-c6a3-47d3-968f-06ba2f139408';
     const REV3 = '27e3af25-4cf9-449a-abb1-a1a9067c3ee7';
@@ -470,6 +561,7 @@ describe('agy hook filtering, intermediate Stop, and self-healing resume', () =>
       await new Promise<void>(resolve => app.server.close(() => resolve()));
       if (prevAgy === undefined) delete process.env.AGY_CONFIG_DIR; else process.env.AGY_CONFIG_DIR = prevAgy;
       if (prevLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = prevLocal;
+      if (prevPath === undefined) delete process.env.PATH; else process.env.PATH = prevPath;
       fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
   });

@@ -1,0 +1,152 @@
+# Checks the macOS port without publishing anything: unit tests and the e2e suite on macOS, and the desktop app built
+# for both architectures, then started on Apple silicon to confirm the shell launches its bundled server.
+# Runs from the Actions tab or on pushes to branches other than main (main builds through release.yml).
+name: macOS build check
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run e2e
+
+      - name: Keep the e2e report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-macos
+          path: |
+            .tmp/m1/report
+            .tmp/m1/results.json
+          if-no-files-found: ignore
+
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    # An Apple silicon runner; the Intel build is cross-compiled and only checked, not started.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      BUNDLE: desktop/src-tauri/target/${{ matrix.target }}/release/bundle
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Cache the bundled Node runtime
+        uses: actions/cache@v6
+        with:
+          path: .tmp/node-runtime
+          key: node-runtime-${{ matrix.target }}-${{ hashFiles('scripts/stage-desktop.mjs') }}
+
+      - run: npm ci
+
+      - name: Build the app and disk image
+        working-directory: desktop/src-tauri
+        run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Check the bundle
+        run: |
+          set -euo pipefail
+          APP="$BUNDLE/macos/Shoal.app"
+          RES="$APP/Contents/Resources/app"
+          ARCH=${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || 'x86_64' }}
+          ls "$BUNDLE"/dmg/*.dmg
+          EXE="$APP/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$APP/Contents/Info.plist")"
+          ls "$RES/node_modules/node-pty/prebuilds"
+          # Every native binary must be built for this target alone: the shell, the bundled Node and node-pty's two.
+          for f in "$EXE" "$RES/node" "$RES"/node_modules/node-pty/prebuilds/darwin-*/pty.node "$RES"/node_modules/node-pty/prebuilds/darwin-*/spawn-helper; do
+            file "$f"
+            test "$(lipo -archs "$f")" = "$ARCH" || { echo "::error::$f is $(lipo -archs "$f"), expected $ARCH"; exit 1; }
+          done
+          test -x "$RES/node_modules/node-pty/prebuilds/darwin-"*/spawn-helper
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          plutil -p "$APP/Contents/Info.plist" | grep -E 'LSMinimumSystemVersion|CFBundleShortVersionString|CFBundleIdentifier'
+
+      - name: Start the app and reach its server
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          set -euo pipefail
+          APP="$BUNDLE/macos/Shoal.app"
+          RES="$APP/Contents/Resources/app"
+          # node-pty from the signed bundle: this runs spawn-helper, which macOS refuses if signing broke it.
+          (cd "$RES" && ./node -e "const p=require('node-pty').spawn('/bin/echo',['pty-ok'],{});let o='';p.onData(d=>o+=d);p.onExit(e=>{console.log(JSON.stringify(o));process.exit(e.exitCode===0&&o.includes('pty-ok')?0:1)})")
+          export WORKBENCH_PORT=47900 WORKBENCH_STATE_DIR="$RUNNER_TEMP/shoal-state"
+          EXE="$APP/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$APP/Contents/Info.plist")"
+          "$EXE" > "$RUNNER_TEMP/app.log" 2>&1 &
+          APP_PID=$!
+          ok=
+          for i in $(seq 60); do
+            if curl -fsS "http://127.0.0.1:$WORKBENCH_PORT/api/state" > "$RUNNER_TEMP/state.json"; then ok=1; break; fi
+            kill -0 "$APP_PID" 2>/dev/null || break
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/app.log" || true
+          test -n "$ok" || { echo "::error::the app did not bring up its server"; exit 1; }
+          head -c 400 "$RUNNER_TEMP/state.json"; echo
+          # The server must be the bundled Node, not anything on the runner.
+          SERVER_PID=$(lsof -ti "tcp:$WORKBENCH_PORT" -sTCP:LISTEN | head -1)
+          ps -o command= -p "$SERVER_PID" | tee /dev/stderr | grep -F "Contents/Resources/app/node"
+          ls "$WORKBENCH_STATE_DIR"
+          # Quit the way the Dock does (an Apple event, which skips the confirmation): the shell must stop its server on
+          # the way out and leave no bundled Node process behind.
+          ID=$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")
+          # Only a refused Apple event (-1743: no Automation permission) skips the check. A timeout or any other osascript
+          # error falls through: whether the app and its server really exited decides.
+          rc=0
+          perl -e 'alarm 20; exec @ARGV' osascript -e "tell application id \"$ID\" to quit" 2> "$RUNNER_TEMP/quit.err" || rc=$?
+          cat "$RUNNER_TEMP/quit.err"
+          if [ "$rc" -ne 0 ] && grep -q -- '-1743' "$RUNNER_TEMP/quit.err"; then
+            echo "::warning::the runner refused the Apple event (Automation permission); quit path not checked"
+            curl -fsS -X POST "http://127.0.0.1:$WORKBENCH_PORT/api/shutdown" || true
+            kill "$APP_PID" 2>/dev/null || true
+            exit 0
+          fi
+          [ "$rc" -eq 0 ] || echo "::warning::osascript exited with $rc; checking whether the app quit anyway"
+          for i in $(seq 30); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$APP_PID" 2>/dev/null; then echo "::error::the app did not exit after Quit"; kill "$APP_PID"; exit 1; fi
+          if kill -0 "$SERVER_PID" 2>/dev/null; then echo "::error::the server outlived the app"; ps -o pid,command= -p "$SERVER_PID"; exit 1; fi
+          if pgrep -fl "Contents/Resources/app/node"; then echo "::error::bundled Node processes left behind"; exit 1; fi
+          cat "$WORKBENCH_STATE_DIR/server.log" || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shoal-${{ matrix.target }}
+          path: ${{ env.BUNDLE }}/dmg/*.dmg
+          if-no-files-found: error

@@ -32,8 +32,10 @@ test('目录浏览：点选子目录（含中文名）创建项目，出错后�
   await page.getByTestId('project-browse').click();
   await expect(page.getByTestId('dir-error')).toBeVisible();
   await page.getByTestId('dir-drives').click();
-  await expect(page.getByTestId('dir-current')).toHaveText('此电脑');
-  await expect(dirEntry(page, 'C:\\')).toBeVisible();
+  // The drive list is "此电脑" with drive letters on Windows, "根目录 / 卷" with / and /Volumes/* on macOS.
+  const mac = process.platform === 'darwin';
+  await expect(page.getByTestId('dir-current')).toHaveText(mac ? '根目录 / 卷' : '此电脑');
+  await expect(dirEntry(page, mac ? '/' : 'C:\\')).toBeVisible();
   await expect(page.getByTestId('dir-select')).toBeDisabled();
 
   // Typed path → browser opens there; navigate into a child, up, and into the Chinese-named one.
@@ -96,8 +98,17 @@ async function waitUp(api: APIRequestContext) {
   throw new Error('restart server did not come up');
 }
 
-function hardKill(p: ChildProcess) {
-  spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { stdio: 'ignore' });
+// Windows: kill the whole tree (the server's ConPTY children too). POSIX: SIGKILL the server and wait for it to exit,
+// so the next server can bind the same port.
+async function hardKill(p: ChildProcess) {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { stdio: 'ignore' });
+    return;
+  }
+  if (p.exitCode !== null || p.signalCode !== null) return;
+  const exited = new Promise<void>((resolve) => p.once('exit', () => resolve()));
+  p.kill('SIGKILL');
+  await exited;
 }
 
 test('服务被强杀重启后：项目和任务还在，会话显示已退出，可续接，可删除，可继续建新任务', async ({ page }) => {
@@ -123,7 +134,7 @@ test('服务被强杀重启后：项目和任务还在，会话显示已退出�
     const nativeA = before.sessions.find(s => s.id === a.session.id)?.nativeSessionId;
     expect(nativeA).toBeTruthy();
 
-    hardKill(srv);
+    await hardKill(srv);
     srv = startServer(2);
     await waitUp(api);
 
@@ -175,7 +186,7 @@ test('服务被强杀重启后：项目和任务还在，会话显示已退出�
     await page.screenshot({ path: path.join(RDIR, 'after-restart.png') });
 
     // Deletion survives another restart too.
-    hardKill(srv);
+    await hardKill(srv);
     srv = startServer(3);
     await waitUp(api);
     const final = await state(api);
@@ -185,6 +196,6 @@ test('服务被强杀重启后：项目和任务还在，会话显示已退出�
     expect(stateFile.version).toBe(1);
   } finally {
     await api.dispose();
-    hardKill(srv);
+    await hardKill(srv);
   }
 });

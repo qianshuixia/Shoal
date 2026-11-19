@@ -38,7 +38,11 @@ const restore = () => VERSION_FILES.forEach(({ file }, i) => fs.writeFileSync(fi
 // Ctrl+C also reaches the build, which then fails; this listener only keeps Node alive long enough to restore the files.
 process.on('SIGINT', () => {});
 
-const installer = path.join(TAURI, 'target', 'release', 'bundle', 'nsis', `Shoal_${next}_x64-setup.exe`);
+// Tauri's names: the NSIS setup on Windows, the disk image on macOS (built for this machine's architecture).
+const BUNDLE = path.join(TAURI, 'target', 'release', 'bundle');
+const installer = process.platform === 'darwin'
+  ? path.join(BUNDLE, 'dmg', `Shoal_${next}_${process.arch === 'arm64' ? 'aarch64' : 'x64'}.dmg`)
+  : path.join(BUNDLE, 'nsis', `Shoal_${next}_x64-setup.exe`);
 const started = Date.now();
 log(next === current ? `rebuilding Shoal ${current}` : `Shoal ${current} -> ${next}`);
 try {

@@ -6,6 +6,9 @@ import { createFakeTask, createProject, pane, row, token } from './helpers.ts';
 const STATE_DIR = path.resolve('.tmp/m1/state');
 const BP_START = '\x1b[200~';
 const BP_END = '\x1b[201~';
+// What a paste with no text or files sends so the CLI reads the clipboard image itself: Claude Code's image-paste key,
+// Alt+V (ESC v) on Windows and Ctrl+V (^V) on macOS.
+const IMAGE_KEY = process.platform === 'darwin' ? '\x16' : '\x1bv';
 
 // The server reads copied files from the real system clipboard; tests answer for it instead (no files unless a test sets some).
 let clipboardFiles: { status: number; body: unknown };
@@ -45,7 +48,7 @@ const PNG_SNIPPET = `
 `;
 
 test.describe('paste and drop images', () => {
-  test('image-only paste sends Alt+V and no bracketed paste', async ({ page, request }) => {
+  test('image-only paste sends the image-paste key and no bracketed paste', async ({ page, request }) => {
     const { sent, input, taskId } = await openTerminal(page, request);
     const prevented = await input.evaluate(async (ta) => {
       const c = document.createElement('canvas'); c.width = 4; c.height = 4;
@@ -58,7 +61,7 @@ test.describe('paste and drop images', () => {
     });
     await settle(page);
     expect(prevented).toBe(true);
-    expect(sent.join('')).toBe('\x1bv');
+    expect(sent.join('')).toBe(IMAGE_KEY);
     expect(sent.join('')).not.toContain(BP_START);
 
     // Chrome's native paste of a bitmap clipboard (measured with Ctrl+V) carries no types, items or files at all.
@@ -67,7 +70,7 @@ test.describe('paste and drop images', () => {
       ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData: new DataTransfer(), bubbles: true, cancelable: true }));
     });
     await settle(page);
-    expect(sent.join('')).toBe('\x1bv');
+    expect(sent.join('')).toBe(IMAGE_KEY);
     await request.delete(`/api/tasks/${taskId}`);
   });
 
@@ -84,7 +87,7 @@ test.describe('paste and drop images', () => {
     await input.evaluate(pasteCopiedFile);
     await settle(page);
     expect(sent.join('')).toBe(`${BP_START}"C:\视频\录屏 a.mp4" D:\clips\b.mov${BP_END}`);
-    expect(sent.join('')).not.toContain('\x1bv');
+    expect(sent.join('')).not.toContain(IMAGE_KEY);
 
     // The clipboard could not be read: say so, and still let the CLI try its own clipboard image paste.
     sent.length = 0;
@@ -92,7 +95,7 @@ test.describe('paste and drop images', () => {
     await input.evaluate(pasteCopiedFile);
     await settle(page);
     await expect(page.getByTestId('notice')).toContainText('读取剪贴板失败：timeout');
-    expect(sent.join('')).toBe('\x1bv');
+    expect(sent.join('')).toBe(IMAGE_KEY);
     await request.delete(`/api/tasks/${taskId}`);
   });
 
@@ -117,11 +120,12 @@ test.describe('paste and drop images', () => {
     });
     await settle(page);
     expect(sent.join('')).toBe(`${BP_START}cell-text${BP_END}`);
-    expect(sent.join('')).not.toContain('\x1bv');
+    expect(sent.join('')).not.toContain(IMAGE_KEY);
     await request.delete(`/api/tasks/${taskId}`);
   });
 
   test('Ctrl+V is not sent as ^V, Alt+V still sends ESC v', async ({ page, request }) => {
+    test.skip(process.platform === 'darwin', 'macOS: Cmd+V pastes, Ctrl+V goes to the CLI (next test)');
     const { sent, input, taskId } = await openTerminal(page, request);
     await input.focus();
     await page.keyboard.press('Control+V');
@@ -131,6 +135,16 @@ test.describe('paste and drop images', () => {
     await page.keyboard.press('Alt+V');
     await settle(page);
     expect(sent.join('')).toBe('\x1bv');
+    await request.delete(`/api/tasks/${taskId}`);
+  });
+
+  test('macOS: Ctrl+V reaches the CLI as ^V, its image-paste key there', async ({ page, request }) => {
+    test.skip(process.platform !== 'darwin', 'macOS only');
+    const { sent, input, taskId } = await openTerminal(page, request);
+    await input.focus();
+    await page.keyboard.press('Control+V');
+    await settle(page);
+    expect(sent.join('')).toBe('\x16');
     await request.delete(`/api/tasks/${taskId}`);
   });
 

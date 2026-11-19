@@ -1,4 +1,5 @@
-# Builds the self-contained Windows desktop installer and publishes it as a GitHub Release.
+# Builds the self-contained desktop installers and publishes them as one GitHub Release: the Windows NSIS setup first,
+# then the macOS disk images (Apple silicon and Intel), which the macos jobs add to the release the windows job published.
 # Every push to main bumps the patch version, builds the installer and publishes it right away;
 # it also runs from the Actions tab, or on a tag matching the app version: git tag v0.1.0 && git push origin v0.1.0
 # CI writes the version back to main with GITHUB_TOKEN, which does not trigger another push workflow.
@@ -24,6 +25,10 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      published: ${{ steps.release.outputs.published }}
+      release-id: ${{ steps.tauri.outputs.releaseId }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -131,6 +136,7 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Encoding UTF8 -Value "body<<$delim`n$text`n$delim"
 
       - uses: tauri-apps/tauri-action@v1
+        id: tauri
         if: steps.release.outputs.published != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -143,3 +149,54 @@ jobs:
           releaseDraft: false
           uploadUpdaterJson: false
           releaseBody: ${{ steps.notes.outputs.body }}
+
+  # Adds the macOS disk images to the release above, built from the same commit. A failed macOS build leaves the
+  # Windows release in place; "Re-run failed jobs" retries only these jobs, with the windows job's outputs.
+  # Uploading by releaseId keeps the release as it is: given a tag instead, tauri-action rewrites the name and body.
+  # The app is ad-hoc signed, not notarized: README explains how to open it the first time.
+  macos:
+    needs: windows
+    if: needs.windows.outputs.published != 'true' && needs.windows.outputs.release-id != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    # An Apple silicon runner; the Intel build is cross-compiled there.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.windows.outputs.commit }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+          key: ${{ matrix.target }}
+
+      - name: Cache the bundled Node runtime
+        uses: actions/cache@v6
+        with:
+          path: .tmp/node-runtime
+          key: node-runtime-${{ matrix.target }}-${{ hashFiles('scripts/stage-desktop.mjs') }}
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop/src-tauri
+          tauriScript: npx tauri
+          args: --target ${{ matrix.target }}
+          releaseId: ${{ needs.windows.outputs.release-id }}
+          uploadUpdaterJson: false

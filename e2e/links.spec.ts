@@ -68,14 +68,16 @@ test.describe('terminal links', () => {
     await request.delete(`/api/tasks/${t.taskId}`);
   });
 
-  test('a bare Windows path works; an exe is only selected, never run', async ({ page, request }) => {
+  test('a bare local path works; an exe is only selected, never run', async ({ page, request }) => {
     const t = await openTerminal(page, request);
     const exe = tempFile(`prog-${token('x')}.exe`);
     const link = await showLink(page, t, exe, 'BAREEXE');
     const p = link.at(1);
     await page.mouse.click(p.x, p.y);
     await expect.poll(() => opened(path.basename(exe)).length).toBe(1);
-    expect(opened(path.basename(exe))[0]).toEqual({ cmd: 'explorer.exe', args: [`/select,"${exe}"`] });
+    // Explorer's /select on Windows, Finder's reveal (open -R) on macOS.
+    const select = process.platform === 'win32' ? { cmd: 'explorer.exe', args: [`/select,"${exe}"`] } : { cmd: 'open', args: ['-R', exe] };
+    expect(opened(path.basename(exe))[0]).toEqual(select);
     await request.delete(`/api/tasks/${t.taskId}`);
   });
 

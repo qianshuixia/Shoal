@@ -18,12 +18,14 @@ export interface PowerBlocker {
 
 export interface PowerBlockerOptions {
   enabledByPlatform?: boolean;
+  platform?: NodeJS.Platform;
   spawnImpl?: typeof spawn;
   onChange?: (active: boolean) => void;
 }
 
 export function createPowerBlocker(opts: PowerBlockerOptions = {}): PowerBlocker {
-  const supported = opts.enabledByPlatform ?? (process.platform === 'win32' && process.env.WORKBENCH_FAKE_AGENT !== '1');
+  const platform = opts.platform ?? process.platform;
+  const supported = opts.enabledByPlatform ?? ((platform === 'win32' || platform === 'darwin') && process.env.WORKBENCH_FAKE_AGENT !== '1');
   const runSpawn = opts.spawnImpl ?? spawn;
   let child: ChildProcess | null = null;
   let wanted = false;
@@ -43,11 +45,14 @@ export function createPowerBlocker(opts: PowerBlockerOptions = {}): PowerBlocker
   const start = () => {
     if (child || disposed || !supported) return;
     try {
-      const proc = runSpawn(
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', PS_SCRIPT],
-        { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] },
-      );
+      // macOS: caffeinate -i blocks idle sleep; -w ties it to this process so it ends with us even if stop() never runs.
+      const proc = platform === 'darwin'
+        ? runSpawn('caffeinate', ['-i', '-w', String(process.pid)], { stdio: ['ignore', 'ignore', 'ignore'] })
+        : runSpawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', PS_SCRIPT],
+          { windowsHide: true, stdio: ['pipe', 'ignore', 'ignore'] },
+        );
       proc.unref?.();
       child = proc;
       proc.once('error', () => {

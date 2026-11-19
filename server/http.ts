@@ -800,6 +800,22 @@ export function createApp(cfg: AppConfig) {
   function listDirs(q: URLSearchParams): DirListing {
     if (q.get('drives')) {
       const entries: DirListing['entries'] = [];
+      if (process.platform !== 'win32') {
+        // No drive letters: the root, plus mounted volumes on macOS.
+        entries.push({ name: '/', path: '/' });
+        if (process.platform === 'darwin') {
+          try {
+            for (const d of fs.readdirSync('/Volumes', { withFileTypes: true })) {
+              const full = `/Volumes/${d.name}`;
+              let ok = d.isDirectory();
+              // The boot volume is listed as a symlink to /.
+              if (!ok && d.isSymbolicLink()) { try { ok = fs.statSync(full).isDirectory(); } catch { /* skip */ } }
+              if (ok) entries.push({ name: d.name, path: full });
+            }
+          } catch { /* no /Volumes */ }
+        }
+        return { path: null, parent: null, entries };
+      }
       for (let c = 65; c <= 90; c++) {
         const d = String.fromCharCode(c) + ':';
         if (fs.existsSync(`${d}\\`)) entries.push({ name: d, path: `${d}\\` });

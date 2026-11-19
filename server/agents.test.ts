@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { agyConversationState, agyResumeId, agyTranscriptFile, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, codexHasUserDeveloperInstructions, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
+import { agyConversationState, agyResumeId, agyTranscriptFile, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, codexHasUserDeveloperInstructions, codexLaunch, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
 import { pickColor } from './store.ts';
 import { TASK_COLORS } from '../shared/protocol.ts';
 
@@ -11,11 +11,14 @@ const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-test-'));
 const build = (agent: 'claude' | 'codex' | 'agy' | 'fake', prompt: string, sessionId = 'sid') =>
   buildLaunch({ agent, sessionId, prompt, stateDir });
 
+// Windows runs codex.js on the bundled Node (one prefix arg); POSIX runs whatever `codex` resolves to, often no prefix.
+const codexPrefix = codexLaunch().prefix.length;
+
 describe('buildLaunch', () => {
   it('codex hook args are byte-identical to the M0 probe format and never bypass trust', () => {
     const { args } = build('codex', 'do it');
     const hookToml = (ev: string) => `hooks.${ev}=[{hooks=[{type="command",command='${NODE} "${NOTIFY}" codex ${ev}',timeout=5}]}]`;
-    expect(args.slice(1)).toEqual([
+    expect(args.slice(codexPrefix)).toEqual([
       '-c', hookToml('SessionStart'),
       '-c', hookToml('UserPromptSubmit'),
       '-c', hookToml('Stop'),
@@ -85,8 +88,8 @@ describe('buildLaunch', () => {
     expect(c.args.slice(0, 2)).toEqual(['--resume', 'n-1']);
     expect(c.nativeSessionId).toBe('n-1');
     const x = resume('codex');
-    expect(x.args.slice(1, 3)).toEqual(['resume', 'n-1']);
-    expect(x.args.slice(3)).toEqual(build('codex', '').args.slice(1)); // trust hashes still match
+    expect(x.args.slice(codexPrefix, codexPrefix + 2)).toEqual(['resume', 'n-1']);
+    expect(x.args.slice(codexPrefix + 2)).toEqual(build('codex', '').args.slice(codexPrefix)); // trust hashes still match
     expect(resume('agy').args.slice(0, 2)).toEqual(['--conversation', 'n-1']);
     for (const a of ['claude', 'codex', 'agy', 'fake'] as const) {
       expect(resume(a).args).not.toContain('ignored');

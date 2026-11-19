@@ -177,8 +177,10 @@ describe('cross-CLI collaboration (Layers 1-3)', () => {
   const prevFake = process.env.WORKBENCH_FAKE_AGENT;
   const prevLocal = process.env.LOCALAPPDATA;
   const prevAgy = process.env.AGY_CONFIG_DIR;
+  const prevPath = process.env.PATH;
 
   afterEach(() => {
+    if (prevPath === undefined) delete process.env.PATH; else process.env.PATH = prevPath;
     vi.restoreAllMocks();
     if (prevFake === undefined) delete process.env.WORKBENCH_FAKE_AGENT; else process.env.WORKBENCH_FAKE_AGENT = prevFake;
     if (prevLocal === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = prevLocal;
@@ -327,6 +329,12 @@ describe('cross-CLI collaboration (Layers 1-3)', () => {
     fs.mkdirSync(path.join(agyLocal, 'agy', 'bin'), { recursive: true });
     fs.writeFileSync(path.join(agyLocal, 'agy', 'bin', 'agy.exe'), '');
     process.env.LOCALAPPDATA = agyLocal;
+    if (process.platform !== 'win32') {
+      // POSIX finds agy on PATH, not under LOCALAPPDATA.
+      const agyBin = path.join(agyLocal, 'agy', 'bin');
+      fs.writeFileSync(path.join(agyBin, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+      process.env.PATH = `${agyBin}${path.delimiter}${process.env.PATH ?? ''}`;
+    }
     process.env.AGY_CONFIG_DIR = agyCfg;
 
     const h = await setupHarness();

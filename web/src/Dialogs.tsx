@@ -5,6 +5,9 @@ import type { AgentKind, AgyOptimizeStatus, Card, CreateProjectBody, CreateTaskB
 import { AGENT_LABEL, AGY_MODELS, DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, FORWARD_NOTE, forwardText } from '../../shared/protocol.ts';
 import { QrCodeSvg } from './QrCode.tsx';
 
+// Only for wording (placeholders, the root-list label); the server decides what a path is.
+const IS_MAC = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform || navigator.userAgent);
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   const json = (await res.json().catch(() => ({}))) as { error?: string };
@@ -64,9 +67,9 @@ function DirBrowser({ start, onSelect }: { start: string; onSelect(dir: string):
     <div className="dir-browser" data-testid="dir-browser">
       <div className="dir-bar">
         <button type="button" data-testid="dir-up" disabled={!canUp} onClick={up}>上一级</button>
-        <button type="button" data-testid="dir-drives" onClick={() => load('?drives=1')}>磁盘</button>
+        <button type="button" data-testid="dir-drives" onClick={() => load('?drives=1')}>{IS_MAC ? '根目录' : '磁盘'}</button>
         <span className="dir-current" data-testid="dir-current" data-private="" title={privacy ? undefined : listing?.path ?? ''}>
-          {listing ? (listing.path ?? '此电脑') : ''}
+          {listing ? (listing.path ?? (IS_MAC ? '根目录 / 卷' : '此电脑')) : ''}
         </span>
       </div>
       {error && <div className="form-error" data-testid="dir-error">{error}</div>}
@@ -980,7 +983,7 @@ export function ProjectDialog({ onClose, onCreated }: { onClose(): void; onCreat
       <label>名称<input data-testid="project-name" data-private="" value={name} onChange={(e) => setName(e.target.value)} /></label>
       <label>路径
         <div className="path-row">
-          <input data-testid="project-path" data-private="" value={path} placeholder="C:\Projects\my-app" onChange={(e) => setPath(e.target.value)} />
+          <input data-testid="project-path" data-private="" value={path} placeholder={IS_MAC ? '/Users/you/Projects/my-app' : 'C:\\Projects\\my-app'} onChange={(e) => setPath(e.target.value)} />
           <button type="button" data-testid="project-browse" onClick={() => setBrowsing((b) => !b)}>浏览…</button>
         </div>
       </label>

@@ -19,6 +19,17 @@ const DELIVERY_GAP_MS = 2000; // between two deliveries to the same session
 // Margin after the Stop hook: it fires as the turn ends, while the TUI may still be redrawing its prompt.
 const SETTLE_MS = 1500;
 const ENTER_DELAY_MS = 300; // pasted text first, Enter separately
+const ENTER_POLL_MS = 50;
+// Codex on Windows drains pastes as per-key console events (~2,000 chars/s) and suppresses Enter for ~120 ms after a
+// paste burst so trailing newlines in clipboard pastes do not auto-submit. Wait for both a size-based floor and PTY
+// echo silence before sending `\r`, capped so continuous status output cannot starve submission.
+const CODEX_ENTER_MS_PER_CHAR = 0.5;
+const CODEX_ENTER_FLOOR_CAP_MS = 6000;
+const CODEX_ECHO_QUIET_MS = 250;
+const ECHO_QUIET_MS = 150;
+const ENTER_MAX_WAIT_MS = 12_000;
+const CODEX_SANDBOX_WAIT_MS = 15_000;
+const CODEX_SANDBOX_SETTLE_MS = 400;
 const DELIVERY_INFLIGHT_MS = 8000; // lock queue until UserPromptSubmit/PreInvocation arrives (or lock expires)
 const SYSTEM_INJECT_TTL_MS = 15_000;
 const PASTE_START = '\x1b[200~';
@@ -27,7 +38,7 @@ const PASTE_END = '\x1b[201~';
 // before that counts as a crash, and two of them turn fullscreen (and with it mouse clicks on its menus) off for that version.
 const CLAUDE_HEALTHY_MS = 11_000;
 export const ENV_STRIP = /^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_AGENT|CODEX_SANDBOX|CODEX_THREAD|AGY_SESSION)/;
-export const STARTUP_BLOCK_RE = /Hooks need review|Do you trust the files in this folder|trust this folder|No,\s*exit/i;
+export const STARTUP_BLOCK_RE = /Hooks need review|Trust all and continue|Do you trust the files in this folder|trust this folder|No,\s*exit/i;
 
 const TERM_REPORT_RE = /^(?:\x1b\[(?:[IO]|<\d+(?:;\d+)*[Mm]|\d+(?:;\d+)*R|[?>=]?[\d;]*c|\?[\d;]+\$y)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))+$/;
 
@@ -87,6 +98,8 @@ interface Live {
   startupBlocked: boolean; // a trust / hooks-review startup prompt was detected before first turn
   firstTurnSeen: boolean;
   startupTail: string;
+  codexTail: string;
+  inputDisabledUntil: number; // Codex composer disabled while `Setting up sandbox...` runs
   hasDraft: boolean; // user typed/pasted uncommitted characters at the prompt
   interruptedByUser: boolean; // user pressed Ctrl+C while messages were queued
   lastInputAt: number; // last keystroke from the user (injected writes & terminal reports do not count)
@@ -108,6 +121,7 @@ interface Live {
   trimmed: boolean; // buf has lost its start
   scrollDirty: boolean; // buf changed since it was last written to disk
   firstOutAt: number; // 0 until the PTY first writes
+  lastOutAt: number; // 0 until the PTY writes non-empty output
   initialPromptPending: boolean; // true until the launch prompt's first hook arrives, so spawn jitter cannot reorder tasks
 }
 
@@ -238,6 +252,7 @@ export function sanitizePaste(text: string): string {
 // Ctrl+J as a win32-input-mode key record (Vk;Sc;Uc;Kd;Cs;Rc_, down then up; ConPTY enables ?9001h itself).
 // Codex on Windows reads key events, not the paste: a \n is kept only inside its ASCII paste-burst heuristic,
 // so after Chinese text it was dropped. Ctrl+J is Codex's insert-newline key and works after any text.
+// Only used on Windows: on POSIX Codex gets the whole text through bracketed paste, so a plain \n is kept.
 export const CODEX_NEWLINE = '\x1b[74;36;10;1;8;1_\x1b[74;36;10;0;8;1_';
 
 // Bytes to write for a paste: one bracketed-paste block, or a single line when the CLI has no bracketed paste.
@@ -256,8 +271,32 @@ export interface DeliveryState {
   initialPromptPending?: boolean;
   startupBlocked?: boolean;
   deliveringUntil?: number;
+  inputDisabledUntil?: number;
+  enterPending?: boolean;
   hasDraft?: boolean;
   interruptedByUser?: boolean;
+}
+
+export function enterReady(opts: {
+  agent: AgentKind;
+  chars: number;
+  injectAt: number;
+  lastOutAt: number;
+  now: number;
+}): { ready: boolean; nextDelayMs: number } {
+  const floor = opts.agent === 'codex'
+    ? Math.min(CODEX_ENTER_FLOOR_CAP_MS, ENTER_DELAY_MS + Math.ceil(Math.max(0, opts.chars) * CODEX_ENTER_MS_PER_CHAR))
+    : ENTER_DELAY_MS;
+  const elapsed = Math.max(0, opts.now - opts.injectAt);
+  if (elapsed >= ENTER_MAX_WAIT_MS) return { ready: true, nextDelayMs: 0 };
+  const floorRem = Math.max(0, floor - elapsed);
+  const quietTarget = opts.agent === 'codex' ? CODEX_ECHO_QUIET_MS : ECHO_QUIET_MS;
+  const quietRem = opts.lastOutAt > opts.injectAt
+    ? Math.max(0, quietTarget - Math.max(0, opts.now - opts.lastOutAt))
+    : 0;
+  const wait = Math.max(floorRem, quietRem);
+  if (wait <= 0) return { ready: true, nextDelayMs: 0 };
+  return { ready: false, nextDelayMs: Math.min(ENTER_MAX_WAIT_MS - elapsed, Math.max(ENTER_POLL_MS, wait)) };
 }
 
 // Whether the head of a session's queue may be pasted now.
@@ -267,9 +306,11 @@ export function deliverable(s: DeliveryState, now: number): boolean {
     && !s.permBlocked
     && !s.initialPromptPending
     && !s.startupBlocked
+    && !s.enterPending
     && !s.hasDraft
     && !s.interruptedByUser
     && now >= (s.deliveringUntil ?? 0)
+    && now >= (s.inputDisabledUntil ?? 0)
     && now - s.lastInputAt >= TYPING_QUIET_MS
     && now - s.lastDeliveryAt >= DELIVERY_GAP_MS;
 }
@@ -474,10 +515,10 @@ export class SessionManager {
         status: 'starting', statusSince: now, startedAt: now, exitCode: null, cols, rows,
       },
       cwd: o.cwd, collabDir, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
-      queue: [], permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '',
+      queue: [], permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '', codexTail: '', inputDisabledUntil: 0,
       hasDraft: false, interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
       inputSeq: 0, waitSeq: 0, outSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
-      modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0,
+      modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0, lastOutAt: 0,
       initialPromptPending: Boolean(o.prompt && !o.resume),
     };
     this.live.set(id, s);
@@ -485,16 +526,31 @@ export class SessionManager {
     this.armQuiet(s);
     this.armScrollSave();
     proc.onData(d => {
-      if (!s.firstOutAt) s.firstOutAt = Date.now();
-      if (d) s.outSeq++;
-      trackModes(s.modes, s.tail + d);
-      s.tail = (s.tail + d).slice(-MODE_TAIL);
+      const outNow = Date.now();
+      if (!s.firstOutAt) s.firstOutAt = outNow;
+      if (d) {
+        s.lastOutAt = outNow;
+        s.outSeq++;
+      }
+      const prevTail = s.tail;
+      trackModes(s.modes, prevTail + d);
+      s.tail = (prevTail + d).slice(-MODE_TAIL);
       if (!s.firstTurnSeen) {
-        s.startupTail = (s.startupTail + d).slice(-1024);
-        if (!s.startupBlocked && STARTUP_BLOCK_RE.test(stripAnsiForMatch(s.startupTail))) {
+        s.startupTail = (s.startupTail + stripAnsiForMatch(prevTail + d)).slice(-1024);
+        if (!s.startupBlocked && STARTUP_BLOCK_RE.test(s.startupTail)) {
           s.startupBlocked = true;
           s.waitSeq++;
           if (this.syncBlocked(s) && !s.removed) this.emit({ t: 'session', session: s.info });
+        }
+      }
+      if (s.info.agent === 'codex') {
+        s.codexTail = (s.codexTail + stripAnsiForMatch(prevTail + d)).slice(-1024);
+        const disIdx = s.codexTail.lastIndexOf('Input disabled until setup completes');
+        const rdyIdx = s.codexTail.lastIndexOf('Sandbox ready');
+        if (disIdx >= 0 && rdyIdx < disIdx && s.codexTail.slice(Math.max(0, disIdx - 240), disIdx).includes('Setting up sandbox')) {
+          if (s.inputDisabledUntil <= outNow) s.inputDisabledUntil = outNow + CODEX_SANDBOX_WAIT_MS;
+        } else if (rdyIdx >= 0 && s.inputDisabledUntil > outNow + CODEX_SANDBOX_SETTLE_MS) {
+          s.inputDisabledUntil = outNow + CODEX_SANDBOX_SETTLE_MS;
         }
       }
       s.buf += d;
@@ -616,6 +672,7 @@ export class SessionManager {
       s.startupBlocked = false;
       if (this.syncBlocked(s)) changed = true;
       s.deliveringUntil = 0;
+      s.inputDisabledUntil = 0;
       s.hasDraft = false;
       s.interruptedByUser = false;
       const now = Date.now();
@@ -726,7 +783,9 @@ export class SessionManager {
     let pending = false;
     for (const s of this.live.values()) {
       if (!s.queue.length) continue;
-      if (deliverable({ ...s, status: s.info.status, statusSince: s.info.statusSince }, now)) this.deliver(s, now);
+      if (deliverable({ ...s, status: s.info.status, statusSince: s.info.statusSince, enterPending: s.enterTimer !== null }, now)) {
+        this.deliver(s, now);
+      }
       if (s.queue.length) pending = true;
     }
     if (!pending && this.queueTimer) {
@@ -738,17 +797,19 @@ export class SessionManager {
   private deliver(s: Live, now: number) {
     const item = s.queue.shift()!;
     const { text, system, onDelivered } = item;
+    const cleanChars = sanitizePaste(text).length;
+    const initial = enterReady({ agent: s.info.agent, chars: cleanChars, injectAt: now, lastOutAt: s.lastOutAt, now });
     s.lastDeliveryAt = now;
-    s.deliveringUntil = now + DELIVERY_INFLIGHT_MS;
+    s.deliveringUntil = now + initial.nextDelayMs + DELIVERY_INFLIGHT_MS;
     s.permBlocked = false;
     s.waitSeq++;
     this.syncBlocked(s);
     if (system) {
       s.systemInjectedPending++;
-      s.systemInjectedUntil = now + SYSTEM_INJECT_TTL_MS;
+      s.systemInjectedUntil = now + initial.nextDelayMs + SYSTEM_INJECT_TTL_MS;
     }
     const seq = s.inputSeq;
-    const frame = pasteFrame(text, s.modes.get(2004) === true, s.info.agent === 'codex' ? CODEX_NEWLINE : '\n');
+    const frame = pasteFrame(text, s.modes.get(2004) === true, s.info.agent === 'codex' && process.platform === 'win32' ? CODEX_NEWLINE : '\n');
     try {
       s.proc.write(frame);
     } catch (e) {
@@ -756,21 +817,43 @@ export class SessionManager {
     }
     if (s.enterTimer) clearTimeout(s.enterTimer);
     s.enterWasSystem = system;
-    s.enterTimer = setTimeout(() => {
-      s.enterTimer = null;
-      s.enterWasSystem = false;
-      if (s.removed || s.info.status === 'exited' || s.inputSeq !== seq) {
-        s.deliveringUntil = 0;
-        if (system && s.systemInjectedPending > 0) s.systemInjectedPending--;
-        return;
-      }
-      try {
-        s.proc.write('\r');
-        onDelivered?.();
-      } catch (e) {
-        console.warn('[inject]', (e as Error).message);
-      }
-    }, ENTER_DELAY_MS);
+    const injectAt = now;
+    const scheduleEnter = (delayMs: number) => {
+      s.enterTimer = setTimeout(() => {
+        s.enterTimer = null;
+        if (s.removed || s.info.status === 'exited' || s.inputSeq !== seq) {
+          s.enterWasSystem = false;
+          s.deliveringUntil = 0;
+          if (system && s.systemInjectedPending > 0) s.systemInjectedPending--;
+          return;
+        }
+        const pollNow = Date.now();
+        const r = enterReady({
+          agent: s.info.agent,
+          chars: cleanChars,
+          injectAt,
+          lastOutAt: s.lastOutAt,
+          now: pollNow,
+        });
+        if (!r.ready) {
+          s.deliveringUntil = pollNow + r.nextDelayMs + DELIVERY_INFLIGHT_MS;
+          if (system) s.systemInjectedUntil = pollNow + r.nextDelayMs + SYSTEM_INJECT_TTL_MS;
+          scheduleEnter(r.nextDelayMs);
+          return;
+        }
+        s.enterWasSystem = false;
+        s.lastDeliveryAt = pollNow;
+        s.deliveringUntil = pollNow + DELIVERY_INFLIGHT_MS;
+        if (system) s.systemInjectedUntil = pollNow + SYSTEM_INJECT_TTL_MS;
+        try {
+          s.proc.write('\r');
+          onDelivered?.();
+        } catch (e) {
+          console.warn('[inject]', (e as Error).message);
+        }
+      }, delayMs);
+    };
+    scheduleEnter(initial.nextDelayMs);
     s.info.queued = s.queue.length;
     this.emit({ t: 'session', session: s.info });
     this.log({ kind: 'inject', sessionId: s.info.id, chars: text.length, system, at: now });

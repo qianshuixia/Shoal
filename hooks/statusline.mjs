@@ -37,12 +37,15 @@ function runUser(raw) {
     const timer = setTimeout(() => {
       // shell: true leaves the real command as a grandchild on Windows; take the whole tree down.
       if (child?.pid && process.platform === 'win32') spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
-      else child?.kill();
+      else if (child?.pid) {
+        // Detached on POSIX (own process group), so one signal also reaches the shell's grandchildren.
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill(); }
+      } else child?.kill();
       out = '';
       end();
     }, 3000);
     try {
-      child = spawn(userCmd, { shell: true, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+      child = spawn(userCmd, { shell: true, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true, ...(process.platform !== 'win32' && { detached: true }) });
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', c => { out += c; });
       child.on('error', () => { out = ''; end(); });

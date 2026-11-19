@@ -311,6 +311,11 @@ describe('Antigravity model tier selection & API validation', () => {
     fs.mkdirSync(fakeAgyBin, { recursive: true });
     fs.writeFileSync(path.join(fakeAgyBin, 'agy.exe'), 'stub');
     vi.stubEnv('LOCALAPPDATA', fakeLocalAppData);
+    if (process.platform !== 'win32') {
+      // POSIX finds agy on PATH, not under LOCALAPPDATA.
+      fs.writeFileSync(path.join(fakeAgyBin, 'agy'), '#!/bin/sh\n', { mode: 0o755 });
+      vi.stubEnv('PATH', `${fakeAgyBin}${path.delimiter}${process.env.PATH ?? ''}`);
+    }
 
     const spawns: Array<{ args: string[] }> = [];
     vi.spyOn(pty, 'spawn').mockImplementation(((_file: string, args: string[] | string) => {

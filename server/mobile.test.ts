@@ -343,14 +343,17 @@ describe('mobile gateway & security integration', () => {
     expect(JSON.stringify(mobState2.cards)).not.toContain(tmp);
 
     // Inject a custom-drive project + task outside homedir/tmpdir so WS initial snapshot must scrub via getExtraDirs().
-    store.addProject({ id: 'p-custom-drive', name: 'CustomDriveProj', path: 'Z:\\secret-enterprise-repo', createdAt: 2 });
+    // POSIX has no drive letters: /Volumes is outside homedir/tmpdir and not covered by the generic path pattern either.
+    const customRoot = process.platform === 'win32' ? 'Z:\\secret-enterprise-repo' : '/Volumes/secret-enterprise-repo';
+    const customSep = process.platform === 'win32' ? '\\' : '/';
+    store.addProject({ id: 'p-custom-drive', name: 'CustomDriveProj', path: customRoot, createdAt: 2 });
     store.addTask({
       id: 't-custom-drive',
       projectId: 'p-custom-drive',
       title: '盘符脱敏',
       titleAuto: false,
       color: '#90b5dc',
-      prompt: '读取（Z:\\secret-enterprise-repo\\config.yaml）并检查',
+      prompt: `读取（${customRoot}${customSep}config.yaml）并检查`,
       agent: 'fake',
       phase: 'active',
       phaseSince: 2,
@@ -698,7 +701,9 @@ describe('mobile gateway & security integration', () => {
     cleanups.push(async () => { fs.rmSync(tmpState, { recursive: true, force: true }); });
     const homeSecret = path.join(os.homedir(), '.claude', 'projects', 'demo', 'trace.jsonl');
     const noteSecret = path.join(os.homedir(), 'secret-notes', 'plan.md');
-    const customRepo = 'D:\\custom-secret-repo\\src\\index.ts';
+    // Outside homedir/tmpdir; host-shaped, since a drive path means nothing to path.resolve on POSIX.
+    const customRoot = process.platform === 'win32' ? 'D:\\custom-secret-repo' : '/Volumes/custom-secret-repo';
+    const customRepo = path.join(customRoot, 'src', 'index.ts');
 
     const sanitized = sanitizeTaskForMobile(
       {
@@ -732,7 +737,7 @@ describe('mobile gateway & security integration', () => {
     const handoffScrubbed = scrubStatePaths(
       `完整对话记录在 ${homeSecret}。项目文件 ${customRepo}。`,
       tmpState,
-      ['D:\\custom-secret-repo'],
+      [customRoot],
     );
     expect(handoffScrubbed).toBe('完整对话记录在 [本机路径]。项目文件 [本机路径]。');
 
