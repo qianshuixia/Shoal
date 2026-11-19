@@ -401,7 +401,7 @@ kbd {
   position: absolute; top: 0.5rem; right: 0.75rem; z-index: 12; pointer-events: none;
   padding: 0.25rem 0.625rem; border-radius: 999px; font-size: 0.75rem;
   background: var(--raised); border: 1px solid var(--line-2); color: var(--text-2);
-  box-shadow: 0 0.375rem 1.25rem rgba(0, 0, 0, .4);
+  transform: translateZ(0);
 }
 /* Header split pill: one-click Approve on the left, secondary actions & card text in a floating popover on the right. */
 .review-split {
@@ -423,7 +423,7 @@ kbd {
   width: min(23rem, calc(100% - 1.25rem)); max-height: calc(100% - 2.875rem);
   display: flex; flex-direction: column;
   background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.5rem;
-  box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .5); overflow: hidden;
+  overflow: hidden; transform: translateZ(0);
 }
 .review-popover:has(.review-body) { width: min(32rem, calc(100% - 1.25rem)); }
 .review-menu { display: flex; flex-direction: column; padding: 0.25rem; flex: none; }
@@ -533,7 +533,7 @@ kbd {
   max-height: 45vh; overflow-y: auto; padding: 0.5rem 0.625rem;
   white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2);
   background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.5rem;
-  box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .5);
+  transform: translateZ(0);
 }
 .hint { color: var(--text-3); font-size: 0.75rem; }
 .modal .preview {
@@ -837,32 +837,41 @@ kbd {
 .task-preview.is-activity.is-stalled { color: var(--signal); }
 
 /* Floating Live Activity HUD inside .pane-stage: strictly position:absolute so .pane-body never resizes or clears ConPTY. */
+/* Keep HUD layers tightly sized (no full-width left+right stretch), fully opaque, and free of backdrop-filter / outer
+   box-shadow / main-thread box-shadow animations: over xterm's WebGL2 canvas, WebView2/DirectComposition left stale pill
+   pixels (ghosts) and accumulated shadow smudges in transparent layer margins when a pill shrank or updated. */
+@keyframes hud-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .42; transform: scale(.82); }
+}
 .pane-stage:has(.activity-hud) .pane-queued { top: 2.5rem; }
 .activity-hud {
-  position: absolute; top: 0.5rem; right: 0.75rem; left: 0.75rem; z-index: 8;
+  position: absolute; top: 0.5rem; right: 0.75rem; z-index: 8;
+  max-width: min(34rem, calc(100% - 1.5rem));
   display: flex; flex-direction: column; align-items: flex-end; gap: 0.375rem;
   pointer-events: none;
+  transform: translateZ(0);
 }
 .activity-bar {
-  display: inline-flex; align-items: center; gap: 0.375rem; max-width: min(34rem, 100%);
+  display: inline-flex; align-items: center; gap: 0.375rem; max-width: 100%;
   pointer-events: auto;
 }
 .activity-pill {
   display: inline-flex; align-items: center; gap: 0.4375rem; height: 1.625rem; max-width: 100%; min-width: 0;
   padding: 0 0.5625rem; border-radius: 999px; font-size: 0.75rem;
-  background: rgba(20, 22, 26, .92); backdrop-filter: blur(8px);
+  background: rgb(20, 22, 26);
   border: 1px solid color-mix(in srgb, var(--work) 32%, var(--line-2));
-  color: var(--text-2); box-shadow: 0 0.375rem 1.25rem rgba(0, 0, 0, .42);
+  color: var(--text-2);
 }
 .activity-pill:hover:not(:disabled) { background: var(--raised); color: var(--text); }
 .activity-dot {
   flex: none; width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: var(--work);
-  box-shadow: 0 0 0 0 var(--ring); animation: ping 1.8s cubic-bezier(.2, .6, .3, 1) infinite;
+  animation: hud-pulse 1.8s ease-in-out infinite;
 }
 .activity-hud.phase-error .activity-dot { background: var(--danger); }
 .activity-hud.stalled .activity-pill {
   border-color: color-mix(in srgb, var(--signal) 55%, var(--line-2));
-  background: color-mix(in srgb, var(--signal) 12%, rgba(20, 22, 26, .95));
+  background: color-mix(in srgb, var(--signal) 12%, rgb(20, 22, 26));
   color: var(--text);
 }
 .activity-hud.stalled .activity-dot { background: var(--signal); animation: none; }
@@ -883,20 +892,19 @@ kbd {
 .activity-chev.on { transform: rotate(180deg); }
 .activity-interrupt {
   flex: none; height: 1.625rem; padding: 0 0.625rem; border-radius: 999px; font-size: 0.75rem; font-weight: 500;
-  color: var(--signal); background: rgba(20, 22, 26, .95);
+  color: var(--signal); background: rgb(20, 22, 26);
   border: 1px solid color-mix(in srgb, var(--signal) 55%, var(--line-2));
-  box-shadow: 0 0.375rem 1.25rem rgba(0, 0, 0, .42);
 }
 .activity-interrupt:hover:not(:disabled) {
   background: color-mix(in srgb, var(--signal) 22%, var(--raised)); color: var(--text);
 }
 .activity-popover {
   pointer-events: auto;
-  width: min(28rem, 100%); max-height: min(20rem, calc(100% - 2.5rem));
+  width: 28rem; max-width: 100%; max-height: min(20rem, calc(100vh - 8rem));
   display: flex; flex-direction: column; gap: 0.5rem; padding: 0.625rem 0.75rem;
-  background: rgba(22, 24, 28, .97); backdrop-filter: blur(10px);
+  background: rgb(22, 24, 28);
   border: 1px solid var(--line-2); border-radius: 0.5rem;
-  box-shadow: 0 0.875rem 2.25rem rgba(0, 0, 0, .55); overflow-y: auto;
+  overflow-y: auto;
 }
 .activity-popover-head { display: flex; align-items: center; gap: 0.4375rem; flex-wrap: wrap; font-size: 0.7188rem; }
 .activity-phase-tag {
@@ -1024,9 +1032,11 @@ kbd {
 
 /* Strictly position:absolute inside .pane-stage (like .activity-hud): .pane-body must never resize or ConPTY redraws. */
 .delegation-hud {
-  position: absolute; top: 0.5rem; right: 0.75rem; left: 0.75rem; z-index: 7;
+  position: absolute; top: 0.5rem; right: 0.75rem; z-index: 7;
+  max-width: min(34rem, calc(100% - 1.5rem));
   display: flex; flex-direction: column; align-items: flex-end; gap: 0.375rem;
   pointer-events: none;
+  transform: translateZ(0);
 }
 .pane-stage:has(.activity-hud) .delegation-hud { top: 2.5rem; }
 .pane-stage:has(.delegation-hud) .pane-queued { top: 2.5rem; }
@@ -1035,10 +1045,10 @@ kbd {
 .delegation-hud:has(.delegation-popover), .activity-hud:has(.activity-popover) { z-index: 13; }
 .delegation-pill {
   pointer-events: auto;
-  display: inline-flex; align-items: center; gap: 0.4375rem; height: 1.625rem; max-width: min(34rem, 100%); min-width: 0;
+  display: inline-flex; align-items: center; gap: 0.4375rem; height: 1.625rem; max-width: 100%; min-width: 0;
   padding: 0 0.5625rem; border-radius: 999px; font-size: 0.75rem;
-  background: rgba(20, 22, 26, .92); backdrop-filter: blur(8px);
-  border: 1px solid var(--line-2); color: var(--text-2); box-shadow: 0 0.375rem 1.25rem rgba(0, 0, 0, .42);
+  background: rgb(20, 22, 26);
+  border: 1px solid var(--line-2); color: var(--text-2);
 }
 .delegation-pill:hover:not(:disabled) { background: var(--raised); color: var(--text); }
 .delegation-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; }
@@ -1062,14 +1072,14 @@ kbd {
 .delegation-hud.level-needs_you .delegation-pill { border-color: color-mix(in srgb, var(--signal) 55%, var(--line-2)); }
 .delegation-hud.level-failed .delegation-dot { background: var(--danger); }
 .delegation-hud.level-review .delegation-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-2); }
-.delegation-hud.level-working .delegation-dot { background: var(--work); box-shadow: 0 0 0 0 var(--ring); animation: ping 1.8s cubic-bezier(.2, .6, .3, 1) infinite; }
+.delegation-hud.level-working .delegation-dot { background: var(--work); animation: hud-pulse 1.8s ease-in-out infinite; }
 .delegation-popover {
   pointer-events: auto;
-  width: min(28rem, 100%); max-height: min(22rem, calc(100% - 2.5rem));
+  width: 28rem; max-width: 100%; max-height: min(22rem, calc(100vh - 10rem));
   display: flex; flex-direction: column; gap: 0.25rem; padding: 0.375rem;
-  background: rgba(22, 24, 28, .97); backdrop-filter: blur(10px);
+  background: rgb(22, 24, 28);
   border: 1px solid var(--line-2); border-radius: 0.5rem;
-  box-shadow: 0 0.875rem 2.25rem rgba(0, 0, 0, .55); overflow-y: auto;
+  overflow-y: auto;
 }
 .delegation-item {
   display: flex; flex-direction: column; align-items: stretch; gap: 0.1875rem; padding: 0.375rem 0.5rem;

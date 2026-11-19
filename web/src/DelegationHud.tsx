@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { DelegationState, SessionActivity, SessionInfo, Task } from '../../shared/protocol.ts';
 import { DELEGATION_LABEL, delegationDisplayTitle } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
@@ -29,15 +29,44 @@ const LEVELS: Level[] = ['needs_you', 'failed', 'review', 'working', 'closed'];
 
 // Floating HUD for a main task's delegated children, overlaid inside .pane-stage: position:absolute so .pane-body never
 // resizes (a height change makes xterm + ConPTY resize the PTY and redraw the screen).
-export function DelegationHud({ delegates, now, onOpen, onRestoreFocus }: {
+export function DelegationHud({ delegates, now, hasActivity, onOpen, onRestoreFocus, onVacate }: {
   delegates: DelegateView[];
   now: number;
+  hasActivity?: boolean;
   onOpen(sessionId: string): void;
   onRestoreFocus?(): void;
+  onVacate?(): void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const prevBoxRef = useRef({ w: 0, h: 0, top: 0 });
+  const vacateRafRef = useRef(0);
+  const onVacateRef = useRef(onVacate);
+  onVacateRef.current = onVacate;
   const privacy = usePrivacy();
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const top = el.offsetTop;
+    const prev = prevBoxRef.current;
+    prevBoxRef.current = { w, h, top };
+    if (prev.w > 0 && (w < prev.w || h < prev.h || top !== prev.top)) {
+      cancelAnimationFrame(vacateRafRef.current);
+      vacateRafRef.current = requestAnimationFrame(() => {
+        vacateRafRef.current = 0;
+        onVacateRef.current?.();
+      });
+    }
+  }, [delegates, open, hasActivity]);
+
+  useEffect(() => () => {
+    cancelAnimationFrame(vacateRafRef.current);
+    const fn = onVacateRef.current;
+    if (fn) requestAnimationFrame(fn);
+  }, []);
 
   useEffect(() => {
     if (!open) return;

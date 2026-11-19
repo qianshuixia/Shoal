@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } fr
 import type { CSSProperties, DragEvent, RefObject } from 'react';
 import type { ActivityPhase, Card, Project, QuotaInfo, SessionActivity, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
 import { AGENT_LABEL, DELEGATION_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
-import { attach, fitEntry, focusOnly, isReplayEmpty, requestReplay, subscribeReplayEmpty } from './terms.ts';
+import { attach, detach, fitEntry, focusOnly, isReplayEmpty, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty } from './terms.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
@@ -82,16 +82,66 @@ function fileBase(p: string): string {
 }
 
 // Floating live activity HUD overlaid inside .pane-stage: position:absolute so .pane-body never resizes or clears ConPTY.
-function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus }: {
+function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus, onVacate }: {
   activity: SessionActivity;
   now: number;
   onInterrupt?(): void;
   onInspectFile?(filePath: string): void;
   onRestoreFocus?(): void;
+  onVacate?(): void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const prevBoxRef = useRef({ w: 0, h: 0, top: 0 });
+  const vacateRafRef = useRef(0);
+  const onVacateRef = useRef(onVacate);
+  onVacateRef.current = onVacate;
   const privacy = usePrivacy();
+
+  const turnSec = Math.max(0, Math.floor((now - activity.turnStartedAt) / 1000));
+  const idleMs = Math.max(0, now - activity.lastProgressAt);
+  const idleSec = Math.floor(idleMs / 1000);
+  const stalled = idleMs >= ACTIVITY_STALL_MS;
+  const writtenSet = new Set(activity.filesWritten);
+  const touchedFiles = [
+    ...activity.filesWritten,
+    ...activity.filesRead.filter((f) => !writtenSet.has(f)),
+  ].slice(0, 12);
+  const hasInterrupt = !!onInterrupt;
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const top = el.offsetTop;
+    const prev = prevBoxRef.current;
+    prevBoxRef.current = { w, h, top };
+    if (prev.w > 0 && (w < prev.w || h < prev.h || top !== prev.top)) {
+      cancelAnimationFrame(vacateRafRef.current);
+      vacateRafRef.current = requestAnimationFrame(() => {
+        vacateRafRef.current = 0;
+        onVacateRef.current?.();
+      });
+    }
+  }, [
+    activity.summary,
+    activity.stepCount,
+    stalled,
+    stalled ? idleSec : 0,
+    hasInterrupt,
+    open,
+    open ? activity.thinkingSnippet : '',
+    open ? activity.recentSteps.length : 0,
+    open ? touchedFiles.length : 0,
+    turnSec,
+  ]);
+
+  useEffect(() => () => {
+    cancelAnimationFrame(vacateRafRef.current);
+    const fn = onVacateRef.current;
+    if (fn) requestAnimationFrame(fn);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -114,15 +164,6 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
     };
   }, [open, onRestoreFocus]);
 
-  const turnSec = Math.max(0, Math.floor((now - activity.turnStartedAt) / 1000));
-  const idleMs = Math.max(0, now - activity.lastProgressAt);
-  const idleSec = Math.floor(idleMs / 1000);
-  const stalled = idleMs >= ACTIVITY_STALL_MS;
-  const writtenSet = new Set(activity.filesWritten);
-  const touchedFiles = [
-    ...activity.filesWritten,
-    ...activity.filesRead.filter((f) => !writtenSet.has(f)),
-  ].slice(0, 12);
   const steps = activity.recentSteps.slice().reverse();
 
   return (
@@ -250,21 +291,32 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
 }
 
 // Floating popover anchored below the header's 待验收 split pill: never alters .pane-body height or triggers PTY resize.
-function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForward }: {
+function ReviewPopover({ card, toggleRef, onClose, onEscape, onFeedback, onForward, onVacate }: {
   card: Card;
   toggleRef: RefObject<HTMLButtonElement | null>;
   onClose(): void;
   onEscape(): void;
   onFeedback(): void;
   onForward(): void;
+  onVacate?(): void;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  const handlersRef = useRef({ onClose, onEscape });
-  handlersRef.current = { onClose, onEscape };
+  const prevOpenRef = useRef(false);
+  const handlersRef = useRef({ onClose, onEscape, onVacate });
+  handlersRef.current = { onClose, onEscape, onVacate };
   const privacy = usePrivacy();
   const bodyText = typeof card.body === 'string' ? card.body : '';
   const summary = bodyText.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+
+  useEffect(() => {
+    const wasOpen = prevOpenRef.current;
+    prevOpenRef.current = open;
+    if (wasOpen && !open) {
+      const raf = requestAnimationFrame(() => handlersRef.current.onVacate?.());
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [open]);
 
   useEffect(() => {
     ref.current?.querySelector<HTMLButtonElement>('.review-item')?.focus();
@@ -355,10 +407,29 @@ const limitText = (l: NonNullable<SessionInfo['limit']>) =>
   `额度用完：${l.message}${l.resetsAt ? `，${new Date(l.resetsAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })} 重置` : ''}`;
 
 // Shown on the session that took over from another agent: one line; its expanded body floats over the terminal so expanding never resizes the PTY.
-function HandoffBar({ card }: { card: Card }) {
+function HandoffBar({ card, onVacate }: { card: Card; onVacate?(): void }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const openRef = useRef(false);
+  const onVacateRef = useRef(onVacate);
+  onVacateRef.current = onVacate;
   const from = card.meta?.from;
+
+  useEffect(() => {
+    const wasOpen = openRef.current;
+    openRef.current = open;
+    if (wasOpen && !open) {
+      const raf = requestAnimationFrame(() => onVacateRef.current?.());
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [open]);
+
+  useEffect(() => () => {
+    if (openRef.current) {
+      const fn = onVacateRef.current;
+      if (fn) requestAnimationFrame(fn);
+    }
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -428,6 +499,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
     return () => {
       ro.disconnect();
       cancelAnimationFrame(raf);
+      detach(sessionId, body);
     };
   }, [sessionId]);
 
@@ -437,6 +509,21 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
     if (sessionId && exited) requestReplay(sessionId);
   }, [sessionId, exited]);
   const noReplay = useSyncExternalStore(subscribeReplayEmpty, () => !!sessionId && isReplayEmpty(sessionId));
+
+  // Repaint the WebGL2 canvas when floating notices/popovers vanish or shift vertically so WebView2 clears vacated pixels.
+  const hasActivity = session?.status === 'working' && !!activity;
+  const hasDelegation = !!delegates?.length && !!onOpenDelegate;
+  const queued = !!session?.queued;
+  const prevFloatingRef = useRef({ sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation });
+  useEffect(() => {
+    const prev = prevFloatingRef.current;
+    prevFloatingRef.current = { sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation };
+    const queuedShifted = prev.queued && queued && (prev.hasActivity !== hasActivity || prev.hasDelegation !== hasDelegation);
+    if (sessionId && prev.sid === sessionId && ((prev.queued && !queued) || queuedShifted || (prev.reviewOpen && !reviewOpen))) {
+      const raf = requestAnimationFrame(() => refreshTerminalCanvas(sessionId));
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [sessionId, queued, reviewOpen, hasActivity, hasDelegation]);
 
   const privacy = usePrivacy();
   const [dropOver, setDropOver] = useState(false);
@@ -554,6 +641,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           }}
           onFeedback={onFeedback}
           onForward={onForward}
+          onVacate={() => refreshTerminalCanvas(sessionId)}
         />
       )}
       {session?.limit && (
@@ -562,7 +650,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           <button className="btn primary" data-testid="pane-limit-switch" onClick={onSwitch}>换 agent</button>
         </div>
       )}
-      {handoff && handoff.sessionId === sessionId && <HandoffBar key={handoff.id} card={handoff} />}
+      {handoff && handoff.sessionId === sessionId && <HandoffBar key={handoff.id} card={handoff} onVacate={() => refreshTerminalCanvas(sessionId)} />}
       <div className="pane-stage">
         <div
           className="pane-body"
@@ -571,7 +659,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             if (sessionId && e.target === e.currentTarget) focusOnly(sessionId);
           }}
         />
-        {session?.status === 'working' && activity && (
+        {hasActivity && activity && (
           <ActivityHud
             key={sessionId ?? 'none'}
             activity={activity}
@@ -581,17 +669,20 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             onRestoreFocus={() => {
               if (!dual || focused) focusOnly(sessionId);
             }}
+            onVacate={() => refreshTerminalCanvas(sessionId)}
           />
         )}
-        {!!delegates?.length && onOpenDelegate && (
+        {hasDelegation && delegates && onOpenDelegate && (
           <DelegationHud
             key={sessionId ?? 'none'}
             delegates={delegates}
             now={now}
+            hasActivity={hasActivity}
             onOpen={onOpenDelegate}
             onRestoreFocus={() => {
               if (!dual || focused) focusOnly(sessionId);
             }}
+            onVacate={() => refreshTerminalCanvas(sessionId)}
           />
         )}
         {exited && noReplay && (
