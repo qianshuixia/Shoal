@@ -9,7 +9,29 @@
 
 当前进度：M3（换 agent 和转发）。agent 每轮做完，最后一条回复成为结果卡片，任务进入「待验收」；可以写反馈让它继续，或者通过。额度用完或想换人时，可以把任务交给另一家 CLI，接手方会收到自动整理的交接卡片；结果卡片可以转发给别的任务。项目、任务、会话和卡片持久化在 `<stateDir>/state.json`；重启服务后旧任务显示「已退出」，可手动续接。
 
-## 运行
+## 安装
+
+安装包在 [Releases](https://github.com/qianshuixia/Shoal/releases) 页面。桌面端自带 Node，不需要装 Node、npm，也不需要 clone 本仓库；但它只是承载各家 agent CLI，至少要装一个 CLI。
+
+Windows：
+
+1. 下载 `Shoal_<版本>_x64-setup.exe` 并运行。安装包没有代码签名，SmartScreen 可能拦截：点「更多信息」，再点「仍要运行」。
+2. 至少装好并登录一个 CLI：Claude Code、Codex CLI 或 agy。
+
+macOS 13.5 及以上：
+
+1. 下载对应芯片的 `.dmg`：Apple silicon（M1 及以后）选 `Shoal_<版本>_aarch64.dmg`，Intel 选 `Shoal_<版本>_x64.dmg`。可以在左上角苹果菜单 →「关于本机」里查看（Apple silicon 显示「芯片」，Intel 显示「处理器」）。`.app.tar.gz` 文件不用下载。
+2. 打开 `.dmg`，把 Shoal 拖进「应用程序」。
+3. 应用没有经过 Apple 公证，第一次打开前要在终端运行：
+
+   ```sh
+   xattr -cr /Applications/Shoal.app
+   ```
+
+   不想用终端的话，也可以先双击打开一次，再到「系统设置 → 隐私与安全性」里点「仍要打开」。如果提示应用「已损坏」，请用上面的终端命令。
+4. 至少装好并登录一个 CLI：Claude Code、Codex CLI 或 agy。Shoal 会读取登录 shell 的 `PATH`，所以终端里能找到的 CLI，从 Finder 或 Dock 启动 Shoal 时也能找到；装 CLI 时 Shoal 已经开着的话，重启一次 Shoal。
+
+## 从源码运行
 
 要求：Windows 或 macOS 13.5 及以上，Node 24（直接运行 `.ts`），已安装并登录要用的 CLI；工作台路径不能含空格（agy 的 hook 命令不能加引号）。
 
@@ -41,13 +63,11 @@ build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 mac
 
 `build-desktop.cmd`（或 `node scripts/build-desktop.mjs`）把新版本号写入 `tauri.conf.json`、`Cargo.toml` 和 `Cargo.lock`，构建后打开安装包所在目录；构建失败会恢复原版本号。不提交也不打 tag。
 
-`.dmg` 只能在 Mac 上构建，所以 `build-desktop.cmd mac`（或 `node scripts/build-mac.mjs`）让 `.github/workflows/mac-build.yml` 去构建，再把镜像下载到 `desktop\src-tauri	argeteleaseundle\mac-ci`。它构建的是已推送到 GitHub 的 HEAD，所以要先推送分支；未提交的改动不在其中，版本号取该提交里的版本。这个提交已有正在跑的 run，或者已跑完且镜像还能下载的 run，会直接复用。需要装好 GitHub CLI（`gh`），并登录一个有权在该仓库运行工作流的账号。`mac-build.yml` 合进 `main` 之前，GitHub 只会在推送到其他分支时运行它，所以要从这样的分支构建。
+`.dmg` 只能在 Mac 上构建，所以 `build-desktop.cmd mac`（或 `node scripts/build-mac.mjs`）让 `.github/workflows/mac-build.yml` 去构建，再把镜像下载到 `desktop\src-tauri\target\release\bundle\mac-ci`。它构建的是已推送到 GitHub 的 HEAD，所以要先推送分支；未提交的改动不在其中，版本号取该提交里的版本。这个提交已有正在跑的 run，或者已跑完且镜像还能下载的 run，会直接复用。需要装好 GitHub CLI（`gh`），并登录一个有权在该仓库运行工作流的账号。
 
 构建会先运行 `scripts/stage-desktop.mjs`：按构建目标下载固定版本的 Node（Windows 是 `node.exe`，macOS 是 `node`，都校验 SHA-256），构建 `web/dist`，只保留目标平台的 node-pty 预编译，把所有内容放进 `desktop/bundle`（安装后位于 `resources\app`，macOS 上是 `Shoal.app/Contents/Resources/app`）。运行 `npm run desktop:dev` 或 `cargo check` 前需先手动跑一次。在 Apple silicon 上构建 Intel 版：先 `rustup target add x86_64-apple-darwin`，再在 `desktop/src-tauri` 里运行 `npx tauri build --target x86_64-apple-darwin`。
 
-也可以从 [Releases](https://github.com/qianshuixia/Shoal/releases) 下载编好的安装包。安装包没有代码签名，SmartScreen 可能拦截（更多信息 → 仍要运行）。
-
-macOS：下载对应芯片的 `.dmg`（Apple silicon 选 `aarch64`，Intel 选 `x64`），把 Shoal 拖进「应用程序」。应用只做了 ad-hoc 签名、没有经过 Apple 公证，第一次打开会提示「无法验证开发者」或「已损坏」：在终端运行 `xattr -cr /Applications/Shoal.app` 后再打开，或者先打开一次，再到「系统设置 → 隐私与安全性」里点「仍要打开」。
+构建出的安装包怎么装，见上文「安装」。
 
 - 启动时服务没在运行，就在后台用自带的 Node（Windows 上是 `node.exe`）运行 `server/main.ts`（失败时窗口里显示原因和「重试」），已在运行就直接连上；窗口打开期间后台守护线程会在服务意外退出时自动重拉，页面自动重连。端口同样读 `WORKBENCH_PORT`，状态目录与服务端规则相同（见下文）；继承来的 `NODE_OPTIONS`、`NODE_PATH` 会被清掉。
 - 关窗口或托盘「退出」会连服务一起停掉（不管服务是外壳还是 `start` 拉起的；macOS 上关窗口只隐藏，点 Dock 图标重新显示，`Cmd+Q`、菜单栏「退出 Shoal」或托盘「退出」才会退出，有 agent 在跑时会先确认；从 Dock 退出或注销无法拦住，会不经确认直接停掉服务）；还有 agent 在跑时先弹确认，「全部退出」走和服务端 `Ctrl+C` 相同的流程，之后可在面板里续接。外壳崩溃或被强杀时服务和 agent 继续运行。托盘菜单另有显示、在浏览器中打开、重新加载。再次启动会唤出已有窗口。

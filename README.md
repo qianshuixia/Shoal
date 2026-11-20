@@ -12,7 +12,29 @@ A local workbench for running Claude Code, Codex CLI and Antigravity CLI (`agy`)
 
 Progress: M3 (switching agents and forwarding). When an agent finishes a turn, its last reply becomes a result card and the task moves to Awaiting review (「待验收」); you can write feedback to keep it going, or approve it. When a CLI runs out of quota, or you want someone else on the task, you can hand it to another CLI, which receives an automatically compiled handoff card; result cards can be forwarded to other tasks. Projects, tasks, sessions and cards persist in `<stateDir>/state.json`; after a server restart, old tasks show as Exited (「已退出」) and can be resumed by hand.
 
-## Running
+## Install
+
+Installers are on the [Releases](https://github.com/qianshuixia/Shoal/releases) page. The desktop app brings its own Node, so you do not need Node, npm or a clone of this repo. It only hosts the agent CLIs, so you need at least one of them.
+
+Windows:
+
+1. Download `Shoal_<version>_x64-setup.exe` and run it. The installer is not code-signed, so SmartScreen may warn: click More info, then Run anyway.
+2. Install and sign in to at least one CLI: Claude Code, Codex CLI or agy.
+
+macOS 13.5 or later:
+
+1. Download the `.dmg` for your chip: `Shoal_<version>_aarch64.dmg` for Apple silicon (M1 and later), `Shoal_<version>_x64.dmg` for Intel. Apple menu > About This Mac shows it (Chip on Apple silicon, Processor on Intel). You do not need the `.app.tar.gz` files.
+2. Open the `.dmg` and drag Shoal into Applications.
+3. The app is not notarized by Apple, so before you open it the first time, run this in Terminal:
+
+   ```sh
+   xattr -cr /Applications/Shoal.app
+   ```
+
+   If you would rather not use Terminal, open Shoal once, then go to System Settings > Privacy & Security and click Open Anyway. If macOS says the app is damaged, use the Terminal command.
+4. Install and sign in to at least one CLI: Claude Code, Codex CLI or agy. Shoal reads your login shell's `PATH`, so Shoal can find any CLI that Terminal can, even when started from Finder or the Dock. If Shoal was already open when you installed the CLI, restart it.
+
+## Running from source
 
 Requirements: Windows, or macOS 13.5 or later; Node 24 (runs `.ts` directly); and the CLIs you want to use, installed and signed in. The workbench path must not contain spaces (agy's hook command cannot be quoted).
 
@@ -44,13 +66,11 @@ build-desktop.cmd mac   # macOS .dmg from Windows: built on GitHub's macOS runne
 
 `build-desktop.cmd` (or `node scripts/build-desktop.mjs`) writes the new version to `tauri.conf.json`, `Cargo.toml` and `Cargo.lock`, builds, and opens the installer folder; if the build fails it puts the old version back. It does not commit or tag.
 
-A `.dmg` can only be built on a Mac, so `build-desktop.cmd mac` (or `node scripts/build-mac.mjs`) has `.github/workflows/mac-build.yml` build it and downloads the image to `desktop\src-tauri	argeteleaseundle\mac-ci`. It builds HEAD as pushed to GitHub, so push the branch first; uncommitted changes are not in it, and the version is the one at that commit. A run already going for that commit, or a finished one whose images can still be downloaded, is reused. It needs the GitHub CLI (`gh`) signed in with an account that may run workflows in the repo. Until `mac-build.yml` is on `main`, GitHub only runs it for pushes to other branches, so build from such a branch.
+A `.dmg` can only be built on a Mac, so `build-desktop.cmd mac` (or `node scripts/build-mac.mjs`) has `.github/workflows/mac-build.yml` build it and downloads the image to `desktop\src-tauri\target\release\bundle\mac-ci`. It builds HEAD as pushed to GitHub, so push the branch first; uncommitted changes are not in it, and the version is the one at that commit. A run already going for that commit, or a finished one whose images can still be downloaded, is reused. It needs the GitHub CLI (`gh`) signed in with an account that may run workflows in the repo.
 
 The build first runs `scripts/stage-desktop.mjs`, which downloads the pinned Node for the build target (`node.exe` on Windows, `node` on macOS, each checked against its SHA-256), builds `web/dist`, keeps only the target's node-pty prebuilds and stages everything in `desktop/bundle` (installed as `resources\app`, or `Shoal.app/Contents/Resources/app` on macOS). Run it once by hand before `npm run desktop:dev` or `cargo check`. To build the Intel app on Apple silicon, run `rustup target add x86_64-apple-darwin`, then `npx tauri build --target x86_64-apple-darwin` in `desktop/src-tauri`.
 
-Prebuilt installers are on the [Releases](https://github.com/qianshuixia/Shoal/releases) page. The installer is not code-signed, so SmartScreen may warn (More info -> Run anyway).
-
-macOS: download the `.dmg` for your chip (`aarch64` for Apple silicon, `x64` for Intel) and drag Shoal into Applications. The app is ad-hoc signed and not notarized by Apple, so the first launch says the developer cannot be verified or that the app is damaged. Run `xattr -cr /Applications/Shoal.app` in Terminal and open it again, or open it once and then click Open Anyway in System Settings > Privacy & Security.
+To install what you built, see "Install" above.
 
 - On launch, if the server is not running the shell starts `server/main.ts` on the bundled Node (`node.exe` on Windows) in the background (on failure the window shows the reason and a Retry button); if it is already running it connects directly. While the desktop window stays open, a background watchdog automatically restarts the bundled server if it ever exits unexpectedly, and the page reconnects on its own. The port is also read from `WORKBENCH_PORT`, and the state directory follows the same rules as the server (below). Inherited `NODE_OPTIONS` and `NODE_PATH` are dropped.
 - Closing the window or choosing Quit in the tray stops the server too (whether the shell or `start` launched it). On macOS closing the window only hides it (click the Dock icon to bring it back); `Cmd+Q`, Quit Shoal in the menu bar or Quit in the tray quits (and asks first while agents are running). Quit from the Dock or logging out cannot be held back, so it stops the server without asking. If agents are still running it asks first; Quit all (「全部退出」) follows the same path as `Ctrl+C` on the server, and you can resume the sessions from the panel later. If the shell crashes or is killed, the server and agents keep running. The tray menu also has Show, Open in browser and Reload. Launching again brings the existing window forward.
