@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  ChangedFile, ChangeStatus, DiffPayload, FileListResult, FilePayload, FsCreateResult, FsDeleteResult, FsPasteResult, FsRenameResult, GitInfo, OpenMode, Project, ProjectChanges, TreeEntry, TreeListing, WriteFileResult,
+  AgentKind, ChangedFile, ChangeStatus, CliToolInfo, DiffPayload, FileListResult, FilePayload, FsCreateResult, FsDeleteResult, FsPasteResult, FsRenameResult, GitInfo, OpenMode, Project, ProjectChanges, QuotaInfo, SessionContext, SessionInfo, Task, TaskMetrics, TreeEntry, TreeListing, WriteFileResult,
 } from '../../shared/protocol.ts';
 import { CodeEditor, type JumpTarget } from './Editor.tsx';
 import { MarkdownPreview } from './MarkdownPreview.tsx';
 import { RawPreview, formatBytes } from './RawPreview.tsx';
+import { InspectorOverview } from './QuotaPanel.tsx';
+import type { QuotaDisplayMode } from './quota.ts';
 import { rawPreviewOf } from '../../shared/protocol.ts';
 import {
   ContextMenu, NamePromptDialog, contextMenuPointForElement, copyText, isContextMenuKey, isMacClient, joinProjectPath,
   type ContextMenuEntry, type ContextMenuState, type FsClipboardItem, type FsMutationEvent, type NamePromptConfig,
 } from './ContextMenu.tsx';
 
-export type InspectorTab = 'changes' | 'files';
+export type InspectorTab = 'overview' | 'changes' | 'files';
 
 export interface InspectOpenRequest {
   projectId: string;
@@ -37,6 +39,21 @@ export interface InspectorProps {
   onSelectProject: (projectId: string) => void;
   onClose: () => void;
   onNotice: (msg: string) => void;
+  // Overview tab context & subscription quota props
+  focusedTask?: Task;
+  focusedSession?: SessionInfo;
+  focusedContext?: SessionContext;
+  focusedMetrics?: TaskMetrics;
+  allQuota?: Partial<Record<AgentKind, QuotaInfo>>;
+  agents?: AgentKind[];
+  cliTools?: CliToolInfo[];
+  now?: number;
+  quotaMode?: QuotaDisplayMode;
+  refreshingQuota?: boolean;
+  onRefreshQuota?: () => void;
+  onCompact?: () => void;
+  onSwitchAgent?: () => void;
+  onOpenStats?: () => void;
 }
 
 interface ProjectViewMem {
@@ -148,6 +165,7 @@ function useVirtualContainer(ref: React.RefObject<HTMLDivElement | null>, enable
 
 export function Inspector({
   project, projects, git, watchRev, openRequest, fsClipboard, onSetFsClipboard, fsMutation, dirtyGuardRef, canSendToTerminal, onSendPathToTerminal, onSelectProject, onClose, onNotice,
+  focusedTask, focusedSession, focusedContext, focusedMetrics, allQuota, agents, cliTools, now, quotaMode, refreshingQuota, onRefreshQuota, onCompact, onSwitchAgent, onOpenStats,
 }: InspectorProps) {
   const memRef = useRef<Map<string, ProjectViewMem>>(new Map());
   const rootRef = useRef<HTMLElement>(null);
@@ -203,11 +221,12 @@ export function Inspector({
   finderQueryRef.current = finderQuery;
 
   const projectId = project?.id ?? '';
-  const activePath = tab === 'changes' ? changePath : filePath;
+  const activePath = tab === 'changes' ? changePath : tab === 'files' ? filePath : null;
   const isEditingText = useMemo(() => {
     if (!activePath) return false;
     if (tab === 'changes') return !!diffData && !diffData.binary && !diffData.tooLarge && !diffData.isDirectory && diffData.status !== 'D';
-    return fileData?.kind === 'text';
+    if (tab === 'files') return fileData?.kind === 'text';
+    return false;
   }, [activePath, tab, diffData, fileData]);
   const isDirty = isEditingText && draft !== savedText;
 
@@ -489,7 +508,9 @@ export function Inspector({
     initReqSeqRef.current = 0;
 
     setTab(openRequest.tab);
-    if (openRequest.tab === 'changes') {
+    if (openRequest.tab === 'overview') {
+      // Overview renders focused session context & quotas directly.
+    } else if (openRequest.tab === 'changes') {
       if (!sameCommitInit) void fetchChanges(projectId, !openRequest.filePath, true);
       if (openRequest.filePath) {
         setChangePath(openRequest.filePath);
@@ -525,7 +546,7 @@ export function Inspector({
 
   // Load active document only when the active tab's selected path actually changes (updating an inactive tab's path must never wipe the active draft).
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId || tab === 'overview') return;
     if (tab === 'changes') {
       if (activePath) void loadDiffFile(projectId, activePath, false);
       else setDiffData(null);
@@ -566,6 +587,11 @@ export function Inspector({
   // Refresh active tab only when watchRev bumps (WS snapshot / review / active-project git), window focuses, or 2.5s active-file poll
   useEffect(() => {
     if (!projectId || watchRev === 0) return;
+    if (liveRef.current.tab === 'overview') {
+      setChangesStale(true);
+      treeStaleRef.current = true;
+      return;
+    }
     if (liveRef.current.tab === 'changes') {
       void fetchChanges(projectId, false, false);
       treeStaleRef.current = true;
@@ -581,6 +607,11 @@ export function Inspector({
   useEffect(() => {
     if (!projectId) return;
     const onFocus = () => {
+      if (liveRef.current.tab === 'overview') {
+        setChangesStale(true);
+        treeStaleRef.current = true;
+        return;
+      }
       if (liveRef.current.tab === 'changes') {
         void fetchChanges(projectId, false, false);
         treeStaleRef.current = true;
@@ -1369,20 +1400,36 @@ export function Inspector({
       onKeyDown={onPanelKeyDown}
     >
       <header className="insp-header">
-        <button
-          type="button"
-          className={`icon-btn ${sideOpen ? 'on' : ''}`}
-          data-testid="insp-toggle-side"
-          title={sideOpen ? '收起文件栏' : '展开文件栏'}
-          onClick={() => setSideOpen((v) => !v)}
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
-            <path d="M6 2.5v11" />
-          </svg>
-        </button>
+        {tab !== 'overview' && (
+          <button
+            type="button"
+            className={`icon-btn ${sideOpen ? 'on' : ''}`}
+            data-testid="insp-toggle-side"
+            title={sideOpen ? '收起文件栏' : '展开文件栏'}
+            onClick={() => setSideOpen((v) => !v)}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+              <path d="M6 2.5v11" />
+            </svg>
+          </button>
+        )}
 
         <span className="seg insp-tabs" role="tablist" aria-label="检视面板">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'overview'}
+            className={`ghost seg-btn ${tab === 'overview' ? 'on' : ''}`}
+            data-testid="insp-tab-overview"
+            onClick={() => {
+              if (tab === 'overview') return;
+              if (!confirmDiscardDraft()) return;
+              setTab('overview');
+            }}
+          >
+            概览
+          </button>
           <button
             type="button"
             role="tab"
@@ -1494,6 +1541,31 @@ export function Inspector({
         <div className="insp-empty">
           <div>还没有可查看的项目</div>
           <div className="pane-empty-hint">先在左侧新建或选择一个项目</div>
+        </div>
+      ) : tab === 'overview' ? (
+        <div className="insp-body is-overview">
+          <InspectorOverview
+            project={project}
+            git={changesGit ?? git}
+            dirtyCount={dirtyCount}
+            task={focusedTask}
+            session={focusedSession}
+            context={focusedContext}
+            metrics={focusedMetrics}
+            allQuota={allQuota ?? {}}
+            agents={agents ?? []}
+            cliTools={cliTools}
+            now={now ?? Date.now()}
+            mode={quotaMode ?? 'remaining'}
+            refreshing={refreshingQuota ?? false}
+            onOpenChanges={() => setTab('changes')}
+            onOpenExternal={() => void openInSystem('', 'editor')}
+            onReveal={() => void openInSystem('', 'reveal')}
+            onCompact={onCompact}
+            onRefreshQuota={onRefreshQuota ?? manualRefresh}
+            onSwitchAgent={onSwitchAgent}
+            onOpenStats={onOpenStats ?? (() => {})}
+          />
         </div>
       ) : (
         <div className="insp-body">

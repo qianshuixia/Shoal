@@ -1,16 +1,17 @@
-// Subscription quota in the top bar and pane header, driven through the real hooks/statusline.mjs (the fake agent pipes
-// both claude-style `rate_limits` via `limits` and agy-style Gemini `quota` via `agylimits`).
+// Subscription quota across L1 topbar dock / pane header, L2 floating popover (with mode toggle & time pace bar),
+// L3 Usage & Quotas dashboard, and Inspector Overview tab, driven through the real hooks/statusline.mjs.
 //
 // Known failure modes -> expected behaviour (pass criterion):
-// 1. The status line never reaches the page, or a window is dropped -> after `limits 85 4` both the top bar and the
-//    focused pane header (next to the agent name) show 5h 85% and 7d 4%, with a multi-line tooltip.
-// 2. A window at >= 80% looks like the others -> warning colour for 85%, the muted colour for 4%; 100% is also bold.
-// 3. A later update leaves the old numbers or adds a second item -> the same item shows the new values (one item per agent).
-// 4. A window whose reset time has passed keeps showing -> it disappears by itself (no new message needed); the other
-//    window stays, and the whole item goes once none is left (the medium-hard case: expiry is driven by the clock only).
-// 5. The relay disturbs the session -> it ends the turn as usual (needs_you) (a RateLimits hook is a no-op for sessions).
+// 1. The status line never reaches the page, or a window is dropped -> after `limits 85 4` (85% used = 15% left,
+//    4% used = 96% left) both the top bar and focused pane header show `5h 15%` and `7d 96%` (default remaining mode),
+//    and clicking opens the L2 popover with full details and mode toggle (剩余 / 已用).
+// 2. A window at >= 80% used (<= 20% left) looks like the others -> warning colour for 5h, muted colour for 7d;
+//    100% used (0% left) is also bold + danger colour.
+// 3. A later update leaves the old numbers or adds a second item -> the same item shows the new values (one per agent).
+// 4. A window whose reset time has passed keeps showing -> it disappears by itself; the other stays.
+// 5. The relay disturbs the session -> it ends the turn as usual (needs_you).
 // 6. A narrow window or dual-pane split crowds the headers -> at 1280px both topbar and dual pane headers fit inside bounds.
-// 7. Antigravity's `quota` (`gemini-5h` + `gemini-weekly`, `remaining_fraction` omitted at 0.0) fails to parse or misses 100%
+// 7. Antigravity's `quota` (`gemini-5h` + `gemini-weekly`, `remaining_fraction` omitted at 0.0) fails to parse or misses 0%
 //    -> `agylimits 48 6` then `agylimits 100 12 3` updates both topbar and pane header and expires cleanly.
 import { test, expect } from '@playwright/test';
 import fs from 'node:fs';
@@ -22,7 +23,7 @@ fs.mkdirSync(OUT, { recursive: true });
 
 test.beforeEach(async ({ request }) => removeAllTasks(request));
 
-test('header shows both windows, warning colour from 80%, updates in place, expired window drops out', async ({ page, request }) => {
+test('L1 pills (remaining default), L2 popover & mode switch, L3 dashboard, warning/full styles, and expiry', async ({ page, request }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
   const project = await createProject(request, token('quota'));
   const { session } = await createFakeTask(request, project.id, '额度', '');
@@ -39,20 +40,20 @@ test('header shows both windows, warning colour from 80%, updates in place, expi
     await page.keyboard.type(`${text}\r`);
   };
 
-  // 1 + 2: both windows in topbar and pane header, tooltip, colours.
+  // 1 + 2: both windows in topbar and pane header (default remaining %: 85% used -> 15% left, 4% used -> 96% left).
   await type('limits 85 4');
-  await expect(win('5h')).toHaveText('5h 85%');
-  await expect(win('7d')).toHaveText('7d 4%');
-  await expect(paneWin('5h')).toHaveText('5h 85%');
-  await expect(paneWin('7d')).toHaveText('7d 4%');
+  await expect(win('5h')).toHaveText('5h 15%');
+  await expect(win('7d')).toHaveText('7d 96%');
+  await expect(paneWin('5h')).toHaveText('5h 15%');
+  await expect(paneWin('7d')).toHaveText('7d 96%');
   await expect(item).toHaveCount(1);
   await expect(paneItem).toHaveCount(1);
   const title = (await item.getAttribute('title'))!.split('\n');
   expect(title).toHaveLength(4);
   expect(title[0]).toBe('Fake 订阅额度');
-  expect(title[1]).toMatch(/^5 小时窗口：已用 85%，(?:\d+月\d+日 )?\d{2}:\d{2} 重置（(1 小时 5\d 分|2 小时)后）$/);
-  expect(title[2]).toMatch(/^7 天窗口：已用 4%，\d+月\d+日 \d{2}:\d{2} 重置（[45] 天后）$/);
-  expect(title[3]).toMatch(/^更新于 \d{2}:\d{2}$/);
+  expect(title[1]).toMatch(/^5 小时窗口：剩余 15%，(?:\d+月\d+日 )?\d{2}:\d{2} 重置（(1 小时 5\d 分|2 小时)后）$/);
+  expect(title[2]).toMatch(/^7 天窗口：剩余 96%，\d+月\d+日 \d{2}:\d{2} 重置（[45] 天后）$/);
+  expect(title[3]).toMatch(/^更新于 \d{2}:\d{2}（点击查看详情）$/);
   const color = (label: string) => win(label).evaluate(e => getComputedStyle(e).color);
   const signal = await page.evaluate(() => {
     const probe = document.createElement('i');
@@ -65,6 +66,37 @@ test('header shows both windows, warning colour from 80%, updates in place, expi
   expect(await color('5h')).toBe(signal);
   expect(await color('7d')).not.toBe(signal);
 
+  // L2 floating popover opens on click, shows time-pace bars and switches remaining <-> used cleanly without resizing terminal.
+  const bodyBefore = (await pane(page, 0).locator('.pane-body').boundingBox())!;
+  await item.click();
+  const pop = page.getByTestId('quota-popover');
+  await expect(pop).toBeVisible();
+  await expect(pop.getByTestId('qp-window-row')).toHaveCount(2);
+  await page.screenshot({ path: path.join(OUT, 'popover-remaining.png') });
+  await pop.getByTestId('quota-mode-used').click();
+  await expect(win('5h')).toHaveText('5h 85%');
+  await expect(win('7d')).toHaveText('7d 4%');
+  await pop.getByTestId('quota-mode-remaining').click();
+  await expect(win('5h')).toHaveText('5h 15%');
+  await page.keyboard.press('Escape');
+  await expect(pop).toHaveCount(0);
+  const bodyAfter = (await pane(page, 0).locator('.pane-body').boundingBox())!;
+  expect(Math.abs(bodyAfter.height - bodyBefore.height)).toBeLessThan(0.5);
+
+  // L3 Usage & Quotas center shows the subscription cards and Inspector Overview shows segmented LED bars.
+  await page.getByTestId('tab-stats').click();
+  await expect(page.getByTestId('quota-dashboard')).toBeVisible();
+  await expect(page.getByTestId('qd-card')).toHaveCount(2);
+  await page.screenshot({ path: path.join(OUT, 'stats-dashboard.png') });
+  await page.getByTestId('tab-work').click();
+
+  await page.getByTestId('layout-inspect').click();
+  await page.getByTestId('insp-tab-overview').click();
+  await expect(page.getByTestId('insp-overview')).toBeVisible();
+  await expect(page.getByTestId('insp-quota-card')).toBeVisible();
+  await page.screenshot({ path: path.join(OUT, 'inspector-overview.png') });
+  await page.getByTestId('layout-1').click();
+
   // 5: the relay does not touch the session.
   await expectStatus(page, session.id, 'needs_you');
 
@@ -75,10 +107,10 @@ test('header shows both windows, warning colour from 80%, updates in place, expi
   expect(box.x + box.width).toBeLessThanOrEqual(right.x + 0.5);
   await page.locator('header.topbar').screenshot({ path: path.join(OUT, 'header-warn.png') });
 
-  // 3 + 2: a second update replaces the numbers; 100% is bold.
+  // 3 + 2: a second update replaces the numbers; 100% used (0% left) is bold.
   await type('limits 100 7 3');
-  await expect(win('5h')).toHaveText('5h 100%');
-  await expect(win('7d')).toHaveText('7d 7%');
+  await expect(win('5h')).toHaveText('5h 0%');
+  await expect(win('7d')).toHaveText('7d 93%');
   await expect(item).toHaveCount(1);
   expect(await win('5h').evaluate(e => getComputedStyle(e).fontWeight)).toBe('600');
   expect(await win('7d').evaluate(e => getComputedStyle(e).fontWeight)).not.toBe('600');
@@ -86,15 +118,15 @@ test('header shows both windows, warning colour from 80%, updates in place, expi
 
   // 4: the 5h window resets a few seconds after the update and goes away on its own; 7d stays.
   await expect(win('5h')).toHaveCount(0, { timeout: 10_000 });
-  await expect(win('7d')).toHaveText('7d 7%');
+  await expect(win('7d')).toHaveText('7d 93%');
   await expect(item).toHaveCount(1);
   await page.locator('header.topbar').screenshot({ path: path.join(OUT, 'header-expired.png') });
 
   // A fresh page still gets the stored value from the snapshot (the server keeps it, not the browser).
   await page.reload();
-  await expect(win('7d')).toHaveText('7d 7%');
+  await expect(win('7d')).toHaveText('7d 93%');
   await expect(win('5h')).toHaveCount(0);
-  await expect(paneWin('7d')).toHaveText('7d 7%');
+  await expect(paneWin('7d')).toHaveText('7d 93%');
   await expect(paneWin('5h')).toHaveCount(0);
 });
 
@@ -114,9 +146,10 @@ test('agy-style Gemini quota renders in pane header and dual-pane layout without
     await page.keyboard.type(`${text}\r`);
   };
 
+  // 48% used -> 52% left, 6% used -> 94% left.
   await type('agylimits 48 6');
-  await expect(paneWin('5h')).toHaveText('5h 48%');
-  await expect(paneWin('7d')).toHaveText('7d 6%');
+  await expect(paneWin('5h')).toHaveText('5h 52%');
+  await expect(paneWin('7d')).toHaveText('7d 94%');
   await paneHeader.screenshot({ path: path.join(OUT, 'pane-header-gemini.png') });
 
   // Dual-pane layout at 1280px: switch button stays inside the pane header.
@@ -126,13 +159,13 @@ test('agy-style Gemini quota renders in pane header and dual-pane layout without
   expect(swBox.x + swBox.width).toBeLessThanOrEqual(hBox.x + hBox.width + 0.5);
   await page.getByTestId('layout-1').click();
 
-  // Go omitempty at 0.0 remaining_fraction -> 100% used, bold, then expires after 3 s.
+  // Go omitempty at 0.0 remaining_fraction -> 100% used (0% left), bold, then expires after 3 s.
   await type('agylimits 100 12 3');
-  await expect(paneWin('5h')).toHaveText('5h 100%');
-  await expect(paneWin('7d')).toHaveText('7d 12%');
+  await expect(paneWin('5h')).toHaveText('5h 0%');
+  await expect(paneWin('7d')).toHaveText('7d 88%');
   expect(await paneWin('5h').evaluate(e => getComputedStyle(e).fontWeight)).toBe('600');
   await paneHeader.screenshot({ path: path.join(OUT, 'pane-header-gemini-full.png') });
 
   await expect(paneWin('5h')).toHaveCount(0, { timeout: 10_000 });
-  await expect(paneWin('7d')).toHaveText('7d 12%');
+  await expect(paneWin('7d')).toHaveText('7d 88%');
 });

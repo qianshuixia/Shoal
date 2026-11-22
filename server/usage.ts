@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AgentKind, Project, SessionInfo, Task, TaskMetrics, TelemetrySummary, UsageCounts, UsageReport, UsageRow } from '../shared/protocol.ts';
+import type { AgentKind, Project, SessionContext, SessionInfo, Task, TaskMetrics, TelemetrySummary, UsageCounts, UsageReport, UsageRow } from '../shared/protocol.ts';
 import { AGENT_LABEL, usageTotal, vendorOf } from '../shared/protocol.ts';
+import { inferContextWindowSize } from './quota.ts';
 
 // Token usage of workbench sessions, read from the CLIs' own transcripts:
 //   claude  ~/.claude/projects/<slug>/<id>.jsonl (+ <id>/subagents/*.jsonl): assistant lines' message.usage, one per message.id
@@ -61,6 +62,7 @@ export interface UsageHit {
   model?: string;
   c: UsageCounts;
   coarseTime?: boolean; // agy created_at has 1s granularity
+  contextWindowSize?: number; // explicit window size when reported (e.g. codex model_context_window)
 }
 
 const MAX_SPEED_SAMPLES = 5;
@@ -139,11 +141,13 @@ export function parseUsageLine(v: Obj, file: FileState, fileKey: string): UsageH
     file.records = true;
     return { t: Date.parse(str(v.timestamp)), key: str(p.response_id) ? `x:${str(p.response_id)}` : undefined, model: file.model, c: codexCounts(p.usage) };
   }
-  if (v.type === 'event_msg' && p?.type === 'token_count' && !file.records && isObj(p.info) && isObj(p.info.last_token_usage)) {
+  if (v.type === 'event_msg' && p?.type === 'token_count' && isObj(p.info) && isObj(p.info.last_token_usage)) {
+    const cw = num(p.info.model_context_window);
+    if (file.records) return null;
     const total = isObj(p.info.total_token_usage) ? num(p.info.total_token_usage.total_tokens) : 0;
     if (total && total === file.lastTotal) return null; // repeated without a new response
     file.lastTotal = total;
-    return { t: Date.parse(str(v.timestamp)), model: file.model, c: codexCounts(p.info.last_token_usage) };
+    return { t: Date.parse(str(v.timestamp)), model: file.model, c: codexCounts(p.info.last_token_usage), ...(cw > 0 ? { contextWindowSize: cw } : {}) };
   }
   if (v.type === 'PLANNER_RESPONSE' && (num(v.input_tokens) || num(v.output_tokens))) {
     // input_tokens excludes cache reads (cache_read_tokens is often larger than it).
@@ -206,6 +210,8 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
   const eventsFile = path.join(o.stateDir, 'events.jsonl');
   const st = loadFile(file);
   const seen = new Set(st.seen);
+  const liveContexts = new Map<string, SessionContext>();
+  const fileContextSize = new Map<string, number>();
   let lastScan = 0;
   let savePending = false;
 
@@ -323,6 +329,10 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       let v: unknown;
       try { v = JSON.parse(line); } catch { continue; }
       if (!isObj(v)) continue;
+      if (v.type === 'event_msg' && isObj(v.payload) && v.payload.type === 'token_count' && isObj(v.payload.info)) {
+        const mcw = num(v.payload.info.model_context_window);
+        if (mcw > 0) fileContextSize.set(f, mcw);
+      }
       const pt = parsePromptAt(v);
       if (pt !== null) { fs0.lastPromptAt = pt; continue; }
       const hit = parseUsageLine(v, fs0, f);
@@ -331,10 +341,31 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       const own = owner(ids, hit.t, live);
       if (!own) continue; // outside every workbench run of this conversation (e.g. resumed in a plain terminal)
       if (hit.key) seen.add(hit.key);
-      const [, s] = own;
+      const [sid, s] = own;
       const model = hit.model ?? modelAt(s, hit.t) ?? '';
       const k = `${Math.floor(hit.t / HOUR) * HOUR}|${s.agent}|${model}|${s.taskId ?? ''}`;
       add((st.buckets[k] ??= zero()), hit.c);
+      const cachedTokens = hit.c.cacheRead + hit.c.cacheWrite;
+      const uncachedTokens = hit.c.input;
+      const usedTokens = cachedTokens + uncachedTokens;
+      if (usedTokens > 0) {
+        const cwSize = hit.contextWindowSize ?? fileContextSize.get(f) ?? inferContextWindowSize(model, s.agent);
+        const prevCtx = liveContexts.get(sid);
+        const turns = (prevCtx?.turns ?? 0) + 1;
+        if (!prevCtx || hit.t >= prevCtx.updatedAt) {
+          liveContexts.set(sid, {
+            contextWindowSize: cwSize,
+            usedTokens,
+            cachedTokens,
+            uncachedTokens,
+            usedPercent: Math.min(100, Math.round((usedTokens / Math.max(1, cwSize)) * 1000) / 10),
+            cacheHitRate: usedTokens > 0 ? hit.c.cacheRead / usedTokens : null,
+            ...(model ? { model } : {}),
+            turns,
+            updatedAt: hit.t,
+          });
+        }
+      }
       if (s.taskId) {
         const ts = ((st.taskSpeed ??= {})[s.taskId] ??= { samples: [], updatedAt: 0 });
         ts.updatedAt = Math.max(ts.updatedAt, hit.t);
@@ -500,7 +531,16 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
     return { byTask, today };
   }
 
-  return { scan, report, telemetry };
+  function contexts(): Record<string, SessionContext> {
+    const out: Record<string, SessionContext> = {};
+    const liveIds = new Set(o.source.sessions().map(s => s.id));
+    for (const [sid, ctx] of liveContexts) {
+      if (liveIds.has(sid)) out[sid] = ctx;
+    }
+    return out;
+  }
+
+  return { scan, report, telemetry, contexts };
 }
 
 export type Usage = ReturnType<typeof createUsage>;

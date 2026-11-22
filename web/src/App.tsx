@@ -16,9 +16,10 @@ import {
 import { matchProjectFileLink } from './linkParse.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
 import { FeedbackDialog, ForwardDialog, ProjectDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
-import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
+import { EditableTitle, PencilIcon, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
-import { liveWindows, QUOTA_AGENTS } from './quota.ts';
+import { QuotaPopover, TopQuotaBar } from './QuotaPanel.tsx';
+import { fmtRelativeAge, loadQuotaMode, saveQuotaMode, type QuotaDisplayMode } from './quota.ts';
 import { SettingsView } from './SettingsView.tsx';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
@@ -158,6 +159,13 @@ export function App() {
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(() => new Set());
   const [resumingAll, setResumingAll] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(() => localStorage.getItem(ARCHIVE_OPEN_KEY) === '1');
+  const [quotaMode, setQuotaModeState] = useState<QuotaDisplayMode>(loadQuotaMode);
+  const [quotaPopoverOpen, setQuotaPopoverOpen] = useState(false);
+  const [refreshingQuota, setRefreshingQuota] = useState(false);
+  const setQuotaMode = useCallback((next: QuotaDisplayMode) => {
+    setQuotaModeState(next);
+    saveQuotaMode(next);
+  }, []);
   const [fsClipboard, setFsClipboard] = useState<FsClipboardItem | null>(null);
   const [fsMutation, setFsMutation] = useState<FsMutationEvent | null>(null);
   const fsMutationSeqRef = useRef(0);
@@ -358,6 +366,14 @@ export function App() {
       case 'telemetry':
         setData((d) => ({ ...d, telemetry: msg.telemetry }));
         break;
+      case 'context':
+        setData((d) => {
+          const nextCtx = { ...(d.context ?? {}) };
+          if (msg.context) nextCtx[msg.sessionId] = msg.context;
+          else delete nextCtx[msg.sessionId];
+          return { ...d, context: nextCtx };
+        });
+        break;
       case 'card':
         setData((d) => ({ ...d, cards: upsert(d.cards, msg.card) }));
         break;
@@ -439,6 +455,25 @@ export function App() {
     focusOnly(sid);
     send({ t: 'in', id: sid, d: '\x1b' });
     setNotice('已向终端发送 Esc 中断信号');
+  }, []);
+
+  const refreshQuota = useCallback(async () => {
+    if (refreshingQuota) return;
+    setRefreshingQuota(true);
+    try {
+      const r = await post<{ quota: Snapshot['quota']; context?: Snapshot['context'] }>('/api/quota/refresh', {});
+      setData((d) => ({ ...d, quota: r.quota, ...(r.context ? { context: r.context } : {}) }));
+    } catch (e) {
+      setNotice(`刷新配额失败：${(e as Error).message}`);
+    } finally {
+      setRefreshingQuota(false);
+    }
+  }, [refreshingQuota]);
+
+  const sendCompactToSession = useCallback((sid: string) => {
+    focusOnly(sid);
+    send({ t: 'in', id: sid, d: '/compact\r' });
+    setNotice('已向终端发送 /compact 压缩指令');
   }, []);
 
   const inspectActivityFile = useCallback(async (rawPath: string, fallbackProject?: Project) => {
@@ -987,7 +1022,10 @@ export function App() {
   };
 
   const focusedTaskId = focusedSessionId ? sessionsById.get(focusedSessionId)?.taskId : undefined;
-  const focusedProjectId = focusedTaskId ? tasksById.get(focusedTaskId)?.projectId : undefined;
+  const focusedTask = focusedTaskId ? tasksById.get(focusedTaskId) : undefined;
+  const focusedProjectId = focusedTask?.projectId;
+  const focusedAgent = focusedTask?.agent ?? focusedSession?.agent;
+  const runningSessionsCount = data.sessions.filter((s) => s.status === 'working').length;
   const visibleIds = panes.slice(0, paneCount(layout));
   const sortedProjects = sortProjects(data.projects, order);
   // A closed delegated task stays listed under its main task while that task is listed, instead of in 已归档.
@@ -1037,13 +1075,16 @@ export function App() {
         </div>
       )}
       <header className="topbar">
-        <span className="app-name">Shoal</span>
+        <span className="app-brand">
+          <span className="app-logo" aria-hidden="true" />
+          <span className="app-name">Shoal</span>
+        </span>
         <span className="view-tabs" role="tablist" aria-label="视图">
           <button role="tab" aria-selected={view === 'work'} className={`view-tab ${view === 'work' ? 'on' : ''}`} data-testid="tab-work" onClick={() => setView('work')}>
             工作台
           </button>
           <button role="tab" aria-selected={view === 'stats'} className={`view-tab ${view === 'stats' ? 'on' : ''}`} data-testid="tab-stats" onClick={() => setView('stats')}>
-            Token 统计
+            用量与配额
           </button>
           <button role="tab" aria-selected={view === 'settings'} className={`view-tab ${view === 'settings' ? 'on' : ''}`} data-testid="tab-settings" onClick={() => setView('settings')}>
             设置
@@ -1067,12 +1108,13 @@ export function App() {
         >
           <span className="needs-dot" />待验收 <span data-testid="review-count">{reviewing.length}</span>
         </button>
-        {QUOTA_AGENTS.map((a) => {
-          const q = data.quota[a];
-          const ws = liveWindows(q, now);
-          if (!q || !ws.length) return null;
-          return <QuotaPill key={a} agent={a} quota={q} windows={ws} now={now} />;
-        })}
+        <TopQuotaBar
+          quota={data.quota}
+          now={now}
+          mode={quotaMode}
+          open={quotaPopoverOpen}
+          onToggle={() => setQuotaPopoverOpen((v) => !v)}
+        />
         {data.telemetry?.today && (
           <TelemetryPill
             counts={data.telemetry.today}
@@ -1100,7 +1142,7 @@ export function App() {
             {([
               [1, '单屏', '单屏'],
               [2, '双屏', '双屏：左右两屏，点屏幕或 Alt+1 / Alt+2 切换左右屏'],
-              ['inspect', '文件', '变更与文件面板（Alt+E）：右侧审阅 Git 改动、浏览与编辑项目文件'],
+              ['inspect', '面板', '右侧检视面板（Alt+E）：会话上下文、实时配额、Git 变更与文件编辑'],
             ] as const).map(([m, label, tip]) => (
               <button
                 key={String(m)}
@@ -1118,6 +1160,25 @@ export function App() {
           </span>
         </div>
       </header>
+      {quotaPopoverOpen && (
+        <QuotaPopover
+          quota={data.quota}
+          agents={data.agents as AgentKind[]}
+          cliTools={data.cliTools}
+          currentAgent={focusedAgent}
+          now={now}
+          mode={quotaMode}
+          refreshing={refreshingQuota}
+          onModeChange={setQuotaMode}
+          onRefresh={() => void refreshQuota()}
+          onSwitchAgent={focusedTask ? () => {
+            setDialogTarget(focusedTask.id);
+            setDialog('switch');
+          } : undefined}
+          onOpenStats={() => setView('stats')}
+          onClose={() => setQuotaPopoverOpen(false)}
+        />
+      )}
       <aside className="sidebar" hidden={view !== 'work'}>
         <div
           className="side-resizer"
@@ -1145,31 +1206,43 @@ export function App() {
           }}
         />
         <div className="side-head">
-          {/* The filter takes the place of the old 项目 label: the head was too crowded for both. */}
-          <span className="seg side-filter" role="radiogroup" aria-label="任务筛选">
-            {([['active', '活跃'], ['all', '全部']] as const).map(([k, label]) => (
-              <button
-                key={k}
-                role="radio"
-                aria-checked={filter === k}
-                className={`ghost seg-btn ${filter === k ? 'on' : ''}`}
-                data-testid={`filter-${k}`}
-                title={k === 'active' ? '隐藏已退出的任务（待验收的保留）' : '每个项目默认保留最近 2 个已退出任务，其余局部收起'}
-                onClick={() => changeFilter(k)}
-              >{label}</button>
-            ))}
-          </span>
-          <button className="icon-btn" data-testid="search-btn" aria-label="搜索任务" title="搜索任务（Alt+K）" onClick={() => setDialog('search')}>
-            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25" /><path d="M10.25 10.25L13.5 13.5" /></svg>
-          </button>
-          <button className="ghost" data-testid="new-project-btn" onClick={() => setDialog('project')}>新建项目</button>
-          <button
-            className="ghost"
-            data-testid="new-task-btn"
-            title={data.agents.length ? '新建任务（Alt+N：在当前项目用上次的 agent 直接新建）' : '请先在「设置 → CLI 工具与权限」启用至少一个 CLI'}
-            disabled={!data.projects.length || !data.agents.length}
-            onClick={() => setDialog('task')}
-          >新建任务</button>
+          <div className="side-head-row">
+            <button
+              type="button"
+              className="side-search-trigger"
+              data-testid="search-btn"
+              aria-label="搜索任务"
+              title="搜索任务（Alt+K）"
+              onClick={() => setDialog('search')}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25" /><path d="M10.25 10.25L13.5 13.5" /></svg>
+              <span>搜索任务…</span>
+              <kbd>Alt+K</kbd>
+            </button>
+          </div>
+          <div className="side-head-row">
+            <span className="seg side-filter" role="radiogroup" aria-label="任务筛选">
+              {([['active', '活跃'], ['all', '全部']] as const).map(([k, label]) => (
+                <button
+                  key={k}
+                  role="radio"
+                  aria-checked={filter === k}
+                  className={`ghost seg-btn ${filter === k ? 'on' : ''}`}
+                  data-testid={`filter-${k}`}
+                  title={k === 'active' ? '隐藏已退出的任务（待验收的保留）' : '每个项目默认保留最近 2 个已退出任务，其余局部收起'}
+                  onClick={() => changeFilter(k)}
+                >{label}</button>
+              ))}
+            </span>
+            <button className="ghost side-act-btn" data-testid="new-project-btn" onClick={() => setDialog('project')}>+ 项目</button>
+            <button
+              className="ghost side-act-btn"
+              data-testid="new-task-btn"
+              title={data.agents.length ? '新建任务（Alt+N：在当前项目用上次的 agent 直接新建）' : '请先在「设置 → CLI 工具与权限」启用至少一个 CLI'}
+              disabled={!data.projects.length || !data.agents.length}
+              onClick={() => setDialog('task')}
+            >+ 任务</button>
+          </div>
         </div>
         <div className="side-list">
           {!data.projects.length && (
@@ -1226,6 +1299,56 @@ export function App() {
             onUnarchive={(task) => void setPhase(task, 'unarchive')}
           />
         </div>
+        <div className="side-dock" data-testid="side-dock">
+          <button
+            type="button"
+            className="icon-btn"
+            title="设置"
+            aria-label="打开设置"
+            onClick={() => setView('settings')}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="8" cy="8" r="2.2" />
+              <path d="M8 2.2v1.3M8 12.5v1.3M2.2 8h1.3M12.5 8h1.3M3.9 3.9l.95.95M11.15 11.15l.95.95M12.1 3.9l-.95.95M4.85 11.15l-.95.95" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            title="用量与配额"
+            aria-label="打开用量与配额"
+            onClick={() => setView('stats')}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3.5 13V8.5M8 13V4M12.5 13V6.5" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            className={`icon-btn ${quotaPopoverOpen ? 'on' : ''}`}
+            title="查看实时订阅配额"
+            aria-label="查看实时订阅配额"
+            onClick={() => setQuotaPopoverOpen((v) => !v)}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M2.5 11a5.5 5.5 0 1 1 11 0M8 11l2.4-3.2" />
+            </svg>
+          </button>
+          <span className="side-dock-status" title={connected ? '服务已连接' : '连接已断开'}>
+            <span className={`side-dock-dot ${connected ? 'on' : 'off'}`} />
+            {runningSessionsCount > 0 ? `${runningSessionsCount} 运行中` : connected ? '已就绪' : '重连中'}
+          </span>
+          <button
+            type="button"
+            className={`icon-btn ${refreshingQuota ? 'is-spin' : ''}`}
+            title="刷新配额与状态"
+            aria-label="刷新配额与状态"
+            disabled={refreshingQuota}
+            onClick={() => void refreshQuota()}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.4-3.5M13 3v2.8h-2.8" /></svg>
+          </button>
+        </div>
       </aside>
       <main
         className={`main layout-${layout}`}
@@ -1262,6 +1385,10 @@ export function App() {
               dual={layout === 2}
               now={now}
               quota={paneAgent ? data.quota[paneAgent] : undefined}
+              quotaMode={quotaMode}
+              onOpenQuotaPopover={() => setQuotaPopoverOpen((v) => !v)}
+              context={id ? data.context?.[id] : undefined}
+              onOpenOverview={project ? () => openInspectorAt(project.id, 'overview') : undefined}
               metrics={task ? data.telemetry?.byTask[task.id] : undefined}
               activity={id ? data.activity?.[id] : undefined}
               onInterrupt={id ? () => interruptSession(id) : undefined}
@@ -1343,11 +1470,38 @@ export function App() {
               onSelectProject={(pid) => setPinnedInspectProjectId(pid)}
               onClose={() => switchLayout(1)}
               onNotice={setNotice}
+              focusedTask={focusedTask}
+              focusedSession={focusedSession}
+              focusedContext={focusedSessionId ? data.context?.[focusedSessionId] : undefined}
+              focusedMetrics={focusedTaskId ? data.telemetry?.byTask[focusedTaskId] : undefined}
+              allQuota={data.quota}
+              agents={data.agents as AgentKind[]}
+              cliTools={data.cliTools}
+              now={now}
+              quotaMode={quotaMode}
+              refreshingQuota={refreshingQuota}
+              onRefreshQuota={() => void refreshQuota()}
+              onCompact={focusedSessionId ? () => sendCompactToSession(focusedSessionId) : undefined}
+              onSwitchAgent={focusedTask ? () => {
+                setDialogTarget(focusedTask.id);
+                setDialog('switch');
+              } : undefined}
+              onOpenStats={() => setView('stats')}
             />
           </>
         )}
       </main>
-      <StatsView visible={view === 'stats'} />
+      <StatsView
+        visible={view === 'stats'}
+        quota={data.quota}
+        agents={data.agents as AgentKind[]}
+        cliTools={data.cliTools}
+        now={now}
+        quotaMode={quotaMode}
+        refreshingQuota={refreshingQuota}
+        onQuotaModeChange={setQuotaMode}
+        onRefreshQuota={() => void refreshQuota()}
+      />
       <SettingsView
         visible={view === 'settings'}
         settings={data.settings}
@@ -1905,6 +2059,9 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
       {paneMark && <span className="pane-mark" data-testid="pane-mark">{paneMark}</span>}
       {!!session?.queued && status !== 'exited' && (
         <span className="queued-mark" data-testid="task-queued" title="有消息排队，agent 空闲后自动发送">队</span>
+      )}
+      {!compact && status === 'idle' && task.phase === 'active' && now - taskActivityAt(task, session) >= 60_000 && (
+        <span className="task-age" title="最近活跃时间">{fmtRelativeAge(taskActivityAt(task, session), now)}</span>
       )}
       {task.phase === 'archived' && delegStatus ? (
         delegStatus

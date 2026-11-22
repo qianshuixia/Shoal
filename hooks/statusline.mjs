@@ -59,12 +59,14 @@ function runUser(raw) {
   });
 }
 
-// Normalizes the quota payload so ticking countdown fields (agy's `reset_in_seconds`) do not trigger a post every second
-// while `remaining_fraction` and `reset_time` are unchanged.
+// Normalizes the quota & context payload so ticking countdown fields (agy's `reset_in_seconds`) do not trigger a post
+// every second while `remaining_fraction`, `reset_time` and context occupancy are unchanged.
 function extractPayload(status) {
-  const rl = status?.rate_limits;
-  if (rl && typeof rl === 'object' && !Array.isArray(rl) && Object.keys(rl).length) return { rate_limits: rl };
-  const q = status?.quota;
+  if (!status || typeof status !== 'object' || Array.isArray(status)) return null;
+  const out = {};
+  const rl = status.rate_limits;
+  if (rl && typeof rl === 'object' && !Array.isArray(rl) && Object.keys(rl).length) out.rate_limits = rl;
+  const q = status.quota;
   if (q && typeof q === 'object' && !Array.isArray(q) && Object.keys(q).length) {
     const clean = {};
     for (const [k, v] of Object.entries(q)) {
@@ -76,9 +78,31 @@ function extractPayload(status) {
         clean[k] = v;
       }
     }
-    if (Object.keys(clean).length) return { quota: clean };
+    if (Object.keys(clean).length) out.quota = clean;
   }
-  return null;
+  const cw = status.context_window;
+  if (cw && typeof cw === 'object' && !Array.isArray(cw)) {
+    const compactCw = {};
+    if (typeof cw.context_window_size === 'number' && cw.context_window_size > 0) compactCw.context_window_size = cw.context_window_size;
+    if (typeof cw.used_percentage === 'number' && Number.isFinite(cw.used_percentage)) compactCw.used_percentage = Math.round(cw.used_percentage * 10) / 10;
+    if (cw.current_usage && typeof cw.current_usage === 'object' && !Array.isArray(cw.current_usage)) {
+      const cu = cw.current_usage;
+      const cleanCu = {};
+      for (const k of ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']) {
+        if (typeof cu[k] === 'number' && Number.isFinite(cu[k])) cleanCu[k] = cu[k];
+      }
+      if (Object.keys(cleanCu).length) compactCw.current_usage = cleanCu;
+    }
+    if (Object.keys(compactCw).length) {
+      out.context_window = compactCw;
+      if (typeof status.model === 'string' && status.model) out.model = status.model;
+      else if (status.model && typeof status.model === 'object') {
+        const id = status.model.id || status.model.display_name;
+        if (typeof id === 'string' && id) out.model = id;
+      }
+    }
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 async function post(status) {

@@ -8,7 +8,7 @@ import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
   AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
-  GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
+  GitInfo, QuotaInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionContext, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
 import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel, rawPreviewOf } from '../shared/protocol.ts';
 import { createActivityTracker } from './activity.ts';
@@ -23,7 +23,7 @@ import {
 import { CollabError, createCollabManager } from './collab.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
-import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, readCodexQuota } from './quota.ts';
+import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, parseStatusLineContext, readCodexQuotaInfo, readLatestCodexQuotaFromDisk } from './quota.ts';
 import { findEditor, OpenError, openAction, resolveOpenTarget, runOpen } from './open.ts';
 import { sendRawPreview } from './raw-stream.ts';
 import { readTranscript } from './transcript.ts';
@@ -151,18 +151,94 @@ export function createApp(cfg: AppConfig) {
 
   // Subscription quota per agent kind: kept in <stateDir>/quota.json, broadcast when the windows change.
   const quota = createQuotaStore(path.join(cfg.stateDir, 'quota.json'));
+  // Live prompt context occupancy per session: merged from statusLine payloads (Claude/Agy) and usage transcript scans.
+  const statusLineContexts = new Map<string, SessionContext>();
+  const lastBroadcastContexts = new Map<string, string>();
+
+  function currentContexts(): Record<string, SessionContext> {
+    const out: Record<string, SessionContext> = { ...cfg.usage.contexts() };
+    const liveIds = new Set(sessions.list().map(s => s.id));
+    for (const [sid, ctx] of statusLineContexts) {
+      if (!liveIds.has(sid)) {
+        statusLineContexts.delete(sid);
+        continue;
+      }
+      const existing = out[sid];
+      if (!existing || ctx.updatedAt >= existing.updatedAt) {
+        out[sid] = { ...existing, ...ctx, turns: ctx.turns ?? existing?.turns };
+      }
+    }
+    return out;
+  }
+
+  function broadcastContextUpdates() {
+    if (!clients.size) return;
+    const merged = currentContexts();
+    for (const [sid, ctx] of Object.entries(merged)) {
+      const json = JSON.stringify(ctx);
+      if (lastBroadcastContexts.get(sid) !== json) {
+        lastBroadcastContexts.set(sid, json);
+        broadcast({ t: 'context', sessionId: sid, context: ctx });
+      }
+    }
+    for (const sid of [...lastBroadcastContexts.keys()]) {
+      if (!merged[sid]) {
+        lastBroadcastContexts.delete(sid);
+        broadcast({ t: 'context', sessionId: sid, context: null });
+      }
+    }
+  }
+
+  function refreshCodexQuota(allowDiskFallback = false): QuotaInfo | null {
+    const codexSessions = sessions.list()
+      .filter(s => s.agent === 'codex' && s.transcriptPath)
+      .sort((a, b) => b.statusSince - a.statusSince);
+    for (const s of codexSessions) {
+      const parsed = readCodexQuotaInfo(s.transcriptPath!);
+      if (parsed) {
+        const info = quota.set('codex', parsed.windows, Date.now(), { plan: parsed.plan, source: 'rollout' });
+        if (info) broadcast({ t: 'quota', agent: 'codex', quota: info });
+        return info ?? quota.all().codex ?? null;
+      }
+    }
+    if (allowDiskFallback && !process.env.VITEST && currentAgents().includes('codex')) {
+      const parsed = readLatestCodexQuotaFromDisk();
+      if (parsed) {
+        const info = quota.set('codex', parsed.windows, Date.now(), { plan: parsed.plan, source: 'rollout' });
+        if (info) broadcast({ t: 'quota', agent: 'codex', quota: info });
+        return info ?? quota.all().codex ?? null;
+      }
+    }
+    return quota.all().codex ?? null;
+  }
+
   function observeQuota(body: HookBody): void {
     const session = sessions.list().find(s => s.id === body.sessionId);
     if (!session) return;
     let windows = null;
+    let meta: { plan?: string; source?: QuotaInfo['source'] } | undefined;
     if (body.event === 'RateLimits') {
       const p = body.payload as Record<string, unknown> | null;
-      if (session.agent === 'agy') windows = parseAgyQuota(p?.quota, body.at);
-      else if (session.agent === 'claude' || session.agent === 'fake') windows = p?.quota ? parseAgyQuota(p.quota, body.at) : parseClaudeRateLimits(p?.rate_limits);
+      if (session.agent === 'agy') {
+        windows = parseAgyQuota(p?.quota, body.at);
+        meta = { plan: 'Google', source: 'statusline' };
+      } else if (session.agent === 'claude' || session.agent === 'fake') {
+        windows = p?.quota ? parseAgyQuota(p.quota, body.at) : parseClaudeRateLimits(p?.rate_limits);
+        meta = { source: 'statusline' };
+      }
+      const ctx = parseStatusLineContext(session.agent, p, body.at);
+      if (ctx) {
+        statusLineContexts.set(session.id, ctx);
+        broadcastContextUpdates();
+      }
     } else if (body.event === 'Stop' && session.agent === 'codex' && session.transcriptPath) {
-      windows = readCodexQuota(session.transcriptPath);
+      const parsed = readCodexQuotaInfo(session.transcriptPath);
+      if (parsed) {
+        windows = parsed.windows;
+        meta = { plan: parsed.plan, source: 'rollout' };
+      }
     }
-    const info = windows && quota.set(session.agent, windows);
+    const info = windows && quota.set(session.agent, windows, undefined, meta);
     if (info) broadcast({ t: 'quota', agent: session.agent, quota: info });
   }
 
@@ -173,12 +249,15 @@ export function createApp(cfg: AppConfig) {
   const snapshot = (): Snapshot => {
     const telemetry = cfg.usage.telemetry();
     lastTelemetryJson = JSON.stringify(telemetry);
+    const context = currentContexts();
+    lastBroadcastContexts.clear();
+    for (const [sid, ctx] of Object.entries(context)) lastBroadcastContexts.set(sid, JSON.stringify(ctx));
     const settings = store.settings();
     const cliTools = buildCliTools(settings);
     return {
       projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(),
       agents: enabledAgentsFrom(settings, cliTools), cliTools, settings,
-      git: Object.fromEntries(gitMap), quota: quota.all(), telemetry, activity: activity.all(),
+      git: Object.fromEntries(gitMap), quota: quota.all(), telemetry, context, activity: activity.all(),
     };
   };
 
@@ -187,9 +266,11 @@ export function createApp(cfg: AppConfig) {
     if (!clients.size) return;
     const telemetry = cfg.usage.telemetry(force);
     const next = JSON.stringify(telemetry);
-    if (next === lastTelemetryJson) return;
-    lastTelemetryJson = next;
-    broadcast({ t: 'telemetry', telemetry });
+    if (next !== lastTelemetryJson) {
+      lastTelemetryJson = next;
+      broadcast({ t: 'telemetry', telemetry });
+    }
+    broadcastContextUpdates();
   }
 
   const sizeOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
@@ -974,6 +1055,11 @@ export function createApp(cfg: AppConfig) {
         return n;
       };
       return send(res, 200, cfg.usage.report(at('from'), at('to')));
+    }
+    if (method === 'POST' && pathname === '/api/quota/refresh') {
+      refreshCodexQuota(true);
+      refreshTelemetry(true);
+      return send(res, 200, { quota: quota.all(), context: currentContexts() });
     }
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
     if (method === 'GET' && pathname === '/api/clis') return send(res, 200, getCachedCliScan(store.settings()));

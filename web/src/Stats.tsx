@@ -1,12 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { usePrivacy } from './privacy.ts';
-import type { AgentKind, UsageCounts, UsageReport, UsageRow } from '../../shared/protocol.ts';
+import type { AgentKind, CliToolInfo, QuotaInfo, UsageCounts, UsageReport, UsageRow } from '../../shared/protocol.ts';
 import { agentLabel, usageTotal } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
+import { QuotaDashboard } from './QuotaPanel.tsx';
+import { QUOTA_AGENTS, type QuotaDisplayMode } from './quota.ts';
 import { fmtPct, fmtTokens, hitRate } from './util.ts';
 
 type Preset = 'today' | '7d' | '30d' | 'all' | 'custom';
 type Group = 'byTask' | 'byModel' | 'byVendor' | 'byAgent' | 'byProject';
+type StatsSection = 'all' | 'limits' | 'tokens';
 
 const PRESETS: [Preset, string][] = [['today', '今天'], ['7d', '近 7 天'], ['30d', '近 30 天'], ['all', '全部'], ['custom', '自定义']];
 const GROUPS: [Group, string][] = [['byTask', '任务'], ['byModel', '模型'], ['byVendor', '厂商'], ['byAgent', 'CLI'], ['byProject', '项目']];
@@ -46,7 +49,21 @@ const pct = fmtPct;
 const clock = (t: number) => new Date(t).toLocaleTimeString('zh-CN', { hour12: false });
 const day = (t: number) => { const d = new Date(t); return `${d.getMonth() + 1}/${d.getDate()}`; };
 
-export function StatsView({ visible }: { visible: boolean }) {
+export function StatsView({
+  visible, quota, agents, cliTools, now, quotaMode, refreshingQuota, onQuotaModeChange, onRefreshQuota,
+}: {
+  visible: boolean;
+  quota: Partial<Record<AgentKind, QuotaInfo>>;
+  agents: AgentKind[];
+  cliTools?: CliToolInfo[];
+  now: number;
+  quotaMode: QuotaDisplayMode;
+  refreshingQuota: boolean;
+  onQuotaModeChange(mode: QuotaDisplayMode): void;
+  onRefreshQuota(): void;
+}) {
+  const [section, setSection] = useState<StatsSection>('all');
+  const [providerFilter, setProviderFilter] = useState<string>('all');
   const [preset, setPreset] = useState<Preset>('7d');
   const [start, setStart] = useState(() => dateInput(addDays(Date.now(), -6)));
   const [end, setEnd] = useState(() => dateInput(Date.now()));
@@ -85,80 +102,138 @@ export function StatsView({ visible }: { visible: boolean }) {
   const total = report?.total;
   const rows = report?.[group] ?? [];
   const sum = total ? usageTotal(total) : 0;
+  const providerOptions = QUOTA_AGENTS.filter((a) => a !== 'fake' && (agents.includes(a) || !!quota[a]));
 
   return (
     <section className="stats" data-testid="stats-view" hidden={!visible}>
       <div className="stats-inner">
-        <div className="stats-filters" role="group" aria-label="时间范围">
-          {PRESETS.map(([p, label]) => (
-            <button key={p} className={`seg ${preset === p ? 'on' : ''}`} aria-pressed={preset === p} data-testid={`range-${p}`} onClick={() => setPreset(p)}>
-              {label}
-            </button>
-          ))}
-          {preset === 'custom' && (
-            <span className="stats-custom">
-              <input type="date" aria-label="开始日期" data-testid="range-start" value={start} max={end} onChange={(e) => setStart(e.target.value)} />
-              <span className="muted">至</span>
-              <input type="date" aria-label="结束日期" data-testid="range-end" value={end} min={start} onChange={(e) => setEnd(e.target.value)} />
-            </span>
-          )}
-          <span className="stats-meta">
-            {error ? <span className="form-error">{error}</span>
-              : report ? <>更新于 {clock(report.scannedAt)}{report.since !== null && <>，记录从 {new Date(report.since).toLocaleDateString('zh-CN')} 开始</>}</> : '读取中…'}
+        {/* Top Mode Bar (T3 Code Usage & Limits header pattern) */}
+        <div className="stats-top-bar">
+          <div className="stats-breadcrumb">
+            <span className="stats-page-title">用量与配额</span>
+            {section !== 'tokens' && providerOptions.length > 0 && (
+              <>
+                <span className="stats-sep">/</span>
+                <select
+                  className="stats-provider-select"
+                  aria-label="按厂商筛选"
+                  value={providerFilter}
+                  onChange={(e) => setProviderFilter(e.target.value)}
+                >
+                  <option value="all">全部厂商</option>
+                  {providerOptions.map((a) => (
+                    <option key={a} value={a}>{agentLabel(a, cliTools)}</option>
+                  ))}
+                </select>
+              </>
+            )}
+          </div>
+          <span className="seg stats-section-tabs" role="tablist" aria-label="统计维度">
+            {([['all', '总览'], ['limits', '订阅配额'], ['tokens', 'Token 用量']] as const).map(([k, label]) => (
+              <button
+                key={k}
+                type="button"
+                role="tab"
+                aria-selected={section === k}
+                className={`ghost seg-btn ${section === k ? 'on' : ''}`}
+                data-testid={`stats-sec-${k}`}
+                onClick={() => setSection(k)}
+              >
+                {label}
+              </button>
+            ))}
           </span>
         </div>
 
-        <div className={`stats-body ${loading && report ? 'refreshing' : ''}`}>
-          {total && (
-            <div className="tiles" data-testid="usage-tiles">
-              <Tile hero label="总 token" value={sum} testId="usage-total" />
-              <Tile label="输入" value={total.input} />
-              <Tile label="输出" value={total.output} note={total.reasoning ? `含推理 ${fmt(total.reasoning)}` : undefined} />
-              <Tile label="缓存读取" value={total.cacheRead} />
-              <Tile label="缓存写入" value={total.cacheWrite} />
-              <div className="tile">
-                <span className="tile-label">缓存命中率</span>
-                <span className="tile-value" data-testid="usage-hit-rate">{pct(hitRate(total))}</span>
-                <span className="tile-note">缓存读取占全部输入</span>
-              </div>
-              <div className="tile">
-                <span className="tile-label">请求</span>
-                <span className="tile-value" data-testid="usage-requests">{full(total.requests)}</span>
-              </div>
-            </div>
-          )}
+        {(section === 'all' || section === 'limits') && (
+          <QuotaDashboard
+            quota={quota}
+            agents={agents}
+            cliTools={cliTools}
+            now={now}
+            mode={quotaMode}
+            providerFilter={providerFilter}
+            compact={section === 'all'}
+            refreshing={refreshingQuota}
+            onModeChange={onQuotaModeChange}
+            onRefresh={onRefreshQuota}
+          />
+        )}
 
-          {report && (
-            <div className="card">
-              <div className="card-head">
-                <span className="card-title">用量趋势</span>
-                <Legend />
-              </div>
-              <Trend report={report} />
-            </div>
-          )}
-
-          {report && (
-            <div className="card">
-              <div className="card-head">
-                <span className="card-title">分组明细</span>
-                <span className="segs" role="tablist" aria-label="分组方式">
-                  {GROUPS.map(([g, label]) => (
-                    <button key={g} role="tab" aria-selected={group === g} className={`seg ${group === g ? 'on' : ''}`} data-testid={`group-${g}`} onClick={() => setGroup(g)}>
-                      按{label}
-                    </button>
-                  ))}
+        {(section === 'all' || section === 'tokens') && (
+          <>
+            <div className="stats-filters" role="group" aria-label="时间范围">
+              {PRESETS.map(([p, label]) => (
+                <button key={p} className={`seg ${preset === p ? 'on' : ''}`} aria-pressed={preset === p} data-testid={`range-${p}`} onClick={() => setPreset(p)}>
+                  {label}
+                </button>
+              ))}
+              {preset === 'custom' && (
+                <span className="stats-custom">
+                  <input type="date" aria-label="开始日期" data-testid="range-start" value={start} max={end} onChange={(e) => setStart(e.target.value)} />
+                  <span className="muted">至</span>
+                  <input type="date" aria-label="结束日期" data-testid="range-end" value={end} min={start} onChange={(e) => setEnd(e.target.value)} />
                 </span>
-              </div>
-              {rows.length ? <UsageTable rows={rows} group={group} sum={sum} /> : <div className="stats-empty">这个时间段没有 token 记录。</div>}
+              )}
+              <span className="stats-meta">
+                {error ? <span className="form-error">{error}</span>
+                  : report ? <>更新于 {clock(report.scannedAt)}{report.since !== null && <>，记录从 {new Date(report.since).toLocaleDateString('zh-CN')} 开始</>}</> : '读取中…'}
+              </span>
             </div>
-          )}
 
-          <p className="stats-foot">
-            统计工作台启动的会话，从各 CLI 自己的对话记录读取（Claude Code、Codex、Antigravity），每分钟和打开本页时更新。
-            输入不含缓存；输出含推理。换 agent 时生成交接卡片的短调用不计入。
-          </p>
-        </div>
+            <div className={`stats-body ${loading && report ? 'refreshing' : ''}`}>
+              {total && (
+                <div className="tiles" data-testid="usage-tiles">
+                  <Tile hero label="总 token" value={sum} testId="usage-total" />
+                  <Tile label="输入" value={total.input} />
+                  <Tile label="输出" value={total.output} note={total.reasoning ? `含推理 ${fmt(total.reasoning)}` : undefined} />
+                  <Tile label="缓存读取" value={total.cacheRead} />
+                  <Tile label="缓存写入" value={total.cacheWrite} />
+                  <div className="tile">
+                    <span className="tile-label">缓存命中率</span>
+                    <span className="tile-value" data-testid="usage-hit-rate">{pct(hitRate(total))}</span>
+                    <span className="tile-note">缓存读取占全部输入</span>
+                  </div>
+                  <div className="tile">
+                    <span className="tile-label">请求</span>
+                    <span className="tile-value" data-testid="usage-requests">{full(total.requests)}</span>
+                  </div>
+                </div>
+              )}
+
+              {report && (
+                <div className="card">
+                  <div className="card-head">
+                    <span className="card-title">用量趋势</span>
+                    <Legend />
+                  </div>
+                  <Trend report={report} />
+                </div>
+              )}
+
+              {report && (
+                <div className="card">
+                  <div className="card-head">
+                    <span className="card-title">分组明细</span>
+                    <span className="segs" role="tablist" aria-label="分组方式">
+                      {GROUPS.map(([g, label]) => (
+                        <button key={g} role="tab" aria-selected={group === g} className={`seg ${group === g ? 'on' : ''}`} data-testid={`group-${g}`} onClick={() => setGroup(g)}>
+                          按{label}
+                        </button>
+                      ))}
+                    </span>
+                  </div>
+                  {rows.length ? <UsageTable rows={rows} group={group} sum={sum} /> : <div className="stats-empty">这个时间段没有 token 记录。</div>}
+                </div>
+              )}
+
+              <p className="stats-foot">
+                统计工作台启动的会话，从各 CLI 自己的对话记录读取（Claude Code、Codex、Antigravity），每分钟和打开本页时更新。
+                输入不含缓存；输出含推理。换 agent 时生成交接卡片的短调用不计入。
+              </p>
+            </div>
+          </>
+        )}
       </div>
     </section>
   );

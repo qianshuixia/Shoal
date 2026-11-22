@@ -99,4 +99,38 @@ describe('hooks/statusline.mjs', () => {
       srv.close();
     }
   }, 20_000);
+
+  it('forwards context_window alongside rate_limits when present', async () => {
+    const bodies: any[] = [];
+    const srv = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', c => { b += c; }).on('end', () => { bodies.push(JSON.parse(b)); res.writeHead(204).end(); });
+    });
+    await new Promise<void>(r => srv.listen(0, '127.0.0.1', r));
+    const port = (srv.address() as { port: number }).port;
+    const env = { WORKBENCH_SESSION_ID: `test-ctx-${Date.now()}`, WORKBENCH_PORT: String(port), WORKBENCH_HOOK_TOKEN: 'tok' };
+    const withCtx = JSON.stringify({
+      model: { id: 'claude-opus-4-6' },
+      rate_limits: { five_hour: { used_percentage: 12, resets_at: 1793447357 } },
+      context_window: {
+        context_window_size: 1_000_000,
+        used_percentage: 16.44,
+        current_usage: { input_tokens: 2000, cache_read_input_tokens: 160000 },
+      },
+    });
+    try {
+      await run(env, withCtx, 'claude');
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0].payload).toMatchObject({
+        model: 'claude-opus-4-6',
+        context_window: {
+          context_window_size: 1_000_000,
+          used_percentage: 16.4,
+          current_usage: { input_tokens: 2000, cache_read_input_tokens: 160000 },
+        },
+      });
+    } finally {
+      srv.close();
+    }
+  }, 20_000);
 });

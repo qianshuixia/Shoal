@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
-import type { ActivityPhase, Card, CliToolInfo, Project, QuotaInfo, SessionActivity, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
+import type { ActivityPhase, Card, CliToolInfo, Project, QuotaInfo, SessionActivity, SessionContext, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
 import { agentLabel, DELEGATION_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
 import { attach, detach, fitEntry, focusOnly, isReplayEmpty, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty } from './terms.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
+import { ContextMiniBar } from './QuotaPanel.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
-import { liveWindows } from './quota.ts';
+import { liveWindows, type QuotaDisplayMode } from './quota.ts';
 import { fmtClock } from './util.ts';
 import { DelegationHud, hudVisibleBox, type DelegateView } from './DelegationHud.tsx';
 
@@ -20,6 +21,10 @@ interface Props {
   dual: boolean;
   now: number;
   quota?: QuotaInfo;
+  quotaMode?: QuotaDisplayMode;
+  onOpenQuotaPopover?(): void;
+  context?: SessionContext;
+  onOpenOverview?(): void;
   metrics?: TaskMetrics;
   activity?: SessionActivity;
   onInterrupt?(): void;
@@ -457,7 +462,7 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath, cliTools }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, quotaMode = 'remaining', onOpenQuotaPopover, context, onOpenOverview, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath, cliTools }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const mountedSessionRef = useRef<string | null>(null);
   const repaintFrameRef = useRef(0);
@@ -573,6 +578,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             <FolderIcon />
             <span className="pane-project-name">{project?.name ?? '?'}</span>
           </span>
+          <span className="pane-crumb-sep" aria-hidden="true">/</span>
           {task ? <EditableTitle className="pane-title" testId="pane-title" title={task.title} onSave={onRename} editing={editing} onEditingChange={setEditing} /> : <span className="pane-title">?</span>}
           {task && !editing && (
             <button className="icon-btn pane-rename" data-testid="pane-rename" title="改名（也可以双击标题）" onClick={() => setEditing(true)}>
@@ -605,9 +611,10 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             </button>
           )}
           <span className="pane-spacer" aria-hidden="true" />
+          {context && <ContextMiniBar context={context} onClick={onOpenOverview} />}
           {metrics && <TelemetryPill counts={metrics} tps={metrics.tps} label="本任务累计用量" compact testId="pane-metrics" />}
           {paneAgent && quota && paneWindows.length > 0 && (
-            <QuotaPill agent={paneAgent} quota={quota} windows={paneWindows} now={now} compact />
+            <QuotaPill agent={paneAgent} quota={quota} windows={paneWindows} now={now} compact mode={quotaMode} onClick={onOpenQuotaPopover} />
           )}
           {session && !((task?.phase === 'approved' || task?.phase === 'review') && session.status === 'needs_you') && <StatusTag status={session.status} since={session.statusSince} now={now} />}
           {reviewing && (

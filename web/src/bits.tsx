@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import type { AgentKind, QuotaInfo, QuotaWindow, SessionStatus, UsageCounts } from '../../shared/protocol.ts';
 import { usageTotal } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
-import { QUOTA_WARN, quotaTitle } from './quota.ts';
+import { displayPercent, primaryWindows, QUOTA_WARN, quotaTitle, quotaTone, type QuotaDisplayMode } from './quota.ts';
 import { fmtPct, fmtTokens, hitRate, STATUS_LABEL, waitText } from './util.ts';
 import { usePrivacy } from './privacy.ts';
 
@@ -98,38 +98,66 @@ export function RingGauge({ percent, tone, size = 14 }: { percent: number; tone:
   );
 }
 
-const quotaTone = (p: number): RingTone => (p >= 100 ? 'full' : p >= QUOTA_WARN ? 'warn' : p >= 50 ? 'mid' : 'ok');
 const cacheTone = (r: number): RingTone => (r >= 0.7 ? 'ok' : r >= 0.4 ? 'mid' : 'warn');
 
 export function QuotaPill({
-  agent, quota, windows, now, compact = false,
+  agent, quota, windows, now, compact = false, mode = 'remaining', onClick,
 }: {
   agent: AgentKind;
   quota: QuotaInfo;
   windows: QuotaWindow[];
   now: number;
   compact?: boolean;
+  mode?: QuotaDisplayMode;
+  onClick?(): void;
 }) {
   const prefix = compact ? 'pane-quota' : 'quota';
+  const shown = primaryWindows(windows);
+  const extra = windows.length - shown.length;
+  const content = (
+    <>
+      {!compact && <AgentIcon agent={agent} />}
+      {shown.map((w) => {
+        const pctVal = displayPercent(w, mode);
+        const ringPct = mode === 'remaining' ? 100 - w.usedPercent : w.usedPercent;
+        return (
+          <span
+            key={w.label}
+            className={`quota-win ${w.usedPercent >= QUOTA_WARN ? 'warn' : ''} ${w.usedPercent >= 100 ? 'full' : ''}`}
+            data-testid={`${prefix}-window`}
+            data-label={w.label}
+          >
+            <RingGauge percent={ringPct} tone={quotaTone(w.usedPercent)} size={compact ? 13 : 14} />
+            {w.label} {pctVal}%
+          </span>
+        );
+      })}
+      {extra > 0 && <span className="quota-more-badge" title={`另有 ${extra} 个共享/次级配额窗口`}>+{extra}</span>}
+    </>
+  );
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className={`quota quota-trigger ${compact ? 'pane-quota' : ''}`}
+        data-testid={prefix}
+        data-agent={agent}
+        title={quotaTitle(agent, quota, windows, now, mode)}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={onClick}
+      >
+        {content}
+      </button>
+    );
+  }
   return (
     <span
       className={`quota ${compact ? 'pane-quota' : ''}`}
       data-testid={prefix}
       data-agent={agent}
-      title={quotaTitle(agent, quota, windows, now)}
+      title={quotaTitle(agent, quota, windows, now, mode)}
     >
-      {!compact && <AgentIcon agent={agent} />}
-      {windows.map((w) => (
-        <span
-          key={w.label}
-          className={`quota-win ${w.usedPercent >= QUOTA_WARN ? 'warn' : ''} ${w.usedPercent >= 100 ? 'full' : ''}`}
-          data-testid={`${prefix}-window`}
-          data-label={w.label}
-        >
-          <RingGauge percent={w.usedPercent} tone={quotaTone(w.usedPercent)} size={compact ? 13 : 14} />
-          {w.label} {Math.round(w.usedPercent)}%
-        </span>
-      ))}
+      {content}
     </span>
   );
 }

@@ -396,10 +396,30 @@ export interface QuotaWindow {
   label: string; // '5h' / '7d', or generic ('60m', '2d')
   usedPercent: number; // 0-100
   resetsAt: number; // ms epoch; a window whose reset has passed is stale
+  windowMinutes?: number; // rolling window duration in minutes for time-pace calculation (300 = 5h, 10080 = 7d)
+  pool?: string; // logical model pool id (e.g. 'gemini', '3p', 'claude', 'codex')
+  poolLabel?: string; // human-readable pool name (e.g. 'Gemini', 'Claude & GPT 共享')
+  primary?: boolean; // primary pool shown in compact pills; omitted counts as true
 }
 export interface QuotaInfo {
   windows: QuotaWindow[];
   at: number; // ms epoch when observed
+  plan?: string; // optional subscription tier/account source (e.g. 'plus', 'pro', 'Google')
+  source?: 'statusline' | 'rollout' | 'transcript';
+}
+
+// Live prompt context window occupancy of one session (cached vs uncached vs remaining), derived from statusLine or transcripts.
+// Never persisted to state.json; broadcast incrementally via WS.
+export interface SessionContext {
+  contextWindowSize: number; // max context tokens (e.g. 200_000 or 1_048_576)
+  usedTokens: number; // total prompt tokens in latest turn (cached + uncached)
+  cachedTokens: number; // cached prompt tokens
+  uncachedTokens: number; // non-cached input tokens
+  usedPercent: number; // 0-100
+  cacheHitRate: number | null; // 0-1 for the latest turn
+  model?: string;
+  turns?: number;
+  updatedAt: number;
 }
 
 export type ActivityPhase = 'thinking' | 'tool' | 'subagent' | 'compacting' | 'error';
@@ -555,6 +575,7 @@ export interface Snapshot {
   git: Record<string, GitInfo | null>; // by project id; null = not a git repo. Derived, not stored in state.json
   quota: Partial<Record<AgentKind, QuotaInfo>>; // from <stateDir>/quota.json
   telemetry?: TelemetrySummary; // derived live token / cache / speed telemetry from usage.ts
+  context?: Record<string, SessionContext>; // by sessionId: live prompt context occupancy
   activity?: Record<string, SessionActivity>; // by sessionId for currently working sessions
 }
 
@@ -1151,6 +1172,7 @@ export type ServerMsg =
   | { t: 'git'; projectId: string; git: GitInfo | null } // sent only when the value changed
   | { t: 'quota'; agent: AgentKind; quota: QuotaInfo } // sent only when the windows changed
   | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
+  | { t: 'context'; sessionId: string; context: SessionContext | null } // live session context window update
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per running session right after snapshot, or on 'want-replay'
