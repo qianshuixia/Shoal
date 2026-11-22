@@ -95,8 +95,8 @@ describe('openAction', () => {
     expect(openAction(at('C:\\d'), true, editor, 'win32')).toEqual({ kind: 'dir', cmd: 'explorer.exe', args: ['C:\\d'] });
   });
 
-  it('opens images, pdf and html with the default program', () => {
-    for (const ext of ['png', 'JPG', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'pdf', 'html', 'htm']) {
+  it('opens images, audio, video, pdf and html with the default program', () => {
+    for (const ext of ['png', 'JPG', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'pdf', 'html', 'htm', 'mp4', 'MOV', 'mkv', 'mp3', 'flac']) {
       expect(openAction(at(`C:\\d\\a.${ext}`), false, editor, 'win32')).toEqual({ kind: 'default', cmd: 'explorer.exe', args: [`C:\\d\\a.${ext}`] });
     }
   });

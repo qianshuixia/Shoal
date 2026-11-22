@@ -95,7 +95,7 @@ build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 mac
   - 「Antigravity 默认模型档位」：指定新开 `agy` 任务默认透传的 `--model` 档位。
   - 「Antigravity CLI 输出与排版优化」（完整方案与手动配置见 [docs/agy-output-optimization.md](docs/agy-output-optimization.md)）：点击「一键优化」→「确定」，自动备份原配置（生成 `.shoal.bak`）并无损写入 `~/.gemini/antigravity-cli/settings.json`（`verbosity: "low"` + `tokyo night` 配色）、全局常驻终端清爽排版与阶段心跳规则（`~/.gemini/config/rules/shoal-output-style.md`）以及内置零依赖 `fast-tools` 极速检索 MCP（`hooks/fast-tools.mjs`），完整保留已有模型、权限与其他 MCP 服务。
 - 贴图：`Ctrl+V` 或 `Alt+V`（macOS 上是 `Cmd+V` 或 `Ctrl+V`）粘贴剪贴板里的图片（交给 CLI 自己读系统剪贴板）；在资源管理器或访达里复制的文件（视频、文档等）用 `Ctrl+V`（macOS 上 `Cmd+V`）粘贴时插入它们的完整路径，含空格的加引号，多个用空格分隔（同 Windows Terminal）；拖入图片文件会保存到 `<state 目录>\attachments\` 并把路径粘贴进去（claude、codex 会识别为图片附件，agy 只收到路径文字）。Claude Code 的贴图键是 `chat:imagePaste`（Windows 默认 `alt+v`，macOS 默认 `ctrl+v`），改过绑定的话粘贴图片会失效。
-- 终端里的链接：属于已登记项目的文本、代码、Markdown 和图片文件点击后直接在右侧「文件」面板打开（带行号的自动定位到该行，右上角「外部打开」仍可用 VS Code 打开）；项目外的文件链接、大文件或二进制文件用 VS Code / 默认程序打开（程序和快捷方式只在资源管理器或访达里选中，不会运行），网页链接在新标签页打开。可用环境变量 `WORKBENCH_EDITOR` 指定编辑器路径。
+- 终端里的链接：属于已登记项目的文本、代码、Markdown、图片、音视频和 PDF 文件点击后直接在右侧「文件」面板打开（带行号的自动定位到该行，右上角「外部打开」仍可用 VS Code 打开）；项目外的文件链接、大文件或二进制文件用 VS Code / 默认程序打开（程序和快捷方式只在资源管理器或访达里选中，不会运行），网页链接在新标签页打开。可用环境变量 `WORKBENCH_EDITOR` 指定编辑器路径。
 - 选中即复制：在终端里拖选、双击选词或三击选行，松开鼠标就复制到系统剪贴板（同 Windows Terminal 的 copyOnSelect）；单击不复制。CLI 开了鼠标模式时按住 `Shift` 再拖选；不按 `Shift` 时由 CLI 自己选中，它通过 OSC 52 交来的文字同样会写进剪贴板。
 - 鼠标点选：Claude Code 的全屏模式（`/tui fullscreen`，或 settings 里 `"tui": "fullscreen"`）会开鼠标模式，选项菜单可以直接点，滚轮也交给它处理。Claude 会把“全屏启动后 10 秒内进程就消失”当作一次崩溃，累计两次后该版本自动退出全屏（`~/.claude.json` 里出现 `fullscreenAutoDisabled`），之后点击就失效了，在 Claude 里运行一次 `/tui fullscreen` 即可恢复。工作台删除或归档刚启动的 Claude 任务、正常停止服务时，会等它满 10 秒再结束进程；但 `stop`/`restart` 是强杀，刚启动的 Claude 照样会被记一次。
 - 点项目名折叠或展开；折叠状态保存在本机浏览器。折叠后项目名旁显示「N 个在等你」和「N 待验收」；用 ``Alt+` `` 跳过去时会自动展开。
@@ -120,7 +120,7 @@ build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 mac
 - 顶栏「单屏 | 双屏 | 文件」分段按钮切换布局，当前布局高亮。双屏时点侧栏会替换当前聚焦的面板；聚焦的面板标题栏顶部有任务色细线，另一屏略微变暗但仍可读。`Alt+1` / `Alt+2` 切换聚焦左 / 右屏，`Alt+E` 一键开关右侧「变更 / 文件」面板。
 - 变更与文件面板（`Alt+E`，或点侧边栏项目头部的 Git 分支胶囊直达）：在右侧半屏内审阅 Agent 改动、浏览与快改项目文件，中间分隔条可拖动调整宽度（双击恢复对半），面板内所有操作不改变左侧终端尺寸、不触发重绘闪烁。
   - 「变更」标签：基于 `git --no-optional-locks` 列出未提交改动（`M`/`A`/`D`/`R`/`?` 及增删行数），默认展示单栏行内 Unified Diff，支持一键切到「编辑」修改并 `Ctrl+S` 保存，也支持单文件悬停「放弃改动」（确认后还原到 `HEAD` 或删除未跟踪新文件）。
-  - 「文件」标签：按层惰性加载目录树（默认显示 `.env*` 等点文件，弱化折叠 `node_modules` 等产物目录，标记有 Git 改动的目录与文件），支持 `Ctrl+P` 快速模糊搜索项目文件、CodeMirror 语法高亮编辑与 `Ctrl+F` 页内查找、Markdown 安全渲染预览（`预览 | 源码` 切换，禁用原始 HTML 脚本执行）、图片内联预览，并对超过 2 MB 或二进制文件提供安全拦截。
+  - 「文件」标签：按层惰性加载目录树（默认显示 `.env*` 等点文件，弱化折叠 `node_modules` 等产物目录，标记有 Git 改动的目录与文件），支持 `Ctrl+P` 快速模糊搜索项目文件、CodeMirror 语法高亮编辑与 `Ctrl+F` 页内查找、Markdown 安全渲染预览（`预览 | 源码` 切换，禁用原始 HTML 脚本执行）、图片、视频（mp4/webm/mov 等）、音频（mp3/wav/flac 等）和 PDF 内联预览（音视频支持拖动进度，内置播放器解不了的编码会提示并提供「在外部打开」，用系统默认程序打开），并对其他二进制文件或超过 2 MB 的文本文件提供安全拦截。
   - 并发保护：Agent 在后台改写磁盘文件时，若当前编辑器无未保存修改则静默热重载最新内容；若你有未保存修改则保留草稿并弹出冲突提示条，由你选择「重新加载磁盘版本」或「保留并覆盖」。
 - ``Alt+` `` 跳到等你最久的会话（Chrome 不把 `Ctrl+Tab` 交给网页）。
 - 权限：三家 CLI 一律以完全权限启动（新建和续接都是），不再弹审批：claude `--dangerously-skip-permissions`、codex `--dangerously-bypass-approvals-and-sandbox`（同时关闭沙箱）、agy `--dangerously-skip-permissions`。agent 可以直接改文件、跑命令，只在信任的项目目录里用。

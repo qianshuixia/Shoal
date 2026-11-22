@@ -47,7 +47,7 @@
 2. **侧边栏 Git 分支徽章点击**：点击项目头部的 `main · 3` 胶囊（`e.stopPropagation()`，不影响折叠箭头与项目名点击折叠），直接展开右侧面板并定位到该项目的 **「变更」** 标签。
 3. **终端内文件路径点击直达**：
    - 点击终端输出中的本地文件链接（如 `C:\Projects\app\src\auth.ts:42:5` 或 `file:///.../README.md#L18`）时：
-   - 若目标文件位于工作台**已登记的某个项目目录内**，且后缀/类型为可检视的文本、代码、Markdown 或图片文件，则**直接在右侧面板打开该文件并滚到目标行高亮**，不再强制跳出工作台；
+   - 若目标文件位于工作台**已登记的某个项目目录内**，且后缀/类型为可检视的文本、代码、Markdown、图片、音视频或 PDF 文件，则**直接在右侧面板打开该文件并滚到目标行高亮**，不再强制跳出工作台；
    - 面板工具栏保留 **「在外部编辑器打开」** 按钮（调用既有 `POST /api/open` 打开 VS Code / Cursor 并跳到当前光标行）；
    - **项目目录之外**的独立文件、目录、`.exe` 可执行文件等，完全保持既有 `POST /api/open` 行为不变。
 
@@ -82,7 +82,7 @@
 - **主视口能力**：
   - **文本/代码编辑（CodeMirror 6）**：行号、折叠、括号匹配、`Ctrl+F` 页内搜索替换、`Ctrl+S` 保存、未保存圆点 `●`、语法高亮（TS/JS/JSX/TSX、JSON、CSS、HTML、Markdown、Python、Rust、YAML 等）；字号随全局缩放 `wb.scale` 联动，字体与终端一致采用 `"Maple Mono NF CN"` 优先等宽栈。
   - **Markdown 阅读模式**：打开 `.md` / `.mdx` 文件时，文件栏提供 **`[ 预览 | 源码 ]`** 切换（默认 `预览` 或记住切换选择）；**安全铁律**：严禁执行或原样注入未清洗的原始 HTML，彻底杜绝本地端口 XSS。
-  - **图片内联预览**：`.png`、`.jpg`、`.jpeg`、`.gif`、`.webp`、`.bmp`、`.svg` 直接渲染缩放预览与文件大小信息（服务端原始流仅白名单放行图片并加严格 `Content-Security-Policy: default-src 'none'` 响应头）。
+  - **多媒体内联预览**：后缀白名单见 `shared/protocol.ts` 的 `RAW_PREVIEW_TYPES`。图片（png/jpg/gif/webp/avif/bmp/ico/svg 等）用 `<img>` 缩放预览，单文件上限 25 MB；视频（mp4/m4v/webm/mov/ogv/mkv/avi 等）和音频（mp3/wav/ogg/opus/m4a/aac/flac 等）用 `<video>` / `<audio>` 播放，不设体积上限；PDF 用浏览器内置查看器（`<iframe>`，不加 `sandbox`，否则查看器被禁用）；嵌入前先用 `Range: bytes=0-1023` 读文件头，找不到 `%PDF-` 或 `navigator.pdfViewerEnabled === false` 时改为提示加「在外部打开」；文件头正常但正文损坏时查看器自己报错且不通知页面，所以查看器下方常驻一行文件大小和「在外部打开」。「变更」标签里音视频和 PDF 一律按二进制处理（不进文本对比和编辑器），未删除的直接内联预览。播放器解码失败时显示「内置播放器无法播放此文件」和「在外部打开」按钮，外部打开对这些类型走系统默认程序而不是 VS Code。`.ts` / `.mts` 永远按 TypeScript 文本处理，不当作 MPEG-TS 视频。
   - **大文件与二进制保护**：超过 `2 MB` 的文件或含 `\0` 字节的二进制文件不加载进编辑器，显示友好提示与文件体积，引导点击「在外部编辑器打开」。
 
 ---
@@ -106,6 +106,7 @@
 
 - 所有新增写/删接口（保存文件、放弃改动）均复用 `server/http.ts` 同源校验（`sameOrigin`）；
 - 所有文件路径参数必须经 `resolveProjectPath(project.path, relPath)` 校验：解析 `fs.realpathSync(project.path)` 与目标真实父路径，**严禁 `..` 路径穿越、盘符越界、UNC 路径、指向项目外的符号链接，以及对 `.git/` 内部元数据目录的直接写入或删除**。
+- 判断真实路径是否在项目根内时，大小写完全一致的前缀才直接放行。Windows 上只差大小写的前缀（NTFS 可以对单个目录开启大小写敏感，使 `Proj` 与 `proj` 成为两个兄弟目录），还要求目标在根目录那一层的祖先与根目录的 dev/ino 相同，否则按项目外处理。
 
 ---
 
@@ -117,8 +118,8 @@
 | `GET /api/projects/:id/diff?path=<rel>` | 获取单文件 `HEAD` 与工作区对比数据 | 返回 `{ path, status, base, head, binary, tooLarge, size, mtimeMs }` |
 | `GET /api/projects/:id/tree?path=<relDir>` | 惰性读取单层目录条目（附带 Git 脏标记） | 返回 `{ path, entries: TreeEntry[] }` |
 | `GET /api/projects/:id/files` | 获取项目内可搜索的相对文件路径列表（供 `Ctrl+P`） | 返回 `{ files: string[], truncated: boolean }` |
-| `GET /api/projects/:id/file?path=<rel>` | 读取单文件文本内容或元信息（支持仅查 `stat=1`） | 返回 `FilePayload`（`text \| image \| binary \| too_large \| missing`） |
-| `GET /api/projects/:id/raw?path=<rel>` | 安全流式读取项目内图片供 `<img>` 预览 | 仅限图片后缀，附 `CSP: default-src 'none'` + `X-Content-Type-Options: nosniff` |
+| `GET /api/projects/:id/file?path=<rel>` | 读取单文件文本内容或元信息（支持仅查 `stat=1`） | 返回 `FilePayload`（`text \| image \| video \| audio \| pdf \| binary \| too_large \| missing`） |
+| `GET /api/projects/:id/raw?path=<rel>` | 安全流式读取项目内图片、音视频和 PDF 供预览 | 仅限 `RAW_PREVIEW_TYPES` 白名单后缀（其他 415）；支持单段 `Range`（206 / 越界 416，多段或格式错误按整文件 200），音视频拖动进度和 macOS WKWebView 播放依赖它；带 `If-Range` 的请求不做校验，直接回整文件 200；服务端先打开文件句柄，再核对它与 realpath 校验后的目标是同一文件（dev + ino），大小和读取都用这个句柄，Windows 备用数据流路径（`a.txt:b.mp4`）返回 400；附 `CSP: default-src 'none'; style-src 'unsafe-inline'` + `X-Content-Type-Options: nosniff` |
 | `PUT /api/projects/:id/file` | 保存文本文件（带乐观锁） | Body `{ path, content, expectedMtimeMs?, force? }`；冲突返回 `409` |
 | `POST /api/projects/:id/discard` | 放弃单文件未提交改动 | Body `{ path }`；恢复已跟踪文件或删除未跟踪文件，触发 Git 广播 |
 
@@ -131,6 +132,6 @@
 1. **三态切换与拖拽流畅**：顶栏 `[ 单屏 | 双屏 | 文件 ]` 与 `Alt+E` 切换正确，拖拽中间分隔条可平滑调整宽度且持久化，双击恢复默认。
 2. **入口联动闭环**：点侧栏 `branch · N` 徽章直达该项目「变更」标签；点终端内项目文件链接（含 `:line` / `#Lline`）直接在右侧打开并定位行；项目外链接与 `.exe` 仍走既有外部打开逻辑。
 3. **Git 审阅与快改可用**：正确展示修改（`M`）、新增/未跟踪（`A`/`?`）、删除（`D`）及增删行数；Unified Diff 清晰可读，切「编辑」修改并 `Ctrl+S` 保存后磁盘内容与 Diff 同步更新；单文件「放弃改动」可安全还原。
-4. **文件浏览与多格式预览**：惰性目录树可见 `.env*`、弱化 `node_modules`；`Ctrl+P` 快速定位文件；Markdown 预览美观且过滤一切 XSS 脚本；图片正常内联预览；`> 2 MB` 与二进制文件安全拦截。
+4. **文件浏览与多格式预览**：惰性目录树可见 `.env*`、弱化 `node_modules`；`Ctrl+P` 快速定位文件；Markdown 预览美观且过滤一切 XSS 脚本；图片、音视频和 PDF 内联预览（音视频可拖动进度，解码失败可外部打开）；`> 2 MB` 文本与其他二进制文件安全拦截。
 5. **并发安全无损**：Agent 外部改盘时，干净编辑器自动热更新，未保存编辑器弹出冲突条且不丢草稿，`409` 乐观锁保护生效。
 6. **零终端闪烁不变量**：右侧面板已打开状态下，切换标签、展开目录、切换文件、切换 Diff/编辑、保存、出现冲突提示条，左侧终端 `.pane-body` 宽高变化为 `0 px`，PTY `resize` 次数为 `0`。

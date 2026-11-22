@@ -216,6 +216,18 @@ test.describe('mobile access gateway & Android PWA', () => {
       expect(mobSnap.projects[0].path).toBe('');
       expect(mobSnap.sessions[0].transcriptPath).toBeUndefined();
 
+      // The phone's raw endpoint stays image-only even though the desktop Inspector now streams video/audio/PDF.
+      fs.writeFileSync(path.join(repoDir, 'pic.png'), TINY_PNG);
+      fs.writeFileSync(path.join(repoDir, 'clip.mp4'), Buffer.alloc(4096, 1));
+      const mobileRaw = (rel: string) =>
+        mobileCtx.request.get(`${MOBILE_ORIGIN}/api/projects/${project.id}/raw?path=${encodeURIComponent(rel)}`, { headers: { 'x-shoal-mobile': '1' } });
+      const rawPng = await mobileRaw('pic.png');
+      expect(rawPng.status()).toBe(200);
+      expect(rawPng.headers()['content-type']).toBe('image/png');
+      expect((await mobileRaw('clip.mp4')).status()).toBe(415);
+      fs.rmSync(path.join(repoDir, 'pic.png'));
+      fs.rmSync(path.join(repoDir, 'clip.mp4'));
+
       // 4) Chat workflow on running task: queue follow-up + image upload + readonly Diff + approve + zero resize.
       // Start a sleep 2 turn from desktop REST so mobile sees working session & queues follow-up.
       await request.post(`/api/tasks/${mainTask.task.id}/feedback`, { data: { text: 'sleep 2', mode: 'same' } });

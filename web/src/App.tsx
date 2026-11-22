@@ -25,6 +25,9 @@ import { TaskSearch } from './TaskSearch.tsx';
 import type { DelegateView } from './DelegationHud.tsx';
 import { needsList, nestDelegated, reviewList, sortProjectTasks, taskActivityAt, taskBand } from './util.ts';
 
+// File kinds the Inspector Files panel can show; anything else (binary, too large, missing) opens externally.
+const INSPECTABLE_KINDS: ReadonlySet<FilePayload['kind']> = new Set(['text', 'image', 'video', 'audio', 'pdf']);
+
 type PaneSessions = [string | null, string | null];
 type LayoutMode = 1 | 2 | 'inspect';
 type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'feedback' | 'search' | null;
@@ -450,7 +453,7 @@ export function App() {
         const res = await fetch(`/api/projects/${encodeURIComponent(match.project.id)}/file?path=${encodeURIComponent(match.relPosix)}&stat=1`);
         if (res.ok) {
           const stat = (await res.json()) as FilePayload;
-          if (stat.kind === 'text' || stat.kind === 'image') {
+          if (INSPECTABLE_KINDS.has(stat.kind)) {
             openInspectorAt(match.project.id, 'files', match.relPosix, match.line, match.col);
             return;
           }
@@ -479,7 +482,7 @@ export function App() {
         const res = await fetch(`/api/projects/${encodeURIComponent(match.project.id)}/file?path=${encodeURIComponent(match.relPosix)}&stat=1`);
         if (!res.ok) return false;
         const stat = (await res.json()) as FilePayload;
-        if (stat.kind !== 'text' && stat.kind !== 'image') return false;
+        if (!INSPECTABLE_KINDS.has(stat.kind)) return false;
         openInspectorAt(match.project.id, 'files', match.relPosix, match.line, match.col);
         return true;
       } catch {

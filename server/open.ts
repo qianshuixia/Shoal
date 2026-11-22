@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import type { OpenMode } from '../shared/protocol.ts';
+import { rawPreviewOf, type OpenMode } from '../shared/protocol.ts';
 import { findExecutable } from './platform.ts';
 
 // Opens a link clicked in a terminal (file: URI or bare absolute path) in VS Code / Explorer. Nothing here ever executes the target.
@@ -93,7 +93,9 @@ export function resolveOpenTarget(target: string, platform: NodeJS.Platform = pr
   throw new OpenError(404, `文件不存在：${p}`);
 }
 
-const DEFAULT_OPEN = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'pdf', 'html', 'htm']);
+// Images, audio, video and PDF (everything the Inspector previews) plus HTML go to the system default program.
+const DEFAULT_OPEN = new Set(['html', 'htm']);
+const opensWithDefault = (ext: string): boolean => DEFAULT_OPEN.has(ext) || rawPreviewOf(`.${ext}`) !== null;
 const SELECT_ONLY = new Set(['exe', 'com', 'msi', 'msp', 'lnk', 'url', 'scr', 'cpl', 'dll', 'sys', 'appref-ms', 'pif', 'msc', 'hta']);
 
 // macOS: .command / .app / installers run or launch when opened, so they are only revealed in Finder.
@@ -121,7 +123,7 @@ export function openAction(
   if (isDir) return { kind: 'dir', cmd: explorer, args: [file] };
   if (mode === 'reveal') return { kind: 'select', cmd: explorer, args: [`/select,"${file}"`], verbatim: true };
   const ext = path.extname(file).slice(1).toLowerCase();
-  if (DEFAULT_OPEN.has(ext)) return { kind: 'default', cmd: explorer, args: [file] };
+  if (opensWithDefault(ext)) return { kind: 'default', cmd: explorer, args: [file] };
   if (SELECT_ONLY.has(ext) || !editor) return { kind: 'select', cmd: explorer, args: [`/select,"${file}"`], verbatim: true };
   if (resolved.line === undefined) return { kind: 'editor', cmd: editor, args: [file] };
   const at = resolved.col === undefined ? `${resolved.line}` : `${resolved.line}:${resolved.col}`;
@@ -138,7 +140,7 @@ function posixOpenAction(resolved: Resolved, isDir: boolean, editor: string | nu
     : { kind: 'select', cmd: opener, args: [path.posix.dirname(file)] };
   if (isDir) return mac && MAC_BUNDLE_DIRS.has(ext) ? select() : { kind: 'dir', cmd: opener, args: [file] };
   if (mode === 'reveal') return select();
-  if (DEFAULT_OPEN.has(ext)) return { kind: 'default', cmd: opener, args: [file] };
+  if (opensWithDefault(ext)) return { kind: 'default', cmd: opener, args: [file] };
   if ((mac ? MAC_SELECT_ONLY : SELECT_ONLY).has(ext) || !editor) return select();
   if (resolved.line === undefined) return { kind: 'editor', cmd: editor, args: [file] };
   const at = resolved.col === undefined ? `${resolved.line}` : `${resolved.line}:${resolved.col}`;

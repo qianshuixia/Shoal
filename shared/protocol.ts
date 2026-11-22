@@ -207,7 +207,49 @@ export interface FileListResult {
   truncated: boolean;
 }
 
-export type FileKind = 'text' | 'image' | 'binary' | 'too_large' | 'missing';
+export type FileKind = 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'binary' | 'too_large' | 'missing';
+export type RawPreviewKind = 'image' | 'video' | 'audio' | 'pdf';
+
+// Files the Inspector renders natively, served by GET /api/projects/:id/raw. Whether a given video or audio codec
+// actually plays depends on the WebView, so the player falls back to "open externally" on a decode error.
+// Never add .ts / .mts here: those are TypeScript sources, not MPEG transport streams.
+const RAW_PREVIEW_TYPES: Record<string, { kind: RawPreviewKind; mime: string }> = {
+  png: { kind: 'image', mime: 'image/png' },
+  apng: { kind: 'image', mime: 'image/apng' },
+  jpg: { kind: 'image', mime: 'image/jpeg' },
+  jpeg: { kind: 'image', mime: 'image/jpeg' },
+  gif: { kind: 'image', mime: 'image/gif' },
+  webp: { kind: 'image', mime: 'image/webp' },
+  avif: { kind: 'image', mime: 'image/avif' },
+  bmp: { kind: 'image', mime: 'image/bmp' },
+  ico: { kind: 'image', mime: 'image/x-icon' },
+  svg: { kind: 'image', mime: 'image/svg+xml' },
+  mp4: { kind: 'video', mime: 'video/mp4' },
+  m4v: { kind: 'video', mime: 'video/mp4' },
+  webm: { kind: 'video', mime: 'video/webm' },
+  mov: { kind: 'video', mime: 'video/quicktime' },
+  ogv: { kind: 'video', mime: 'video/ogg' },
+  mkv: { kind: 'video', mime: 'video/x-matroska' },
+  avi: { kind: 'video', mime: 'video/x-msvideo' },
+  wmv: { kind: 'video', mime: 'video/x-ms-wmv' },
+  flv: { kind: 'video', mime: 'video/x-flv' },
+  '3gp': { kind: 'video', mime: 'video/3gpp' },
+  mp3: { kind: 'audio', mime: 'audio/mpeg' },
+  wav: { kind: 'audio', mime: 'audio/wav' },
+  ogg: { kind: 'audio', mime: 'audio/ogg' },
+  oga: { kind: 'audio', mime: 'audio/ogg' },
+  opus: { kind: 'audio', mime: 'audio/ogg' },
+  m4a: { kind: 'audio', mime: 'audio/mp4' },
+  aac: { kind: 'audio', mime: 'audio/aac' },
+  flac: { kind: 'audio', mime: 'audio/flac' },
+  weba: { kind: 'audio', mime: 'audio/webm' },
+  pdf: { kind: 'pdf', mime: 'application/pdf' },
+};
+
+export const rawPreviewOf = (filePath: string): { kind: RawPreviewKind; mime: string } | null => {
+  const ext = /\.([A-Za-z0-9]+)$/.exec(filePath)?.[1].toLowerCase();
+  return ext && Object.hasOwn(RAW_PREVIEW_TYPES, ext) ? RAW_PREVIEW_TYPES[ext] : null;
+};
 
 export interface FilePayload {
   path: string;
@@ -560,7 +602,7 @@ export const TASK_COLORS = [
 // GET    /api/projects/:id/tree?path=dir -> TreeListing      (single-level lazy directory listing with git dirty badges)
 // GET    /api/projects/:id/files         -> FileListResult   (relative file paths for Ctrl+P quick search, capped at 20,000)
 // GET    /api/projects/:id/file?path=p[&stat=1] -> FilePayload (text content or metadata; stat=1 omits content for fast mtime check)
-// GET    /api/projects/:id/raw?path=p    -> binary stream    (image preview only, strict CSP: default-src 'none')
+// GET    /api/projects/:id/raw?path=p    -> binary stream    (rawPreviewOf types only, single-range Range support, strict CSP: default-src 'none')
 // PUT    /api/projects/:id/file WriteFileBody -> WriteFileResult (saves UTF-8 text; 409 { code: 'conflict', mtimeMs } on mtime mismatch)
 // POST   /api/projects/:id/discard { path } -> { ok: true }  (restores tracked file to HEAD or deletes untracked file)
 // GET    /api/agy/optimize               -> AgyOptimizeStatus (read-only status of Antigravity CLI output & fast-tools optimization)

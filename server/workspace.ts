@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import type {
   ChangedFile, ChangeStatus, DiffPayload, FileListResult, FilePayload, FsCreateBody, FsCreateResult, FsDeleteBody, FsDeleteResult, FsPasteBody, FsPasteResult, FsRenameBody, FsRenameResult, GitInfo, ProjectChanges, TreeEntry, TreeListing, WriteFileBody, WriteFileResult,
 } from '../shared/protocol.ts';
+import { rawPreviewOf, type RawPreviewKind } from '../shared/protocol.ts';
 
 export const MAX_TEXT_BYTES = 2 * 1024 * 1024; // 2 MB guard for editor & diff
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024; // 25 MB guard for inline image preview
@@ -15,17 +16,6 @@ const PORCELAIN_CACHE_TTL_MS = 250;
 const LINE_STAT_CONCURRENCY = 16;
 const PATH_COLLATOR = new Intl.Collator('en', { sensitivity: 'base' });
 const NAME_COLLATOR = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
-
-const IMAGE_MIME: Record<string, string> = {
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.webp': 'image/webp',
-  '.bmp': 'image/bmp',
-  '.ico': 'image/x-icon',
-  '.svg': 'image/svg+xml',
-};
 
 // Heavy artifact / dependency folders dimmed in the tree and skipped during fallback FS walk.
 // Note: dotfiles like .env, .env.local, .gitignore, .github are intentionally NOT here so users can inspect/edit them!
@@ -48,11 +38,27 @@ export class WorkspaceError extends Error {
 
 export const toPosix = (p: string): string => p.replace(/\\/g, '/');
 
+function sameDirectory(a: string, b: string): boolean {
+  try {
+    const sa = fs.statSync(a, { bigint: true });
+    const sb = fs.statSync(b, { bigint: true });
+    // A file system that reports no file IDs (ino 0) cannot prove identity.
+    return sa.isDirectory() && sa.ino !== 0n && sa.dev === sb.dev && sa.ino === sb.ino;
+  } catch {
+    return false;
+  }
+}
+
 function isInsideRoot(realRoot: string, realTarget: string): boolean {
-  const normRoot = process.platform === 'win32' ? realRoot.toLowerCase() : realRoot;
-  const normTarget = process.platform === 'win32' ? realTarget.toLowerCase() : realTarget;
-  const rootWithSep = normRoot.endsWith(path.sep) ? normRoot : normRoot + path.sep;
-  return normTarget === normRoot || normTarget.startsWith(rootWithSep);
+  const rootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+  if (realTarget === realRoot || realTarget.startsWith(rootWithSep)) return true;
+  if (process.platform !== 'win32') return false;
+  // Windows paths are usually case-insensitive, but NTFS can make a single directory case-sensitive, where `Proj` and
+  // `proj` are different siblings. A match that differs only in case therefore counts only when the target's ancestor
+  // at the root's depth is the root directory itself.
+  const ancestor = realTarget.slice(0, realRoot.length);
+  const atBoundary = realTarget.length === realRoot.length || realRoot.endsWith(path.sep) || realTarget[realRoot.length] === path.sep;
+  return atBoundary && ancestor.toLowerCase() === realRoot.toLowerCase() && sameDirectory(realRoot, ancestor);
 }
 
 export interface ResolvedProjectPath {
@@ -559,6 +565,10 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
     }
   }
 
+  // Video, audio and PDF are never text-diffed or editable even when their bytes look like text (a small PDF has no NUL),
+  // so the Changes tab previews them; images keep the byte sniff so an SVG still gets a text diff.
+  const previewKind = rawPreviewOf(relPosix)?.kind;
+  const opaqueMedia = previewKind !== undefined && previewKind !== 'image';
   let diskBuf: Buffer | null = null;
   let size = 0;
   let mtimeMs: number | null = null;
@@ -569,7 +579,7 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
     } else if (fst.isFile()) {
       size = fst.size;
       mtimeMs = fst.mtimeMs;
-      if (!isSubmoduleOrDir && size <= MAX_TEXT_BYTES) {
+      if (!isSubmoduleOrDir && !opaqueMedia && size <= MAX_TEXT_BYTES) {
         diskBuf = await fs.promises.readFile(absPath);
       }
     }
@@ -583,6 +593,10 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
 
   if (size > MAX_TEXT_BYTES) {
     return { path: relPosix, status, base: '', head: '', binary: false, tooLarge: true, size, mtimeMs };
+  }
+
+  if (opaqueMedia) {
+    return { path: relPosix, status, base: '', head: '', binary: true, tooLarge: false, size, mtimeMs };
   }
 
   let baseBuf: Buffer = Buffer.alloc(0);
@@ -624,19 +638,11 @@ export function readFileEntry(projectDir: string, rawRelPath: string, statOnly =
   if (!fst.isFile()) {
     throw new WorkspaceError(400, '目标不是普通文件');
   }
-  const ext = path.extname(absPath).toLowerCase();
-  const imgMime = IMAGE_MIME[ext];
-  // SVG is both XML text and image: in FilePayload we return text if editable, OR let's return image?
-  // Returning 'image' for raster images (.png/.jpg/.gif/.webp/.bmp/.ico) and for .svg returning 'image' with content?
-  // Even better: for .svg, users may want image preview AND source editing, or image preview! Wait: if .svg is 'image' with content populated when <= MAX_TEXT_BYTES, or keep raster + svg as 'image' and allow raw preview! Let's check spec: ".png, .jpg, .jpeg, .gif, .webp, .bmp, .svg 直接渲染缩放预览与文件大小信息". Let's also include content for .svg if !statOnly and <= MAX_TEXT_BYTES so even editing svg is possible if needed, while kind='image' renders preview!
-  if (imgMime) {
-    return {
-      path: relPosix,
-      kind: fst.size > MAX_IMAGE_BYTES ? 'too_large' : 'image',
-      size: fst.size,
-      mtimeMs: fst.mtimeMs,
-      mime: imgMime,
-    };
+  const preview = rawPreviewOf(absPath);
+  if (preview) {
+    // Video, audio and PDF stream through Range requests, so only images (decoded whole by <img>) have a size cap.
+    const tooLarge = preview.kind === 'image' && fst.size > MAX_IMAGE_BYTES;
+    return { path: relPosix, kind: tooLarge ? 'too_large' : preview.kind, size: fst.size, mtimeMs: fst.mtimeMs, mime: preview.mime };
   }
   if (fst.size > MAX_TEXT_BYTES) {
     return { path: relPosix, kind: 'too_large', size: fst.size, mtimeMs: fst.mtimeMs };
@@ -657,20 +663,63 @@ export function readFileEntry(projectDir: string, rawRelPath: string, statOnly =
   };
 }
 
-export function resolveRawImage(projectDir: string, rawRelPath: string): { absPath: string; mime: string; size: number } {
-  const { absPath } = resolveProjectPath(projectDir, rawRelPath, { preserveSpaces: true });
-  const ext = path.extname(absPath).toLowerCase();
-  const mime = IMAGE_MIME[ext];
-  if (!mime) throw new WorkspaceError(415, '只支持预览图片文件');
-  let fst: fs.Stats;
+export interface RawPreviewFile {
+  fd: number; // owned by the caller (sendRawPreview closes it)
+  absPath: string;
+  mime: string;
+  kind: RawPreviewKind;
+  size: number;
+}
+
+// O_NONBLOCK: a FIFO named like media (clip.mp4) would otherwise block this synchronous open, and with it the whole
+// server, until a writer appears; fstat then rejects it as not a regular file. Reads of regular files ignore the flag.
+// Windows has no FIFOs in the file namespace and no O_NONBLOCK constant.
+const RAW_OPEN_FLAGS = process.platform === 'win32' ? fs.constants.O_RDONLY : fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
+
+// Opens a whitelisted preview file inside the project. The descriptor is opened first and then matched (device + inode)
+// against the realpath-verified target, so a link swapped after the check cannot redirect the read; the size and every
+// streamed byte come from that one descriptor. Throws WorkspaceError (descriptor already closed) on refusal.
+// Residual race, accepted: realpath and the stat of its result are separate lookups, so a process that keeps swapping a
+// directory inside the project between them could pair an outside file's descriptor with an inside-looking path. Node
+// has no openat walk or handle-to-path call (GetFinalPathNameByHandle / F_GETPATH) to close it. Such a process already
+// runs as the user and can call this unauthenticated loopback API's file and terminal routes directly, so this check
+// guards against stale links and traversal from clients, not against that process.
+export function openRawPreview(projectDir: string, rawRelPath: string): RawPreviewFile {
+  const { realRoot, absPath } = resolveProjectPath(projectDir, rawRelPath, { preserveSpaces: true });
+  const preview = rawPreviewOf(absPath);
+  if (!preview) throw new WorkspaceError(415, '只支持预览图片、音视频和 PDF 文件');
+  // NTFS alternate data streams (notes.txt:clip.mp4) would otherwise pass the suffix whitelist.
+  if (process.platform === 'win32' && path.relative(realRoot, absPath).includes(':')) throw new WorkspaceError(400, '文件路径无效');
+  let fd: number;
   try {
-    fst = fs.statSync(absPath);
-  } catch {
-    throw new WorkspaceError(404, '图片文件不存在');
+    fd = fs.openSync(absPath, RAW_OPEN_FLAGS);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EISDIR') throw new WorkspaceError(400, '目标不是文件');
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new WorkspaceError(404, '文件不存在');
+    throw new WorkspaceError(403, '无法读取文件（可能被占用或没有权限）');
   }
-  if (!fst.isFile()) throw new WorkspaceError(400, '目标不是文件');
-  if (fst.size > MAX_IMAGE_BYTES) throw new WorkspaceError(413, '图片体积过大');
-  return { absPath, mime, size: fst.size };
+  try {
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile()) throw new WorkspaceError(400, '目标不是文件');
+    let real: string;
+    let realSt: fs.BigIntStats;
+    try {
+      real = fs.realpathSync.native(absPath);
+      realSt = fs.statSync(real, { bigint: true });
+    } catch {
+      throw new WorkspaceError(404, '文件不存在');
+    }
+    if (!isInsideRoot(realRoot, real)) throw new WorkspaceError(403, '拒绝访问指向项目目录之外的符号链接');
+    if (hasGitSegment(path.relative(realRoot, real))) throw new WorkspaceError(403, '不允许通过符号链接访问 .git 内部文件');
+    if (realSt.dev !== st.dev || realSt.ino !== st.ino) throw new WorkspaceError(409, '文件在读取时被替换，请重试');
+    const size = Number(st.size);
+    if (preview.kind === 'image' && size > MAX_IMAGE_BYTES) throw new WorkspaceError(413, '图片体积过大');
+    return { fd, absPath, mime: preview.mime, kind: preview.kind, size };
+  } catch (e) {
+    fs.closeSync(fd);
+    throw e;
+  }
 }
 
 export function writeFileEntry(projectDir: string, body: Partial<WriteFileBody>): WriteFileResult {
@@ -1652,9 +1701,8 @@ export async function pasteFsEntries(
   const baseName = validateExistingBasename(path.basename(src.absPath));
   if (mode === 'cut') {
     const srcParentReal = fs.realpathSync.native(path.dirname(src.absPath));
-    const sameParent = process.platform === 'win32'
-      ? srcParentReal.toLowerCase() === realTargetDir.toLowerCase()
-      : srcParentReal === realTargetDir;
+    // Both sides are canonical realpaths; a lowercase compare would merge `Box` and `box` in a case-sensitive directory.
+    const sameParent = srcParentReal === realTargetDir || sameDirectory(srcParentReal, realTargetDir);
     if (sameParent) {
       return { paths: [src.relPosix], targetDir: targetDir.relPosix, skipped: true };
     }

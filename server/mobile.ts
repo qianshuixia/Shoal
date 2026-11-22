@@ -40,6 +40,7 @@ import { buildTaskConversation } from './conversation.ts';
 import { createMobileNotifier, isAllowedWebhookUrl } from './notify.ts';
 import { createPowerBlocker } from './power.ts';
 import { readPrompt } from './prompt.ts';
+import { sendRawPreview } from './raw-stream.ts';
 import type { SessionManager } from './sessions.ts';
 import type { Store } from './store.ts';
 import { createCfAccessVerifier, createTunnelManager, extractTunnelToken, normalizeTeamDomain } from './tunnel.ts';
@@ -159,7 +160,8 @@ export interface MobileHandlers {
   saveAttachment(ext: string, data: Buffer): { path: string; name: string };
   listChanges(projectId: string): Promise<ProjectChanges>;
   readDiff(projectId: string, relPath: string): Promise<DiffPayload>;
-  resolveRawImage(projectId: string, relPath: string): { absPath: string; mime: string; size: number };
+  // Returns an open descriptor that sendRawPreview takes ownership of.
+  openRawPreview(projectId: string, relPath: string): { fd: number; absPath: string; mime: string; size: number };
   forwardHttpError(err: unknown): { status: number; message: string; code?: string } | null;
 }
 
@@ -1295,17 +1297,7 @@ export function createMobileController(handlers: MobileHandlers) {
       if (sub === 'changes') return sendJson(res, 200, await handlers.listChanges(projectId));
       if (sub === 'diff') return sendJson(res, 200, await handlers.readDiff(projectId, q.get('path') ?? ''));
       if (sub === 'raw') {
-        const img = handlers.resolveRawImage(projectId, q.get('path') ?? '');
-        res.writeHead(200, {
-          'content-type': img.mime,
-          'content-length': String(img.size),
-          'cache-control': 'no-cache',
-          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
-          'x-content-type-options': 'nosniff',
-        });
-        pipeline(fs.createReadStream(img.absPath), res, e => {
-          if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.warn('[mobile-raw]', img.absPath, e.message);
-        });
+        sendRawPreview(req, res, handlers.openRawPreview(projectId, q.get('path') ?? ''), '[mobile-raw]');
         return;
       }
     }

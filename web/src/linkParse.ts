@@ -7,7 +7,7 @@ export interface ParsedLocalLink {
 }
 
 const EXTERNAL_ONLY_EXT = new Set([
-  'exe', 'com', 'msi', 'msp', 'lnk', 'url', 'scr', 'cpl', 'dll', 'sys', 'appref-ms', 'pif', 'msc', 'hta', 'pdf',
+  'exe', 'com', 'msi', 'msp', 'lnk', 'url', 'scr', 'cpl', 'dll', 'sys', 'appref-ms', 'pif', 'msc', 'hta',
 ]);
 // POSIX only: a .app is a directory there, and these run or install when opened.
 const POSIX_EXTERNAL_ONLY_EXT = new Set(['app', 'command', 'dmg', 'pkg']);

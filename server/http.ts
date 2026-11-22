@@ -10,7 +10,7 @@ import type {
   AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
   GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
-import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel, rawPreviewOf } from '../shared/protocol.ts';
 import { createActivityTracker } from './activity.ts';
 import { clipboardFiles, writeClipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
@@ -25,6 +25,7 @@ import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless
 import type { HandoffInput } from './handoff.ts';
 import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, readCodexQuota } from './quota.ts';
 import { findEditor, OpenError, openAction, resolveOpenTarget, runOpen } from './open.ts';
+import { sendRawPreview } from './raw-stream.ts';
 import { readTranscript } from './transcript.ts';
 import type { EnqueueOptions, SessionManager } from './sessions.ts';
 import { pickColor } from './store.ts';
@@ -33,7 +34,7 @@ import type { Usage } from './usage.ts';
 import { titleFromPrompt, titleFromReply, titlePrompt, promptPreview } from './titles.ts';
 import { gitInfo } from './git.ts';
 import {
-  WorkspaceError, createFsEntry, deleteFsEntry, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
+  WorkspaceError, createFsEntry, deleteFsEntry, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, openRawPreview, resolveProjectPath, writeFileEntry,
 } from './workspace.ts';
 import { createMobileController } from './mobile.ts';
 import { AgyOptimizeError, applyAgyOptimization, getAgyOptimizeStatus } from './agyOptimize.ts';
@@ -1120,17 +1121,7 @@ export function createApp(cfg: AppConfig) {
       if (method === 'GET' && sub === 'files') return send(res, 200, await listAllFiles(project.path));
       if (method === 'GET' && sub === 'file') return send(res, 200, readFileEntry(project.path, q.get('path') ?? '', q.get('stat') === '1'));
       if (method === 'GET' && sub === 'raw') {
-        const img = resolveRawImage(project.path, q.get('path') ?? '');
-        res.writeHead(200, {
-          'content-type': img.mime,
-          'content-length': String(img.size),
-          'cache-control': 'no-cache',
-          'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
-          'x-content-type-options': 'nosniff',
-        });
-        pipeline(fs.createReadStream(img.absPath), res, e => {
-          if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.warn('[raw]', img.absPath, e.message);
-        });
+        sendRawPreview(req, res, openRawPreview(project.path, q.get('path') ?? ''), '[raw]');
         return;
       }
       if (method === 'PUT' && sub === 'file') {
@@ -1321,10 +1312,12 @@ export function createApp(cfg: AppConfig) {
       if (!project) throw new HttpError(404, '项目不存在');
       return readDiff(project.path, relPath);
     },
-    resolveRawImage(projectId, relPath) {
+    openRawPreview(projectId, relPath) {
       const project = store.getProject(projectId);
       if (!project) throw new HttpError(404, '项目不存在');
-      return resolveRawImage(project.path, relPath);
+      // The phone UI only previews images; keep paired devices from pulling video/audio/PDF bytes they never display.
+      if (rawPreviewOf(relPath)?.kind !== 'image') throw new HttpError(415, '手机端只支持预览图片');
+      return openRawPreview(project.path, relPath);
     },
     forwardHttpError(err) {
       if (err instanceof HttpError) return { status: err.status, message: err.message, code: err.code };

@@ -4,6 +4,8 @@ import type {
 } from '../../shared/protocol.ts';
 import { CodeEditor, type JumpTarget } from './Editor.tsx';
 import { MarkdownPreview } from './MarkdownPreview.tsx';
+import { RawPreview, formatBytes } from './RawPreview.tsx';
+import { rawPreviewOf } from '../../shared/protocol.ts';
 import {
   ContextMenu, NamePromptDialog, contextMenuPointForElement, copyText, isContextMenuKey, isMacClient, joinProjectPath,
   type ContextMenuEntry, type ContextMenuState, type FsClipboardItem, type FsMutationEvent, type NamePromptConfig,
@@ -43,12 +45,6 @@ interface ProjectViewMem {
   treeFile: string | null;
   expanded: Set<string>;
 }
-
-const formatBytes = (n: number): string => {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
-};
 
 const isMarkdownPath = (p: string): boolean => /\.(md|mdx|markdown)$/i.test(p);
 
@@ -214,6 +210,14 @@ export function Inspector({
     return fileData?.kind === 'text';
   }, [activePath, tab, diffData, fileData]);
   const isDirty = isEditingText && draft !== savedText;
+
+  // Build preview URLs from the loaded payload's own path and mtime, so src, kind and the shown file can never disagree
+  // while a new selection is still loading.
+  const rawSrcOf = (relPath: string, mtimeMs: number | null | undefined) =>
+    `/api/projects/${encodeURIComponent(projectId ?? '')}/raw?path=${encodeURIComponent(relPath)}&t=${mtimeMs ?? 0}`;
+  const diffPreview = diffData ? rawPreviewOf(diffData.path) : null;
+  const diffRawSrc = diffData ? rawSrcOf(diffData.path, diffData.mtimeMs) : '';
+  const fileRawSrc = fileData ? rawSrcOf(fileData.path, fileData.mtimeMs) : '';
 
   const liveRef = useRef({ projectId, tab, activePath, isDirty, loadedMtime, changeMode, mdMode });
   liveRef.current = { projectId, tab, activePath, isDirty, loadedMtime, changeMode, mdMode };
@@ -1463,7 +1467,7 @@ export function Inspector({
             type="button"
             className="ghost insp-ext-btn"
             data-testid="insp-open-external"
-            title="在外部编辑器（VS Code）或资源管理器中打开"
+            title="在外部编辑器（VS Code）、系统默认程序（图片、音视频、PDF）或资源管理器中打开"
             disabled={!project}
             onClick={() => void openExternal()}
           >
@@ -1813,26 +1817,25 @@ export function Inspector({
                         <div>该项是子目录或嵌套 Git 仓库，不支持文本对比。</div>
                         <button type="button" onClick={() => void openExternal()}>在外部打开</button>
                       </div>
+                    ) : diffPreview && diffData.status !== 'D' && (diffData.binary || diffData.tooLarge) ? (
+                      <RawPreview
+                        key={diffRawSrc}
+                        kind={diffPreview.kind}
+                        src={diffRawSrc}
+                        path={diffData.path}
+                        size={diffData.size}
+                        onOpenExternal={() => void openExternal()}
+                      />
                     ) : diffData.tooLarge ? (
                       <div className="insp-placeholder" data-testid="guard-too-large">
                         <div>文件体积较大（{formatBytes(diffData.size)}），为保证流畅不在面板内渲染对比。</div>
                         <button type="button" onClick={() => void openExternal()}>在外部编辑器打开</button>
                       </div>
                     ) : diffData.binary ? (
-                      /\.(png|jpg|jpeg|gif|webp|bmp|ico|svg)$/i.test(activePath) && diffData.status !== 'D' ? (
-                        <div className="insp-image-wrap" data-testid="image-preview">
-                          <img
-                            src={`/api/projects/${encodeURIComponent(projectId)}/raw?path=${encodeURIComponent(activePath)}&t=${diffData.mtimeMs ?? 0}`}
-                            alt={activePath}
-                          />
-                          <div className="insp-image-meta">{formatBytes(diffData.size)}</div>
-                        </div>
-                      ) : (
-                        <div className="insp-placeholder" data-testid="guard-binary">
-                          <div>二进制文件（{formatBytes(diffData.size)}），不支持文本对比。</div>
-                          <button type="button" onClick={() => void openExternal()}>在外部打开</button>
-                        </div>
-                      )
+                      <div className="insp-placeholder" data-testid="guard-binary">
+                        <div>二进制文件（{formatBytes(diffData.size)}），不支持文本对比。</div>
+                        <button type="button" onClick={() => void openExternal()}>在外部打开</button>
+                      </div>
                     ) : changeMode === 'diff' || diffData.status === 'D' ? (
                       <CodeEditor
                         docKey={`diff:${projectId}:${activePath}:${diffData.mtimeMs ?? 0}`}
@@ -1859,14 +1862,15 @@ export function Inspector({
                     <div className="insp-placeholder">选择左侧文件查看或编辑</div>
                   ) : fileData.kind === 'missing' ? (
                     <div className="insp-placeholder" data-testid="guard-missing">文件不存在或已被移除</div>
-                  ) : fileData.kind === 'image' ? (
-                    <div className="insp-image-wrap" data-testid="image-preview">
-                      <img
-                        src={`/api/projects/${encodeURIComponent(projectId)}/raw?path=${encodeURIComponent(activePath)}&t=${fileData.mtimeMs ?? 0}`}
-                        alt={activePath}
-                      />
-                      <div className="insp-image-meta">{formatBytes(fileData.size)}</div>
-                    </div>
+                  ) : fileData.kind === 'image' || fileData.kind === 'video' || fileData.kind === 'audio' || fileData.kind === 'pdf' ? (
+                    <RawPreview
+                      key={fileRawSrc}
+                      kind={fileData.kind}
+                      src={fileRawSrc}
+                      path={fileData.path}
+                      size={fileData.size}
+                      onOpenExternal={() => void openExternal()}
+                    />
                   ) : fileData.kind === 'too_large' ? (
                     <div className="insp-placeholder" data-testid="guard-too-large">
                       <div>文件超过 2 MB（{formatBytes(fileData.size)}），为避免卡顿已拦截内置加载。</div>

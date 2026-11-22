@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, createFsEntry, deleteFsEntry, discardFile, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
+  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, createFsEntry, deleteFsEntry, discardFile, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, openRawPreview, resolveProjectPath, writeFileEntry,
 } from './workspace.ts';
 import { gitInfo } from './git.ts';
 import { matchProjectFileLink, parseLocalFileLink } from '../web/src/linkParse.ts';
@@ -27,6 +27,23 @@ function initRepo(prefix: string): string {
   git(d, ['config', 'user.email', 'test@example.com']);
   git(d, ['config', 'user.name', 'Tester']);
   return d;
+}
+
+// openRawPreview hands back an open descriptor; tests only need the metadata, so close it straight away.
+function openRaw(root: string, rel: string) {
+  const { fd, ...meta } = openRawPreview(root, rel);
+  fs.closeSync(fd);
+  return meta;
+}
+
+function rawStatus(root: string, rel: string): number | undefined {
+  try {
+    openRaw(root, rel);
+    return undefined;
+  } catch (e) {
+    expect(e).toBeInstanceOf(WorkspaceError);
+    return (e as WorkspaceError).status;
+  }
 }
 
 afterAll(() => {
@@ -62,8 +79,62 @@ describe('resolveProjectPath security boundaries', () => {
     // Directory junction pointing outside project root (works on Windows without admin rights)
     const linkDir = path.join(root, 'linked-out');
     fs.symlinkSync(outside, linkDir, 'junction');
+    fs.writeFileSync(path.join(outside, 'leak.mp4'), 'x');
     expect(() => resolveProjectPath(root, 'linked-out/secret.txt')).toThrow(WorkspaceError);
+    expect(rawStatus(root, 'linked-out/leak.mp4')).toBe(403);
     expect(() => resolveProjectPath(root, 'linked-out/new-file.txt')).toThrow(WorkspaceError);
+  });
+
+  it.skipIf(process.platform !== 'win32')('treats a case-only sibling in a case-sensitive directory as outside the project', async (ctx) => {
+    const parent = makeTempDir('case');
+    try {
+      execFileSync('fsutil.exe', ['file', 'setCaseSensitiveInfo', parent, 'enable'], { stdio: 'ignore' });
+    } catch {
+      ctx.skip(); // needs a recent Windows build and an NTFS volume
+    }
+    const root = path.join(parent, 'Proj');
+    const sibling = path.join(parent, 'proj');
+    fs.mkdirSync(root);
+    fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(sibling, 'secret.mp4'), 'outside');
+    fs.writeFileSync(path.join(sibling, 'secret.txt'), 'outside');
+    fs.writeFileSync(path.join(root, 'own.mp4'), 'inside');
+    fs.symlinkSync(sibling, path.join(root, 'link'), 'junction');
+
+    expect(openRaw(root, 'own.mp4').size).toBe(6);
+    expect(rawStatus(root, 'link/secret.mp4')).toBe(403);
+    expect(() => readFileEntry(root, 'link/secret.txt')).toThrow(WorkspaceError);
+    expect(() => writeFileEntry(root, { path: 'link/planted.txt', content: 'x' })).toThrow(WorkspaceError);
+    expect(() => createFsEntry(root, { parentDir: 'link', name: 'made.txt', kind: 'file' })).toThrow(WorkspaceError);
+    expect(fs.readdirSync(sibling).sort()).toEqual(['secret.mp4', 'secret.txt']);
+    expect((await listTree(root)).entries.map((e) => e.name)).toEqual(['own.mp4']);
+
+    // New directories inherit case sensitivity, so `Box` and `box` are different folders and a cut between them must move.
+    fs.mkdirSync(path.join(root, 'Box'));
+    fs.mkdirSync(path.join(root, 'box'));
+    fs.writeFileSync(path.join(root, 'Box', 'm.txt'), 'm');
+    const moved = await pasteFsEntries(root, { mode: 'cut', targetDir: 'box', sourcePath: 'Box/m.txt' });
+    expect(moved.skipped).toBeUndefined();
+    expect(moved.paths).toEqual(['box/m.txt']);
+    expect(fs.readdirSync(path.join(root, 'Box'))).toEqual([]);
+    expect(fs.readFileSync(path.join(root, 'box', 'm.txt'), 'utf8')).toBe('m');
+    // Cutting into the same folder is still a no-op.
+    expect((await pasteFsEntries(root, { mode: 'cut', targetDir: 'box', sourcePath: 'box/m.txt' })).skipped).toBe(true);
+  });
+
+  it.skipIf(process.platform !== 'win32')('still accepts an in-project link whose stored target differs only in case', async () => {
+    const root = makeTempDir('ci');
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.mkdirSync(path.join(root, 'dst'));
+    fs.writeFileSync(path.join(root, 'src', 'a.ts'), 'export {};\n');
+    const realRoot = fs.realpathSync.native(root);
+    const caseVariant = path.join(path.dirname(realRoot), path.basename(realRoot).toUpperCase(), 'SRC');
+    fs.symlinkSync(caseVariant, path.join(root, 'inner'), 'junction');
+    expect(fs.readlinkSync(path.join(root, 'inner'))).toContain(path.basename(realRoot).toUpperCase());
+
+    expect(readFileEntry(root, 'inner/a.ts').kind).toBe('text');
+    await pasteFsEntries(root, { mode: 'copy', targetDir: 'dst', sourcePath: 'inner' });
+    expect(fs.readFileSync(path.join(root, 'dst', 'inner', 'a.ts'), 'utf8')).toBe('export {};\n');
   });
 });
 
@@ -185,6 +256,11 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     fs.writeFileSync(path.join(repo, 'logo.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     fs.writeFileSync(path.join(repo, 'bin.dat'), Buffer.from([0x00, 0x01, 0x02, 0x03]));
     fs.writeFileSync(path.join(repo, 'huge.log'), Buffer.alloc(MAX_TEXT_BYTES + 16, 0x61));
+    fs.writeFileSync(path.join(repo, 'clip.mp4'), Buffer.alloc(MAX_TEXT_BYTES + 16, 0x01));
+    fs.writeFileSync(path.join(repo, 'Tune.MP3'), Buffer.from([0xff, 0xfb, 0x90, 0x00]));
+    fs.writeFileSync(path.join(repo, 'doc.pdf'), '%PDF-1.4\n');
+    fs.writeFileSync(path.join(repo, 'mod.mts'), 'export {};\n');
+    fs.writeFileSync(path.join(repo, 'x.constructor'), 'plain\n');
 
     const tree = await listTree(repo, '');
     const names = tree.entries.map((e) => e.name);
@@ -204,10 +280,40 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     expect(all.files.some((f) => f.startsWith('node_modules/'))).toBe(false);
 
     expect(readFileEntry(repo, 'logo.png').kind).toBe('image');
-    expect(resolveRawImage(repo, 'logo.png').mime).toBe('image/png');
-    expect(() => resolveRawImage(repo, 'src/main.ts')).toThrow(WorkspaceError);
+    expect(openRaw(repo, 'logo.png').mime).toBe('image/png');
+    expect(rawStatus(repo, 'src/main.ts')).toBe(415);
+    // Video, audio and PDF preview at any size (streamed with Range); TypeScript .ts/.mts and prototype keys stay non-media.
+    expect(readFileEntry(repo, 'clip.mp4')).toMatchObject({ kind: 'video', mime: 'video/mp4', size: MAX_TEXT_BYTES + 16 });
+    expect(readFileEntry(repo, 'Tune.MP3')).toMatchObject({ kind: 'audio', mime: 'audio/mpeg' });
+    expect(readFileEntry(repo, 'doc.pdf')).toMatchObject({ kind: 'pdf', mime: 'application/pdf' });
+    expect(openRaw(repo, 'clip.mp4')).toMatchObject({ kind: 'video', size: MAX_TEXT_BYTES + 16 });
+    // A small PDF has no NUL byte; the Changes tab must still treat it as a preview, never as editable text.
+    expect(await readDiff(repo, 'doc.pdf')).toMatchObject({ binary: true, tooLarge: false, base: '', head: '' });
+    fs.mkdirSync(path.join(repo, 'folder.mp4'));
+    expect(rawStatus(repo, 'folder.mp4')).toBe(400);
+    expect(rawStatus(repo, 'missing.mp4')).toBe(404);
+    // NTFS alternate data stream: the suffix looks like video but the bytes come from a text file's hidden stream.
+    if (process.platform === 'win32') expect(rawStatus(repo, 'src/main.ts:clip.mp4')).toBe(400);
+    expect(readFileEntry(repo, 'src/main.ts').kind).toBe('text');
+    expect(readFileEntry(repo, 'mod.mts').kind).toBe('text');
+    expect(readFileEntry(repo, 'x.constructor').kind).toBe('text');
+    expect(rawStatus(repo, 'x.constructor')).toBe(415);
+    expect(rawStatus(repo, '../outside.mp4')).toBeDefined();
     expect(readFileEntry(repo, 'bin.dat').kind).toBe('binary');
     expect(readFileEntry(repo, 'huge.log').kind).toBe('too_large');
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects a FIFO named like media without blocking on open', () => {
+    const dir = makeTempDir('fifo');
+    execFileSync('mkfifo', [path.join(dir, 'pipe.mp4')]);
+    // A blocking open would freeze the event loop for good, so run it in a child process the test can time out.
+    const script = [
+      `import { openRawPreview } from ${JSON.stringify(new URL('./workspace.ts', import.meta.url).href)};`,
+      `try { openRawPreview(${JSON.stringify(dir)}, 'pipe.mp4'); console.log('opened'); }`,
+      'catch (e) { console.log(String(e.status)); }',
+    ].join('\n');
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 10_000, encoding: 'utf8' });
+    expect(out.trim()).toBe('400');
   });
 
   it('parses terminal file links and matches deepest in-project files while leaving external/exe links untouched', () => {
@@ -240,6 +346,8 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     expect(hit?.relPosix).toBe('src/auth.ts');
     expect(hit?.line).toBe(42);
     expect(hit?.col).toBe(5);
+    // PDFs preview in the Inspector now, so they match like any other project file
+    expect(matchProjectFileLink('G:\\Workspace\\app\\docs\\spec.pdf', projects)?.relPosix).toBe('docs/spec.pdf');
 
     // Executables, .git internals, and outside paths return null so /api/open handles them
     expect(matchProjectFileLink('G:\\Workspace\\app\\tool.exe', projects)).toBeNull();
