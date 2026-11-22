@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { usePrivacy } from './privacy.ts';
 import type { AgentKind, UsageCounts, UsageReport, UsageRow } from '../../shared/protocol.ts';
-import { AGENT_LABEL, usageTotal } from '../../shared/protocol.ts';
+import { agentLabel, usageTotal } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
 import { fmtPct, fmtTokens, hitRate } from './util.ts';
 
@@ -326,7 +326,7 @@ function UsageTable({ rows, group, sum }: { rows: UsageRow[]; group: Group; sum:
                   <span className="row-name">
                     {r.agents?.map((a) => <AgentIcon key={a} agent={a as AgentKind} />)}
                     {group === 'byAgent' && <AgentIcon agent={r.key as AgentKind} />}
-                    <span className="row-label" data-private={secret ? '' : undefined} title={secret && privacy ? undefined : r.label}>{group === 'byAgent' ? AGENT_LABEL[r.key as AgentKind] ?? r.label : r.label}</span>
+                    <span className="row-label" data-private={secret ? '' : undefined} title={secret && privacy ? undefined : r.label}>{group === 'byAgent' ? agentLabel(r.key) : r.label}</span>
                     {r.deleted && r.key && <span className="row-tag">已删除</span>}
                   </span>
                   {(r.project || r.vendor) && <span className="row-sub" data-private={secret ? '' : undefined}>{r.project || r.vendor}</span>}

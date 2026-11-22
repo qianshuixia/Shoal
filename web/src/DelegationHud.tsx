@@ -27,12 +27,23 @@ const levelOf = (s: DelegationState): Level =>
   s === 'working' || s === 'rework' ? 'working' : s === 'accepted' || s === 'canceled' ? 'closed' : s;
 const LEVELS: Level[] = ['needs_you', 'failed', 'review', 'working', 'closed'];
 
+// What a fixed-width HUD container actually draws: its pill row plus, when open, the absolutely positioned popover below.
+// A narrower or lower result means pixels were vacated over the terminal.
+export function hudVisibleBox(el: HTMLElement, rowSel: string, popSel: string): { w: number; h: number; top: number } {
+  const row = el.querySelector<HTMLElement>(rowSel);
+  const pop = el.querySelector<HTMLElement>(popSel);
+  return {
+    w: Math.max(row?.offsetWidth ?? 0, pop?.offsetWidth ?? 0),
+    h: pop ? pop.offsetTop + pop.offsetHeight : el.offsetHeight,
+    top: el.offsetTop,
+  };
+}
+
 // Floating HUD for a main task's delegated children, overlaid inside .pane-stage: position:absolute so .pane-body never
 // resizes (a height change makes xterm + ConPTY resize the PTY and redraw the screen).
-export function DelegationHud({ delegates, now, hasActivity, onOpen, onRestoreFocus, onVacate }: {
+export function DelegationHud({ delegates, now, onOpen, onRestoreFocus, onVacate }: {
   delegates: DelegateView[];
   now: number;
-  hasActivity?: boolean;
   onOpen(sessionId: string): void;
   onRestoreFocus?(): void;
   onVacate?(): void;
@@ -45,22 +56,21 @@ export function DelegationHud({ delegates, now, hasActivity, onOpen, onRestoreFo
   onVacateRef.current = onVacate;
   const privacy = usePrivacy();
 
+  // Every render, before paint: the pill text can change on any render.
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const w = el.offsetWidth;
-    const h = el.offsetHeight;
-    const top = el.offsetTop;
+    const box = hudVisibleBox(el, '.delegation-pill', '.delegation-popover');
     const prev = prevBoxRef.current;
-    prevBoxRef.current = { w, h, top };
-    if (prev.w > 0 && (w < prev.w || h < prev.h || top !== prev.top)) {
+    prevBoxRef.current = box;
+    if (prev.w > 0 && (box.w < prev.w || box.h < prev.h || box.top !== prev.top)) {
       cancelAnimationFrame(vacateRafRef.current);
       vacateRafRef.current = requestAnimationFrame(() => {
         vacateRafRef.current = 0;
         onVacateRef.current?.();
       });
     }
-  }, [delegates, open, hasActivity]);
+  });
 
   useEffect(() => () => {
     cancelAnimationFrame(vacateRafRef.current);

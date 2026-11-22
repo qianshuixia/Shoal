@@ -3,8 +3,9 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
-import type { AgentKind } from '../shared/protocol.ts';
+import type { AgentKind, CliToolInfo, PermissionMode } from '../shared/protocol.ts';
 import { isValidAgyModel } from '../shared/protocol.ts';
+import { buildSafeProcessLaunch, isCmdBatchPath } from './cliRegistry.ts';
 import { findExecutable } from './platform.ts';
 
 // Hook commands go through shells that quote badly (agy uses `cmd /c`), so a path with spaces falls back to its
@@ -112,7 +113,7 @@ const AGY_EVENTS = ['SessionStart', 'PreInvocation', 'PostInvocation', 'Stop'];
 
 const hookCmd = (agent: string, ev: string) => `${nodeCmd} "${NOTIFY}" ${agent} ${ev}`;
 // agy runs hook and statusLine commands through `cmd /c`, which breaks quoted paths.
-const agyUsable = () => !NOTIFY.includes(' ') && !STATUSLINE.includes(' ') && !NODE.includes(' ');
+export const agyUsable = () => !NOTIFY.includes(' ') && !STATUSLINE.includes(' ') && !NODE.includes(' ');
 
 // Claude saves a conversation as <config>/projects/<cwd slug>/<uuid>.jsonl once a prompt is sent; read-only check.
 export function claudeConversationExists(id: string): boolean {
@@ -412,10 +413,11 @@ export function preparePrompt(prompt: string, sessionId: string, stateDir: strin
 export interface Launch {
   file: string;
   args: string[];
+  verbatimArgs?: string; // used on Windows for non-npm .cmd/.bat scripts via cmd.exe /d /s /c
   nativeSessionId: string | null; // known at spawn for claude and when resuming
 }
 
-// Every real CLI runs with full permissions (the author's choice): no approval prompts, no codex sandbox.
+// Default full-permission flags for deep-adapted CLIs (omitted when permissionMode === 'normal').
 // Flags checked against local --help: claude 2.1.310, codex 0.167.0 (top level and `resume`), agy 1.5.3.
 export const FULL_ACCESS = {
   claude: '--dangerously-skip-permissions',
@@ -433,6 +435,8 @@ export function codexHasUserDeveloperInstructions(): boolean {
   }
 }
 
+export type LaunchCliMeta = Pick<CliToolInfo, 'path' | 'command' | 'normalArgs' | 'fullAccessArgs' | 'promptArg'>;
+
 // resume: native session id of a saved conversation to reopen (resume commands verified in M0); the prompt is ignored then.
 export function buildLaunch(opts: {
   agent: AgentKind;
@@ -443,16 +447,24 @@ export function buildLaunch(opts: {
   model?: string;
   collabDir?: string;
   instructions?: string; // standing instructions for the session (the fake agent ignores them)
+  permissionMode?: PermissionMode; // default 'full'; 'normal' omits skip-permission flags
+  cliMeta?: LaunchCliMeta; // resolved executable & args for generic/custom CLIs (or fallback path for built-ins)
 }): Launch {
-  const { agent, sessionId, stateDir, resume, model, collabDir, instructions } = opts;
+  const { agent, sessionId, stateDir, resume, model, collabDir, instructions, cliMeta } = opts;
+  const fullAccess = opts.permissionMode !== 'normal';
   const prompt = resume ? '' : preparePrompt(opts.prompt, sessionId, stateDir);
   switch (agent) {
     case 'claude': {
       const native = resume ?? crypto.randomUUID();
-      const args = [resume ? '--resume' : '--session-id', native, '--settings', path.join(stateDir, 'claude-hooks.json').replaceAll('\\', '/'), FULL_ACCESS.claude];
+      const args = [resume ? '--resume' : '--session-id', native, '--settings', path.join(stateDir, 'claude-hooks.json').replaceAll('\\', '/')];
+      if (fullAccess) args.push(FULL_ACCESS.claude);
       if (instructions) args.push('--append-system-prompt', instructions);
       if (prompt) args.push(prompt);
-      return { file: resolveClaude() ?? 'claude', args, nativeSessionId: native };
+      const resolved = cliMeta?.path ?? resolveClaude() ?? 'claude';
+      const safe = buildSafeProcessLaunch(resolved, args);
+      return typeof safe.args === 'string'
+        ? { file: safe.file, args: [], verbatimArgs: safe.args, nativeSessionId: native }
+        : { file: safe.file, args: safe.args, nativeSessionId: native };
     }
     case 'codex': {
       const { file, prefix } = codexLaunch();
@@ -462,7 +474,8 @@ export function buildLaunch(opts: {
       for (const ev of CODEX_EVENTS) args.push('-c', `hooks.${ev}=[{hooks=[{type="command",command='${hookCmd('codex', ev)}',timeout=5}]}]`);
       // Not injected when the user's own Codex config defines developer_instructions: a -c override would replace it.
       if (instructions && !codexHasUserDeveloperInstructions()) args.push('-c', `developer_instructions=${JSON.stringify(instructions)}`);
-      args.push('-c', 'check_for_update_on_startup=false', FULL_ACCESS.codex);
+      args.push('-c', 'check_for_update_on_startup=false');
+      if (fullAccess) args.push(FULL_ACCESS.codex);
       if (prompt) args.push(prompt);
       return { file, args, nativeSessionId: resume ?? null };
     }
@@ -481,16 +494,33 @@ export function buildLaunch(opts: {
         fs.writeFileSync(path.join(dir, 'AGENTS.md'), `${instructions}\n`);
         args.push('--add-dir', dir);
       }
-      args.push(FULL_ACCESS.agy);
+      if (fullAccess) args.push(FULL_ACCESS.agy);
       if (model && isValidAgyModel(model)) args.push('--model', model);
       if (prompt) args.push('-i', prompt);
-      return { file: resolveAgy() ?? 'agy', args, nativeSessionId: resume ?? null };
+      const resolved = cliMeta?.path ?? resolveAgy() ?? 'agy';
+      const safe = buildSafeProcessLaunch(resolved, args);
+      return typeof safe.args === 'string'
+        ? { file: safe.file, args: [], verbatimArgs: safe.args, nativeSessionId: resume ?? null }
+        : { file: safe.file, args: safe.args, nativeSessionId: resume ?? null };
     }
     case 'fake': {
       const args = [FAKE_AGENT];
       if (resume) args.push('--resume', resume);
       if (prompt) args.push(prompt);
       return { file: process.execPath, args, nativeSessionId: resume ?? null };
+    }
+    default: {
+      const target = cliMeta?.path ?? cliMeta?.command ?? agent;
+      const modeArgs = fullAccess ? (cliMeta?.fullAccessArgs ?? []) : (cliMeta?.normalArgs ?? []);
+      const args = [...modeArgs];
+      const batch = isCmdBatchPath(target);
+      if (prompt && !batch && (cliMeta?.promptArg ?? 'positional') === 'positional') {
+        args.push(prompt);
+      }
+      const safe = buildSafeProcessLaunch(target, args);
+      return typeof safe.args === 'string'
+        ? { file: safe.file, args: [], verbatimArgs: safe.args, nativeSessionId: null }
+        : { file: safe.file, args: safe.args, nativeSessionId: null };
     }
   }
 }
@@ -522,5 +552,7 @@ export function buildGenerator(agent: AgentKind, prompt: string, outFile: string
       return null;
     case 'fake':
       return { file: process.execPath, args: [path.join(ROOT, 'test', 'fixtures', 'fake-handoff.mjs')], stdin: prompt, outFile: null };
+    default:
+      return null;
   }
 }

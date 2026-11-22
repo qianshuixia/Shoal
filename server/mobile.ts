@@ -10,6 +10,7 @@ import type {
   AgentKind,
   Card,
   ClientMsg,
+  CliToolInfo,
   ConversationItem,
   DiffPayload,
   ForwardResult,
@@ -28,6 +29,7 @@ import type {
   ServerMsg,
   SessionActivity,
   SessionInfo,
+  Settings,
   Snapshot,
   SwitchResult,
   Task,
@@ -378,6 +380,30 @@ export function sanitizeActivityForMobile(a: SessionActivity): SessionActivity {
   };
 }
 
+export function sanitizeSettingsForMobile(settings: Settings): Settings {
+  if (!settings.customClis?.length) return settings;
+  return {
+    ...settings,
+    customClis: settings.customClis.map(c => ({
+      id: c.id,
+      label: c.label,
+      command: '',
+      ...(c.promptArg ? { promptArg: c.promptArg } : {}),
+    })),
+  };
+}
+
+export function sanitizeCliToolForMobile(t: CliToolInfo, stateDir?: string, extraDirs?: Iterable<string>): CliToolInfo {
+  return {
+    ...t,
+    path: null,
+    command: '',
+    normalArgs: [],
+    fullAccessArgs: [],
+    ...(t.unusableReason ? { unusableReason: scrubErrorForMobile(t.unusableReason, stateDir, extraDirs) } : {}),
+  };
+}
+
 export function sanitizeSnapshotForMobile(s: Snapshot, stateDir?: string, extraDirs?: Iterable<string>): Snapshot {
   const activity: Record<string, SessionActivity> | undefined = s.activity
     ? Object.fromEntries(Object.entries(s.activity).map(([k, v]) => [k, sanitizeActivityForMobile(v)]))
@@ -388,6 +414,8 @@ export function sanitizeSnapshotForMobile(s: Snapshot, stateDir?: string, extraD
     tasks: s.tasks.map(t => sanitizeTaskForMobile(t, stateDir, extraDirs)),
     cards: s.cards.map(c => sanitizeCardForMobile(c, stateDir, extraDirs)),
     sessions: s.sessions.map(sanitizeSessionForMobile),
+    settings: sanitizeSettingsForMobile(s.settings),
+    ...(s.cliTools ? { cliTools: s.cliTools.map(t => sanitizeCliToolForMobile(t, stateDir, extraDirs)) } : {}),
     ...(activity !== undefined ? { activity } : {}),
   };
 }
@@ -404,6 +432,10 @@ export function sanitizeServerMsgForMobile(m: ServerMsg, stateDir?: string, extr
       return { t: 'card', card: sanitizeCardForMobile(m.card, stateDir, extraDirs) };
     case 'session':
       return { t: 'session', session: sanitizeSessionForMobile(m.session) };
+    case 'settings':
+      return { t: 'settings', settings: sanitizeSettingsForMobile(m.settings) };
+    case 'clis':
+      return { t: 'clis', agents: m.agents, cliTools: m.cliTools.map(t => sanitizeCliToolForMobile(t, stateDir, extraDirs)) };
     case 'activity':
       return { t: 'activity', sessionId: m.sessionId, activity: m.activity ? sanitizeActivityForMobile(m.activity) : null };
     default:
@@ -1043,6 +1075,8 @@ export function createMobileController(handlers: MobileHandlers) {
       pathname === '/api/clipboard/files' ||
       pathname === '/api/usage' ||
       pathname === '/api/settings' ||
+      pathname === '/api/clis' ||
+      pathname.startsWith('/api/clis/') ||
       pathname === '/api/agy/optimize' ||
       pathname.startsWith('/api/agy/') ||
       pathname === '/api/projects' ||

@@ -1,4 +1,4 @@
-import { AGENT_LABEL } from '../../shared/protocol.ts';
+import { agentLabel } from '../../shared/protocol.ts';
 import type { AgentKind, QuotaInfo, QuotaWindow } from '../../shared/protocol.ts';
 
 // Agents in header order.
@@ -30,7 +30,7 @@ function remaining(ms: number): string {
 
 // Multi-line tooltip of one agent's quota.
 export function quotaTitle(agent: AgentKind, q: QuotaInfo, windows: QuotaWindow[], now: number): string {
-  const head = agent === 'agy' ? 'Antigravity (Gemini) 订阅额度' : `${AGENT_LABEL[agent]} 订阅额度`;
+  const head = agent === 'agy' ? 'Antigravity (Gemini) 订阅额度' : `${agentLabel(agent)} 订阅额度`;
   return [
     head,
     ...windows.map(w => `${windowName(w.label)}：已用 ${Math.round(w.usedPercent)}%，${resetClock(w.resetsAt, now)} 重置（${remaining(w.resetsAt - now)}）`),

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { MobileRouteVia, Snapshot } from '../../../shared/protocol.ts';
-import { AGENT_LABEL } from '../../../shared/protocol.ts';
+import { agentLabel } from '../../../shared/protocol.ts';
 import { AgentIcon } from '../agentIcons.tsx';
 import { liveWindows, QUOTA_AGENTS, QUOTA_WARN, quotaTitle } from '../quota.ts';
 import { needsList, reviewList, sortProjectTasks, STATUS_LABEL, waitText } from '../util.ts';
@@ -134,7 +134,7 @@ export function MobileHome({
                 title={quotaTitle(agent, q, wins, now)}
               >
                 <AgentIcon agent={agent} className="agent-icon" />
-                <span>{AGENT_LABEL[agent]}</span>
+                <span>{agentLabel(agent, state.cliTools)}</span>
                 <strong>{Math.round(peak)}%</strong>
               </div>
             ))}

@@ -7,7 +7,7 @@ import type {
   Task,
   TaskConversationResponse,
 } from '../../../shared/protocol.ts';
-import { AGENT_LABEL, canResume } from '../../../shared/protocol.ts';
+import { agentLabel, canResume } from '../../../shared/protocol.ts';
 import { AgentIcon } from '../agentIcons.tsx';
 import { MarkdownPreview } from '../MarkdownPreview.tsx';
 import { STATUS_LABEL } from '../util.ts';
@@ -394,7 +394,7 @@ export function MobileTaskView({
         <div className="mob-title-wrap">
           <span className="mob-title" data-private="">{task.title}</span>
           <span className="mob-sub">
-            <span data-private="">{project?.name ?? '项目'}</span> · {AGENT_LABEL[session?.agent ?? task.agent]} · {statusText}
+            <span data-private="">{project?.name ?? '项目'}</span> · {agentLabel(session?.agent ?? task.agent, state.cliTools)} · {statusText}
             {task.phase === 'review' ? ' · 待验收' : task.phase === 'approved' ? ' · 已通过' : task.phase === 'archived' ? ' · 已归档' : ''}
           </span>
         </div>

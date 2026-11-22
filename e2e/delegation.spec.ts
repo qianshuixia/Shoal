@@ -191,7 +191,7 @@ test.describe('cross-CLI delegation e2e', () => {
     expect(delegationCards(await state(request), main.task.id, 'blocked')).toHaveLength(1);
 
     // The launch-time delegation hint can be turned off in settings.
-    await page.getByTestId('settings-btn').click();
+    await page.getByTestId('tab-settings').click();
     const toggle = page.getByTestId('setting-auto-delegate');
     await expect(toggle).toBeChecked();
     await toggle.uncheck();
@@ -205,7 +205,7 @@ test.describe('cross-CLI delegation e2e', () => {
     expect(defaultRules).toContain('三方评审怎么做');
     await expect(page.getByTestId('setting-delegation-rules-save')).toBeDisabled();
     await expect(page.getByTestId('setting-delegation-rules-reset')).toBeDisabled();
-    await page.getByTestId('settings-dialog').screenshot({ path: path.join(ARTIFACT_DIR, 'settings-rules.png') });
+    await page.getByTestId('settings-view').screenshot({ path: path.join(ARTIFACT_DIR, 'settings-rules.png') });
     await rulesBox.fill('x'.repeat(4001));
     await expect(page.getByTestId('setting-delegation-rules-count')).toHaveClass(/over/);
     await expect(page.getByTestId('setting-delegation-rules-save')).toBeDisabled();

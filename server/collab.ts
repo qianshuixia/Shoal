@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {
   AgentKind, Card, DelegationSummary, PeerDelegateBody, PeerDelegateResult, PeerDelegationActionBody, PeerDelegationActionResult,
-  PeerDelegationList, PeerListResult, PeerSendBody, PeerSendResult, PeerTaskSummary, Project, SessionInfo, Task, TaskDelegation,
+  PeerDelegationList, PeerListResult, PeerSendBody, PeerSendResult, PeerTaskSummary, PermissionMode, Project, SessionInfo, Task, TaskDelegation,
 } from '../shared/protocol.ts';
 import {
-  AGENT_LABEL, DELEGATION_LABEL, delegationBlockedText, delegationHandle, delegationPrompt, delegationReworkText,
-  delegationResultText, delegationState, forwardText,
+  agentLabel, DELEGATION_LABEL, delegationBlockedText, delegationHandle, delegationPrompt, delegationReworkText,
+  delegationResultText, delegationState, forwardText, isDeepAgent,
 } from '../shared/protocol.ts';
 import { capBody } from './cards.ts';
 import { delegationTitle } from './titles.ts';
@@ -46,8 +46,9 @@ export interface CollabDeps {
   store: Store;
   sessions: SessionManager;
   availableAgents: () => AgentKind[];
+  delegatableAgents?: () => AgentKind[];
   // retitleFrom: the title was made up from this text, so an AI title (when enabled) may replace it.
-  createPeerTask: (opts: { projectId: string; agent: AgentKind; title: string; prompt: string; delegation?: TaskDelegation; retitleFrom?: string }) => { task: Task; session: SessionInfo };
+  createPeerTask: (opts: { projectId: string; agent: AgentKind; title: string; prompt: string; delegation?: TaskDelegation; retitleFrom?: string; permissionMode?: PermissionMode }) => { task: Task; session: SessionInfo };
   // Ends the child's process and archives it with the outcome written into its delegation.
   closeDelegation: (task: Task, outcome: 'accepted' | 'canceled') => Task;
   deliverToTask: (opts: {
@@ -143,7 +144,7 @@ export function createCollabManager(deps: CollabDeps) {
       const promptLine = t.lastPrompt ? firstLinePreview(t.lastPrompt, 120) : '';
       const infoParts = [
         `### #${n} ${t.title} (\`${t.id}\`)`,
-        `- Agent: ${AGENT_LABEL[t.agent]} (\`${t.agent}\`) · Phase: \`${t.phase}\` · Session: \`${status}\``,
+        `- Agent: ${agentLabel(t.agent)} (\`${t.agent}\`) · Phase: \`${t.phase}\` · Session: \`${status}\``,
       ];
       if (t.delegation) {
         const parentTitle = store.getTask(t.delegation.parentTaskId)?.title ?? '（已删除）';
@@ -187,7 +188,7 @@ export function createCollabManager(deps: CollabDeps) {
       '',
       `- Task ID: \`${task.id}\``,
       `- Project ID: \`${task.projectId}\``,
-      `- Agent: ${AGENT_LABEL[agent]} (\`${agent}\`)`,
+      `- Agent: ${agentLabel(agent)} (\`${agent}\`)`,
       `- Updated: ${new Date(at).toISOString()}`,
       '',
       '---',
@@ -588,17 +589,22 @@ export function createCollabManager(deps: CollabDeps) {
     const fullText = forwardText({ title: caller.title, agent: caller.agent }, combinedBody, headerNote, { replyBack });
 
     if (resolved.kind === 'spawn') {
-      const avail = deps.availableAgents();
+      if (!isDeepAgent(resolved.agent)) {
+        throw new CollabError(400, `「${resolved.agent}」目前为通用终端模式，暂不支持跨 CLI 自动协作与结果回传（仅深度适配 CLI 支持）`);
+      }
+      const avail = deps.delegatableAgents ? deps.delegatableAgents() : deps.availableAgents().filter(isDeepAgent);
       if (!avail.includes(resolved.agent)) {
         throw new CollabError(400, `智能体不可用：${resolved.agent}`);
       }
       sentMap.set(targetKey, priorSends + 1);
       const title = [...`协作：${caller.title}`].slice(0, 80).join('');
+      const parentMode = sessionOf(caller)?.permissionMode ?? caller.permissionMode;
       const { task: createdTask, session: createdSession } = deps.createPeerTask({
         projectId: project.id,
         agent: resolved.agent,
         title,
         prompt: fullText,
+        ...(parentMode ? { permissionMode: parentMode } : {}),
       });
       seedSessionHop(createdSession.id, hop);
       if (replyBack) {
@@ -623,6 +629,9 @@ export function createCollabManager(deps: CollabDeps) {
     }
 
     const target = resolved.task;
+    if (replyBack && !isDeepAgent(target.agent)) {
+      throw new CollabError(400, `目标任务「${target.title}」使用通用终端 CLI，暂不支持自动回传结果`);
+    }
     if (!deps.availableAgents().includes(target.agent)) {
       throw new CollabError(400, `目标智能体不可用：${target.agent}`);
     }
@@ -714,8 +723,12 @@ export function createCollabManager(deps: CollabDeps) {
     const { task: caller, project } = verifyCaller(callerSessionId);
     if (caller.delegation) throw new CollabError(403, '委派任务不能再向下委派');
     const agent = (typeof body.agent === 'string' ? body.agent.trim().toLowerCase() : '') as AgentKind;
-    if (!VALID_AGENTS.has(agent) || !deps.availableAgents().includes(agent)) {
-      throw new CollabError(400, `智能体不可用：${String(body.agent)}（可用：${deps.availableAgents().join(' / ')}）`);
+    const delegatable = deps.delegatableAgents ? deps.delegatableAgents() : deps.availableAgents().filter(isDeepAgent);
+    if (agent && !isDeepAgent(agent) && deps.availableAgents().includes(agent)) {
+      throw new CollabError(400, `「${agent}」目前为通用终端模式，暂不支持跨 CLI 自动委派与结果回传（仅深度适配 CLI 支持）`);
+    }
+    if (!VALID_AGENTS.has(agent) || !delegatable.includes(agent)) {
+      throw new CollabError(400, `智能体不可用：${String(body.agent)}（可用：${delegatable.join(' / ') || '无'}）`);
     }
     const hop = checkDelegationHop(callerSessionId);
     const open = store.tasks().filter(t => t.delegation?.parentTaskId === caller.id && t.phase !== 'archived').length;
@@ -726,12 +739,14 @@ export function createCollabManager(deps: CollabDeps) {
     const review = body.review === true;
     const rawTitle = typeof body.title === 'string' ? body.title.trim() : '';
     const title = [...(rawTitle || delegationTitle(brief) || firstLinePreview(brief, 40))].slice(0, 80).join('');
+    const parentMode = sessionOf(caller)?.permissionMode ?? caller.permissionMode;
     const { task, session } = deps.createPeerTask({
       projectId: project.id,
       agent,
       title,
       prompt: delegationPrompt({ title: caller.title, agent: caller.agent }, brief, { review }),
       delegation: { parentTaskId: caller.id, brief: firstLinePreview(brief, 140), round: 1, createdAt: Date.now(), ...(review ? { mode: 'review' as const } : {}) },
+      ...(parentMode ? { permissionMode: parentMode } : {}),
     });
     seedSessionHop(session.id, hop);
     syncProjectPeers(project.id);

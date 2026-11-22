@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, ArchiveStoppedResult, Card, CliToolInfo, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
-import { AGENT_LABEL, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
+import { agentLabel, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
 import { connect, send } from './ws.ts';
 import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
 import type { TermGlDebug } from './terms.ts';
@@ -11,10 +11,11 @@ import { ACTIVITY_STALL_MS, Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
 import { matchProjectFileLink } from './linkParse.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
-import { FeedbackDialog, ForwardDialog, ProjectDialog, SettingsDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
+import { FeedbackDialog, ForwardDialog, ProjectDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { liveWindows, QUOTA_AGENTS } from './quota.ts';
+import { SettingsView } from './SettingsView.tsx';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
 import type { DelegateView } from './DelegationHud.tsx';
@@ -22,9 +23,9 @@ import { needsList, nestDelegated, reviewList, sortProjectTasks, taskActivityAt,
 
 type PaneSessions = [string | null, string | null];
 type LayoutMode = 1 | 2 | 'inspect';
-type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'feedback' | 'search' | 'settings' | null;
+type Dialog = 'project' | 'task' | 'switch' | 'forward' | 'feedback' | 'search' | null;
 type SideFilter = 'active' | 'all';
-type View = 'work' | 'stats';
+type View = 'work' | 'stats' | 'settings';
 
 const paneCount = (l: LayoutMode): 1 | 2 => (l === 2 ? 2 : 1);
 
@@ -120,7 +121,7 @@ function defaultAgentFor(d: Snapshot, projectId: string): AgentKind {
       return taskActivityAt(b, sb) - taskActivityAt(a, sa) || b.createdAt - a.createdAt;
     })[0];
   if (last && agents.includes(last.agent)) return last.agent;
-  return agents.includes('claude') ? 'claude' : (agents[0] ?? 'claude');
+  return agents.includes('claude') ? 'claude' : (agents[0] ?? '');
 }
 
 export function App() {
@@ -326,6 +327,9 @@ export function App() {
       case 'settings':
         setData((d) => ({ ...d, settings: msg.settings }));
         break;
+      case 'clis':
+        setData((d) => ({ ...d, agents: msg.agents, cliTools: msg.cliTools }));
+        break;
       case 'git': {
         const prevGit = live.current.data.git[msg.projectId];
         const changed = prevGit === undefined || JSON.stringify(prevGit) !== JSON.stringify(msg.git);
@@ -518,7 +522,9 @@ export function App() {
       const sid = focusedSessionOf(s);
       const projectId = s.data.tasks.find((t) => t.id === s.data.sessions.find((x) => x.id === sid)?.taskId)?.projectId
         ?? s.data.projects[0]?.id;
-      if (projectId) void quickCreate(projectId, defaultAgentFor(s.data, projectId));
+      const agent = projectId ? defaultAgentFor(s.data, projectId) : '';
+      if (projectId && agent) void quickCreate(projectId, agent);
+      else if (projectId) setNotice('当前没有已启用的 CLI，请先在「设置 → CLI 工具与权限」中启用');
     };
     window.addEventListener('keydown', onKey, true);
     // Ctrl+wheel zooms the whole UI anywhere, terminals included (they never see it).
@@ -877,6 +883,9 @@ export function App() {
           <button role="tab" aria-selected={view === 'stats'} className={`view-tab ${view === 'stats' ? 'on' : ''}`} data-testid="tab-stats" onClick={() => setView('stats')}>
             Token 统计
           </button>
+          <button role="tab" aria-selected={view === 'settings'} className={`view-tab ${view === 'settings' ? 'on' : ''}`} data-testid="tab-settings" onClick={() => setView('settings')}>
+            设置
+          </button>
         </span>
         <button
           className={`needs ${needsYou.length ? 'on' : ''}`}
@@ -945,11 +954,6 @@ export function App() {
               </button>
             ))}
           </span>
-          <button className="icon-btn" data-testid="settings-btn" aria-label="设置" title="设置" onClick={() => setDialog('settings')}>
-            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-              <path d="M2 4.5h6.5M11.5 4.5H14M2 11.5h2.5M7.5 11.5H14" /><circle cx="10" cy="4.5" r="1.5" /><circle cx="6" cy="11.5" r="1.5" />
-            </svg>
-          </button>
         </div>
       </header>
       <aside className="sidebar" hidden={view !== 'work'}>
@@ -997,7 +1001,13 @@ export function App() {
             <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25" /><path d="M10.25 10.25L13.5 13.5" /></svg>
           </button>
           <button className="ghost" data-testid="new-project-btn" onClick={() => setDialog('project')}>新建项目</button>
-          <button className="ghost" data-testid="new-task-btn" title="新建任务（Alt+N：在当前项目用上次的 agent 直接新建）" disabled={!data.projects.length} onClick={() => setDialog('task')}>新建任务</button>
+          <button
+            className="ghost"
+            data-testid="new-task-btn"
+            title={data.agents.length ? '新建任务（Alt+N：在当前项目用上次的 agent 直接新建）' : '请先在「设置 → CLI 工具与权限」启用至少一个 CLI'}
+            disabled={!data.projects.length || !data.agents.length}
+            onClick={() => setDialog('task')}
+          >新建任务</button>
         </div>
         <div className="side-list">
           {!data.projects.length && (
@@ -1021,6 +1031,7 @@ export function App() {
               onArchiveStopped={() => void archiveStopped(project)}
               collapsed={collapsed.has(project.id)}
               agents={data.agents as AgentKind[]}
+              cliTools={data.cliTools}
               defaultAgent={defaultAgentFor(data, project.id)}
               git={data.git[project.id] ?? null}
               onInspectChanges={() => openInspectorAt(project.id, 'changes')}
@@ -1119,6 +1130,7 @@ export function App() {
               parentTask={parentTask}
               onOpenParent={parentTask?.sessionId ? () => showSession(parentTask.sessionId!) : undefined}
               onOpenPath={(p) => void post('/api/open', { target: p }).catch((e: Error) => setNotice(`无法打开对话记录：${e.message}`))}
+              cliTools={data.cliTools}
             />
           );
         })}
@@ -1165,6 +1177,12 @@ export function App() {
         )}
       </main>
       <StatsView visible={view === 'stats'} />
+      <SettingsView
+        visible={view === 'settings'}
+        settings={data.settings}
+        cliTools={data.cliTools}
+        onClisUpdated={(agents, cliTools) => setData((d) => ({ ...d, agents, cliTools }))}
+      />
       {dialog === 'project' && (
         <ProjectDialog
           onClose={() => setDialog(null)}
@@ -1178,6 +1196,7 @@ export function App() {
         <TaskDialog
           projects={sortedProjects}
           agents={data.agents as AgentKind[]}
+          cliTools={data.cliTools}
           defaultProjectId={focusedProjectId ?? data.projects[0]?.id ?? ''}
           defaultAgent={(pid) => defaultAgentFor(data, pid)}
           defaultAgyModel={data.settings.agyModel ?? ''}
@@ -1201,19 +1220,11 @@ export function App() {
           }}
         />
       )}
-      {dialog === 'settings' && (
-        <SettingsDialog
-          settings={data.settings}
-          onClose={() => {
-            setDialog(null);
-            setFocusTick((n) => n + 1);
-          }}
-        />
-      )}
       {dialog === 'switch' && tasksById.get(dialogTarget) && (
         <SwitchDialog
           task={tasksById.get(dialogTarget)!}
           agents={data.agents as AgentKind[]}
+          cliTools={data.cliTools}
           onClose={() => setDialog(null)}
           onSwitch={(agent, note) => switchAgent(tasksById.get(dialogTarget)!, agent, note)}
         />
@@ -1226,6 +1237,7 @@ export function App() {
           projects={data.projects}
           tasks={data.tasks}
           agents={data.agents as AgentKind[]}
+          cliTools={data.cliTools}
           onClose={() => setDialog(null)}
           onForward={(to, note, replyBack) => forward(forwardCard, to, note, replyBack)}
         />
@@ -1277,7 +1289,7 @@ function BranchChip({ git, onInspect }: { git: GitInfo; onInspect?: () => void }
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onOpenChild, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, cliTools, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onOpenChild, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -1291,6 +1303,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   onArchiveStopped(): void;
   collapsed: boolean;
   agents: AgentKind[];
+  cliTools?: CliToolInfo[];
   defaultAgent: AgentKind;
   git: GitInfo | null;
   onInspectChanges(): void;
@@ -1441,6 +1454,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
           {menu && (
             <QuickMenu
               agents={agents}
+              cliTools={cliTools}
               defaultAgent={defaultAgent}
               onPick={(a) => {
                 setMenu(false);
@@ -1534,8 +1548,9 @@ function ArchiveSection({ projects, tasks, sessionsById, visibleIds, focusedId, 
   );
 }
 
-function QuickMenu({ agents, defaultAgent, onPick, onClose }: {
+function QuickMenu({ agents, cliTools, defaultAgent, onPick, onClose }: {
   agents: AgentKind[];
+  cliTools?: CliToolInfo[];
   defaultAgent: AgentKind;
   onPick(agent: AgentKind): void;
   onClose(): void;
@@ -1568,13 +1583,17 @@ function QuickMenu({ agents, defaultAgent, onPick, onClose }: {
       }}
     >
       <div className="menu-label">用哪个 agent</div>
-      {ordered.map((a) => (
-        <button key={a} role="menuitem" data-testid="quick-agent" data-agent={a} onClick={() => onPick(a)}>
-          <AgentIcon agent={a} />
-          <span>{a}</span>
-          {a === defaultAgent && <span className="menu-hint">上次用的<span><kbd>Alt</kbd><kbd>N</kbd></span></span>}
-        </button>
-      ))}
+      {ordered.length === 0 ? (
+        <div className="group-empty" style={{ padding: '0.375rem 0.5rem' }}>未启用任何 CLI，请在「设置」开启</div>
+      ) : (
+        ordered.map((a) => (
+          <button key={a} role="menuitem" data-testid="quick-agent" data-agent={a} onClick={() => onPick(a)}>
+            <AgentIcon agent={a} />
+            <span>{agentLabel(a, cliTools)}</span>
+            {a === defaultAgent && <span className="menu-hint">上次用的<span><kbd>Alt</kbd><kbd>N</kbd></span></span>}
+          </button>
+        ))
+      )}
     </div>
   );
 }
@@ -1710,7 +1729,7 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
           </button>
         </span>
       )}
-      <span className="agent-mark" title={AGENT_LABEL[task.agent] ?? task.agent}><AgentIcon agent={task.agent} /></span>
+      <span className="agent-mark" title={agentLabel(task.agent)}><AgentIcon agent={task.agent} /></span>
       {showLiveAct && (
         <span className={`task-preview is-activity ${actStalled ? 'is-stalled' : ''}`} data-testid="task-activity" data-private="">
           {actLine}

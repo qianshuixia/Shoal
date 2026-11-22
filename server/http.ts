@@ -7,15 +7,19 @@ import { pipeline } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, Project,
+  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
   GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
-import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isValidAgyModel } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isValidAgyModel } from '../shared/protocol.ts';
 import { createActivityTracker } from './activity.ts';
 import { clipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
-import { agyResumeId, agyTranscriptFile, availableAgents, claudeResumeId, ROOT } from './agents.ts';
+import { agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
+import {
+  buildCliTools, delegatableAgentsFrom, effectivePermissionMode, enabledAgentsFrom, getCachedCliScan, getCliTool,
+  scanCliTools, validateCliPrefsPatch, validateCustomClis,
+} from './cliRegistry.ts';
 import { CollabError, createCollabManager } from './collab.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
@@ -161,11 +165,18 @@ export function createApp(cfg: AppConfig) {
     if (info) broadcast({ t: 'quota', agent: session.agent, quota: info });
   }
 
+  const currentCliTools = () => buildCliTools(store.settings());
+  const currentAgents = () => enabledAgentsFrom(store.settings());
+  const currentDelegatableAgents = () => delegatableAgentsFrom(store.settings());
+
   const snapshot = (): Snapshot => {
     const telemetry = cfg.usage.telemetry();
     lastTelemetryJson = JSON.stringify(telemetry);
+    const settings = store.settings();
+    const cliTools = buildCliTools(settings);
     return {
-      projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(), agents: availableAgents(), settings: store.settings(),
+      projects: store.projects(), tasks: store.tasks(), sessions: sessions.list(), cards: store.cards(),
+      agents: enabledAgentsFrom(settings, cliTools), cliTools, settings,
       git: Object.fromEntries(gitMap), quota: quota.all(), telemetry, activity: activity.all(),
     };
   };
@@ -200,9 +211,10 @@ export function createApp(cfg: AppConfig) {
     stateDir: cfg.stateDir,
     store,
     sessions,
-    availableAgents,
-    createPeerTask: ({ projectId, agent, title, prompt, delegation, retitleFrom }) => {
-      const created = createTask({ projectId, agent, title, prompt }, { delegation });
+    availableAgents: currentAgents,
+    delegatableAgents: currentDelegatableAgents,
+    createPeerTask: ({ projectId, agent, title, prompt, delegation, retitleFrom, permissionMode }) => {
+      const created = createTask({ projectId, agent, title, prompt }, { delegation, permissionMode });
       if (retitleFrom) aiRetitle(created.task.id, created.task.title, retitleFrom);
       return created;
     },
@@ -291,24 +303,41 @@ export function createApp(cfg: AppConfig) {
     return out;
   }
 
-  // Standing delegation instructions for a new session; a delegated task never gets them (it cannot delegate).
+  // Standing delegation instructions for a new session; a delegated task or generic CLI never gets them.
   function delegationInstructions(task: Pick<Task, 'delegation' | 'agent'>): string | undefined {
     const settings = store.settings();
-    if (settings.autoDelegate === false || task.delegation) return undefined;
-    return composeDelegationInstructions({ host: task.agent, available: availableAgents(), rules: settings.delegationRules ?? DEFAULT_DELEGATION_RULES });
+    if (settings.autoDelegate === false || task.delegation || !isDeepAgent(task.agent)) return undefined;
+    return composeDelegationInstructions({ host: task.agent, available: currentDelegatableAgents(), rules: settings.delegationRules ?? DEFAULT_DELEGATION_RULES });
   }
 
-  // `extra.delegation` comes only from collab.delegate, never from the HTTP body.
-  function createTask(b: Record<string, unknown>, extra?: { delegation?: TaskDelegation }) {
+  // Resolves the effective permission mode for a task spawn:
+  // - Explicit mode from caller (e.g. parent -> child delegation / peer spawn) wins.
+  // - Delegated child tasks inherit their parent's live session (or parent task's) permission mode.
+  // - Normal root tasks read the target CLI's current global permission setting (default 'full').
+  function resolveTaskPermissionMode(task: Pick<Task, 'agent' | 'delegation' | 'permissionMode'>, explicit?: PermissionMode): PermissionMode {
+    if (explicit) return explicit;
+    if (task.delegation) {
+      const parent = store.getTask(task.delegation.parentTaskId);
+      const parentSession = parent?.sessionId ? sessions.list().find(s => s.id === parent.sessionId) : undefined;
+      if (parentSession?.permissionMode) return parentSession.permissionMode;
+      if (parent?.permissionMode) return parent.permissionMode;
+      if (task.permissionMode) return task.permissionMode;
+    }
+    return effectivePermissionMode(task.agent, store.settings().cliPrefs);
+  }
+
+  // `extra.delegation` and `extra.permissionMode` come only from internal collab callers, never from the HTTP body.
+  function createTask(b: Record<string, unknown>, extra?: { delegation?: TaskDelegation; permissionMode?: PermissionMode }) {
     const body = b as Partial<CreateTaskBody>;
     const project = typeof body.projectId === 'string' ? store.getProject(body.projectId) : undefined;
     if (!project) throw new HttpError(400, '项目不存在');
     const agent = body.agent as AgentKind;
-    if (!availableAgents().includes(agent)) throw new HttpError(400, `智能体不可用：${String(body.agent)}`);
+    if (!currentAgents().includes(agent)) throw new HttpError(400, `智能体不可用：${String(body.agent)}`);
     if (body.model !== undefined && (typeof body.model !== 'string' || !isValidAgyModel(body.model))) {
       throw new HttpError(400, '模型档位无效');
     }
-    const rawModel = body.model !== undefined ? body.model : store.settings().agyModel;
+    const settings = store.settings();
+    const rawModel = body.model !== undefined ? body.model : settings.agyModel;
     const model = agent === 'agy' && rawModel ? rawModel : undefined;
     const rawPrompt = typeof body.prompt === 'string' ? body.prompt : '';
     const files = resolveAttachments(body.attachments);
@@ -328,9 +357,11 @@ export function createApp(cfg: AppConfig) {
       titleAuto = true;
     }
     const now = Date.now();
+    const permissionMode = resolveTaskPermissionMode({ agent, delegation: extra?.delegation }, extra?.permissionMode);
+    const cliMeta = getCliTool(agent, settings);
     const task: Task = {
       id: crypto.randomUUID(), projectId: project.id, title, titleAuto, prompt, color: pickColor(store.tasks()),
-      agent, ...(model && { model }), sessionId: null, createdAt: now,
+      agent, ...(model && { model }), permissionMode, sessionId: null, createdAt: now,
       phase: 'active', phaseSince: now, lastActiveAt: now, ...(lastPrompt && { lastPrompt }),
       ...(extra?.delegation && { delegation: extra.delegation }),
     };
@@ -338,6 +369,7 @@ export function createApp(cfg: AppConfig) {
     try {
       session = sessions.spawn({
         taskId: task.id, projectId: project.id, agent, cwd: project.path, prompt, model,
+        permissionMode, cliMeta,
         instructions: delegationInstructions(task),
         cols: typeof body.cols === 'number' ? body.cols : undefined,
         rows: typeof body.rows === 'number' ? body.rows : undefined,
@@ -439,12 +471,18 @@ export function createApp(cfg: AppConfig) {
     o: { prompt: string; resume?: string; cols?: number; rows?: number }, patch: Partial<Task> = {},
   ): { task: Task; session: SessionInfo } {
     const merged = { ...task, ...patch };
+    const settings = store.settings();
     const model = merged.agent === 'agy'
-      ? (patch.agent && patch.agent !== task.agent ? store.settings().agyModel : merged.model) || undefined
+      ? (patch.agent && patch.agent !== task.agent ? settings.agyModel : merged.model) || undefined
       : undefined;
+    const permissionMode = resolveTaskPermissionMode(merged);
+    const cliMeta = getCliTool(merged.agent, settings);
     let session;
     try {
-      session = sessions.spawn({ taskId: task.id, projectId: project.id, agent: merged.agent, cwd: project.path, model, instructions: delegationInstructions(merged), ...o });
+      session = sessions.spawn({
+        taskId: task.id, projectId: project.id, agent: merged.agent, cwd: project.path, model,
+        permissionMode, cliMeta, instructions: delegationInstructions(merged), ...o,
+      });
     } catch (e) {
       throw new HttpError(500, `启动失败：${(e as Error).message}`);
     }
@@ -454,7 +492,7 @@ export function createApp(cfg: AppConfig) {
       sessions.remove(prev.id);
       store.removeSession(prev.id);
     }
-    const next: Task = { ...merged, ...(model ? { model } : {}), sessionId: session.id, lastActiveAt: session.startedAt };
+    const next: Task = { ...merged, ...(model ? { model } : {}), permissionMode, sessionId: session.id, lastActiveAt: session.startedAt };
     if (merged.agent !== 'agy') delete next.model;
     store.updateTask(next);
     store.saveSession(session);
@@ -466,9 +504,10 @@ export function createApp(cfg: AppConfig) {
 
   // Native session id to reopen for an exited session, if its conversation still exists.
   function resumableNative(prev: SessionInfo | undefined): string | undefined {
-    const native = prev && canResume(prev) ? prev.nativeSessionId! : undefined;
-    if (native && prev!.agent === 'claude') return claudeResumeId(native, prev!.transcriptPath);
-    if (native && prev!.agent === 'agy') return agyResumeId(native, prev!.transcriptPath);
+    if (!prev || !isDeepAgent(prev.agent)) return undefined;
+    const native = canResume(prev) ? prev.nativeSessionId! : undefined;
+    if (native && prev.agent === 'claude') return claudeResumeId(native, prev.transcriptPath);
+    if (native && prev.agent === 'agy') return agyResumeId(native, prev.transcriptPath);
     return native;
   }
 
@@ -480,7 +519,7 @@ export function createApp(cfg: AppConfig) {
     if (!task) throw new HttpError(404, '任务不存在');
     const project = store.getProject(task.projectId);
     if (!project) throw new HttpError(400, '项目不存在');
-    if (!availableAgents().includes(task.agent)) throw new HttpError(400, `智能体不可用：${task.agent}`);
+    if (!currentAgents().includes(task.agent)) throw new HttpError(400, `智能体不可用：${task.agent}`);
     const prev = task.sessionId ? sessions.list().find(s => s.id === task.sessionId) : undefined;
     if (prev && prev.status !== 'exited') throw new HttpError(409, '会话还在运行');
     const native = body.fresh === true ? undefined : resumableNative(prev);
@@ -504,7 +543,7 @@ export function createApp(cfg: AppConfig) {
     const cols = typeof b.cols === 'number' ? b.cols : undefined;
     const rows = typeof b.rows === 'number' ? b.rows : undefined;
     const byId = new Map(sessions.list().map(s => [s.id, s]));
-    const avail = new Set(availableAgents());
+    const avail = new Set(currentAgents());
     const candidates = store.tasks()
       .filter(t => {
         if (t.phase === 'archived' || !t.sessionId) return false;
@@ -576,7 +615,7 @@ export function createApp(cfg: AppConfig) {
     if (!task) throw new HttpError(404, '任务不存在');
     const project = store.getProject(task.projectId);
     if (!project) throw new HttpError(400, '项目不存在');
-    if (!availableAgents().includes(task.agent)) throw new HttpError(400, `智能体不可用：${task.agent}`);
+    if (!currentAgents().includes(task.agent)) throw new HttpError(400, `智能体不可用：${task.agent}`);
     const prev = task.sessionId ? sessions.list().find(s => s.id === task.sessionId) : undefined;
     const size = { cols: typeof body.cols === 'number' ? body.cols : undefined, rows: typeof body.rows === 'number' ? body.rows : undefined };
     const active = { phase: 'active' as const, phaseSince: Date.now() };
@@ -600,7 +639,7 @@ export function createApp(cfg: AppConfig) {
   async function switchAgent(id: string, b: Record<string, unknown>): Promise<SwitchResult> {
     const body = b as Partial<SwitchAgentBody>;
     const agent = body.agent as AgentKind;
-    if (!availableAgents().includes(agent)) throw new HttpError(400, `智能体不可用：${String(body.agent)}`);
+    if (!currentAgents().includes(agent)) throw new HttpError(400, `智能体不可用：${String(body.agent)}`);
     const first = store.getTask(id);
     if (!first) throw new HttpError(404, '任务不存在');
     const project = store.getProject(first.projectId);
@@ -619,7 +658,7 @@ export function createApp(cfg: AppConfig) {
         turns: tp ? readTranscript(from, tp) : [],
         transcriptPath: tp, note, limit: before?.limit,
       };
-      const generated = await generateCard(agent, generatorPrompt(input), { cwd: project.path, stateDir: cfg.stateDir });
+      const generated = await generateCard(agent, generatorPrompt(input), { cwd: project.path, stateDir: cfg.stateDir, available: currentAgents() });
       const task = store.getTask(id);
       if (!task) throw new HttpError(404, '任务已删除');
       const prev = current(task);
@@ -662,7 +701,7 @@ export function createApp(cfg: AppConfig) {
       if (target.id === source.id) throw new HttpError(400, '不能转发给同一个任务');
       const project = store.getProject(target.projectId);
       if (!project) throw new HttpError(400, '项目不存在');
-      if (!availableAgents().includes(target.agent)) throw new HttpError(400, `智能体不可用：${target.agent}`);
+      if (!currentAgents().includes(target.agent)) throw new HttpError(400, `智能体不可用：${target.agent}`);
       const prev = target.sessionId ? sessions.list().find(s => s.id === target.sessionId) : undefined;
       const msg = '目标任务没有可续接的对话，请转发到新任务';
       let obligationId: string | undefined;
@@ -767,7 +806,7 @@ export function createApp(cfg: AppConfig) {
     if (!store.settings().aiTitles) return;
     const task = store.getTask(taskId);
     const project = task ? store.getProject(task.projectId) : undefined;
-    if (!task || !project || task.agent === 'agy') return;
+    if (!task || !project || !isDeepAgent(task.agent) || task.agent === 'agy') return;
     void runHeadless(task.agent, titlePrompt(text), { cwd: project.path, stateDir: cfg.stateDir, timeoutMs: 60_000, what: '生成标题' })
       .then(out => {
         const title = out ? titleFromReply(out) : '';
@@ -918,6 +957,12 @@ export function createApp(cfg: AppConfig) {
       return send(res, 200, cfg.usage.report(at('from'), at('to')));
     }
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
+    if (method === 'GET' && pathname === '/api/clis') return send(res, 200, getCachedCliScan(store.settings()));
+    if (method === 'POST' && pathname === '/api/clis/scan') {
+      const scanned = await scanCliTools(store.settings());
+      broadcast({ t: 'clis', agents: scanned.agents, cliTools: scanned.cliTools });
+      return send(res, 200, scanned);
+    }
     if (method === 'POST' && pathname === '/api/settings') {
       if (body.aiTitles !== undefined && typeof body.aiTitles !== 'boolean') throw new HttpError(400, '设置值无效');
       if (body.autoDelegate !== undefined && typeof body.autoDelegate !== 'boolean') throw new HttpError(400, '设置值无效');
@@ -927,6 +972,18 @@ export function createApp(cfg: AppConfig) {
       }
       if (body.agyModel !== undefined && (typeof body.agyModel !== 'string' || !isValidAgyModel(body.agyModel))) {
         throw new HttpError(400, '设置值无效');
+      }
+      let nextCliPrefsPatch: ReturnType<typeof validateCliPrefsPatch> | undefined;
+      let nextCustomClis: ReturnType<typeof validateCustomClis> | undefined;
+      try {
+        if (body.cliPrefs !== undefined && body.cliPrefs !== null) {
+          nextCliPrefsPatch = validateCliPrefsPatch(body.cliPrefs);
+        }
+        if (body.customClis !== undefined && body.customClis !== null) {
+          nextCustomClis = validateCustomClis(body.customClis);
+        }
+      } catch (e) {
+        throw new HttpError(400, (e as Error).message);
       }
       const settings: Settings = {
         ...store.settings(),
@@ -939,8 +996,33 @@ export function createApp(cfg: AppConfig) {
         if (body.agyModel) settings.agyModel = body.agyModel;
         else delete settings.agyModel;
       }
+      let clisChanged = false;
+      if (body.cliPrefs === null) {
+        delete settings.cliPrefs;
+        clisChanged = true;
+      } else if (nextCliPrefsPatch) {
+        const merged = { ...(settings.cliPrefs ?? {}) };
+        for (const [k, pref] of Object.entries(nextCliPrefsPatch)) {
+          merged[k] = { ...(merged[k] ?? {}), ...pref };
+        }
+        settings.cliPrefs = merged;
+        clisChanged = true;
+      }
+      if (body.customClis === null) {
+        delete settings.customClis;
+        clisChanged = true;
+      } else if (nextCustomClis !== undefined) {
+        if (nextCustomClis.length > 0) settings.customClis = nextCustomClis;
+        else delete settings.customClis;
+        // Clean up prefs for deleted custom CLIs? Keep or prune only non-builtin missing ids safely.
+        clisChanged = true;
+      }
       store.setSettings(settings);
       broadcast({ t: 'settings', settings });
+      if (clisChanged) {
+        const cliTools = currentCliTools();
+        broadcast({ t: 'clis', agents: enabledAgentsFrom(settings, cliTools), cliTools });
+      }
       return send(res, 200, settings);
     }
     if (method === 'GET' && pathname === '/api/agy/optimize') return send(res, 200, getAgyOptimizeStatus());
@@ -1075,6 +1157,7 @@ export function createApp(cfg: AppConfig) {
     const bearer = rawAuth.startsWith('Bearer ') ? rawAuth.slice(7).trim() : '';
     const caller = sessions.resolvePeerToken(bearer);
     if (!caller) throw new HttpError(401, '无效或已过期的协作会话令牌');
+    if (!isDeepAgent(caller.session.agent)) throw new HttpError(403, '仅深度适配 CLI 可调用协作接口');
     if (caller.subagentWait) throw new HttpError(403, 'Antigravity 子代理等待期间禁止发起对外协作请求');
 
     const method = req.method ?? 'GET';
@@ -1166,7 +1249,7 @@ export function createApp(cfg: AppConfig) {
     store,
     sessions,
     activity,
-    availableAgents,
+    availableAgents: currentAgents,
     snapshot,
     createTask,
     renameTask,

@@ -76,7 +76,7 @@ test.describe('mobile P0 batch 1: back stack, composer, drafts, scrolling', () =
     desktopCtx = await browser.newContext({ baseURL: DESKTOP_ORIGIN, viewport: { width: 1600, height: 900 } });
     const desktop = await desktopCtx.newPage();
     await desktop.goto('/');
-    await desktop.getByTestId('settings-btn').click();
+    await desktop.getByTestId('tab-settings').click();
     await expect(desktop.getByTestId('mobile-settings-section')).toBeVisible();
     await desktop.getByTestId('mobile-enable-toggle').check();
     await expect(desktop.getByTestId('mobile-settings-section')).toContainText(`监听中 :${MOBILE_PORT}`);

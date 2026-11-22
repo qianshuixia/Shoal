@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import pty from 'node-pty';
-import type { AgentKind, HookBody, ServerMsg, SessionInfo } from '../shared/protocol.ts';
+import type { AgentKind, HookBody, PermissionMode, ServerMsg, SessionInfo } from '../shared/protocol.ts';
+import { isDeepAgent } from '../shared/protocol.ts';
 import { agyConversationState, agyUserStatusLine, buildLaunch, userStatusLine } from './agents.ts';
+import type { LaunchCliMeta } from './agents.ts';
 import { detectLimit, readResetsAt } from './quota.ts';
 import { isStatusHook, isWorkingHook, reduceStatus } from './status.ts';
 import type { StatusEvent } from './status.ts';
@@ -156,6 +158,8 @@ export interface SpawnOptions {
   rows?: number;
   resume?: string; // native session id to reopen
   instructions?: string; // standing instructions appended to the CLI's system prompt (see buildLaunch)
+  permissionMode?: PermissionMode; // default 'full'; 'normal' omits skip-permission flags
+  cliMeta?: LaunchCliMeta; // resolved executable & flags for generic/custom CLIs
 }
 
 // Hook events that mean a prompt was submitted, i.e. the CLI now has a saved conversation.
@@ -481,37 +485,46 @@ export class SessionManager {
 
   spawn(o: SpawnOptions): SessionInfo {
     const id = crypto.randomUUID();
-    const peerToken = crypto.randomBytes(32).toString('hex');
-    const collabDir = o.projectId ? path.join(this.cfg.stateDir, 'collab', o.projectId) : undefined;
+    const deep = isDeepAgent(o.agent);
+    const permissionMode: PermissionMode = o.permissionMode === 'normal' ? 'normal' : 'full';
+    const peerToken = deep ? crypto.randomBytes(32).toString('hex') : '';
+    const collabDir = deep && o.projectId ? path.join(this.cfg.stateDir, 'collab', o.projectId) : undefined;
     const launch = buildLaunch({
       agent: o.agent, sessionId: id, prompt: o.prompt, stateDir: this.cfg.stateDir,
-      resume: o.resume, model: o.model, collabDir, instructions: o.instructions,
+      resume: o.resume, model: o.model, collabDir, instructions: deep ? o.instructions : undefined,
+      permissionMode, cliMeta: o.cliMeta,
     });
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP.test(k))) as Record<string, string>;
-    prependEnvPath(env, path.join(this.cfg.stateDir, 'bin'));
     Object.assign(env, {
       TERM: 'xterm-256color',
       COLORTERM: 'truecolor',
-      // Claude Code only turns on synchronized output (DEC 2026) for terminals it recognizes; xterm.js supports it, and
-      // without it half-drawn frames show the cursor jumping around the spinner and status lines.
-      CLAUDE_CODE_FORCE_SYNC_OUTPUT: '1',
-      WORKBENCH_SESSION_ID: id,
-      WORKBENCH_PORT: String(this.cfg.port),
-      WORKBENCH_HOOK_TOKEN: this.cfg.token,
-      WORKBENCH_PEER_TOKEN: peerToken,
-      WORKBENCH_NODE: process.execPath,
-      ...(collabDir ? { WORKBENCH_COLLAB_DIR: collabDir, WORKBENCH_PEERS_FILE: path.join(collabDir, 'PEERS.md') } : {}),
     });
+    if (deep) {
+      prependEnvPath(env, path.join(this.cfg.stateDir, 'bin'));
+      Object.assign(env, {
+        // Claude Code only turns on synchronized output (DEC 2026) for terminals it recognizes; xterm.js supports it, and
+        // without it half-drawn frames show the cursor jumping around the spinner and status lines.
+        ...(o.agent === 'claude' ? { CLAUDE_CODE_FORCE_SYNC_OUTPUT: '1' } : {}),
+        WORKBENCH_SESSION_ID: id,
+        WORKBENCH_PORT: String(this.cfg.port),
+        WORKBENCH_HOOK_TOKEN: this.cfg.token,
+        WORKBENCH_PEER_TOKEN: peerToken,
+        WORKBENCH_NODE: process.execPath,
+        ...(collabDir ? { WORKBENCH_COLLAB_DIR: collabDir, WORKBENCH_PEERS_FILE: path.join(collabDir, 'PEERS.md') } : {}),
+      });
+    }
     // Our status line (for the rate limits) replaces the user's own; the relay script runs theirs.
     const userSl = o.agent === 'claude' ? userStatusLine(o.cwd) : o.agent === 'agy' ? agyUserStatusLine().command : undefined;
     if (userSl) env.WORKBENCH_USER_STATUSLINE = userSl;
     const cols = clamp(o.cols ?? 120, 20, 500);
     const rows = clamp(o.rows ?? 36, 5, 200);
-    const proc = pty.spawn(launch.file, launch.args, { name: 'xterm-256color', cols, rows, cwd: o.cwd, env });
+    const proc = pty.spawn(launch.file, launch.verbatimArgs ?? launch.args, { name: 'xterm-256color', cols, rows, cwd: o.cwd, env });
     const now = Date.now();
     const s: Live = {
       info: {
-        id, taskId: o.taskId, agent: o.agent, nativeSessionId: launch.nativeSessionId, resumable: Boolean(o.resume || o.prompt),
+        id, taskId: o.taskId, agent: o.agent, nativeSessionId: launch.nativeSessionId,
+        resumable: deep && Boolean(o.resume || o.prompt),
+        permissionMode,
         status: 'starting', statusSince: now, startedAt: now, exitCode: null, cols, rows,
       },
       cwd: o.cwd, collabDir, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
@@ -519,10 +532,10 @@ export class SessionManager {
       hasDraft: false, interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
       inputSeq: 0, waitSeq: 0, outSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
       modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0, lastOutAt: 0,
-      initialPromptPending: Boolean(o.prompt && !o.resume),
+      initialPromptPending: deep && Boolean(o.prompt && !o.resume),
     };
     this.live.set(id, s);
-    this.peerTokens.set(peerToken, id);
+    if (peerToken) this.peerTokens.set(peerToken, id);
     this.armQuiet(s);
     this.armScrollSave();
     proc.onData(d => {
@@ -535,7 +548,7 @@ export class SessionManager {
       const prevTail = s.tail;
       trackModes(s.modes, prevTail + d);
       s.tail = (prevTail + d).slice(-MODE_TAIL);
-      if (!s.firstTurnSeen) {
+      if (deep && !s.firstTurnSeen) {
         s.startupTail = (s.startupTail + stripAnsiForMatch(prevTail + d)).slice(-1024);
         if (!s.startupBlocked && STARTUP_BLOCK_RE.test(s.startupTail)) {
           s.startupBlocked = true;
@@ -562,11 +575,14 @@ export class SessionManager {
         s.buf = tail;
         s.trimmed = true;
       }
-      if (s.info.status === 'starting') this.armQuiet(s);
+      if (s.info.status === 'starting') {
+        if (!deep && d) this.apply(s, { type: 'ready' });
+        else this.armQuiet(s);
+      }
       if (!s.removed) this.emit({ t: 'out', id, d });
     });
     proc.onExit(e => {
-      this.peerTokens.delete(s.peerToken);
+      if (s.peerToken) this.peerTokens.delete(s.peerToken);
       if (s.quiet) clearTimeout(s.quiet);
       if (s.enterTimer) {
         clearTimeout(s.enterTimer);
@@ -590,7 +606,7 @@ export class SessionManager {
     s.quiet = setTimeout(() => {
       // Fallback for CLIs that start quietly without emitting UserPromptSubmit: never leave initialPromptPending wedged.
       if (s.info.status === 'starting') s.initialPromptPending = false;
-      this.apply(s, { type: 'quiet' });
+      this.apply(s, isDeepAgent(s.info.agent) ? { type: 'quiet' } : { type: 'ready' });
     }, QUIET_MS);
   }
 

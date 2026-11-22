@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import type { Card, Project, SessionInfo, Settings, Task } from '../shared/protocol.ts';
 import { CARDS_PER_TASK, DEFAULT_SETTINGS, isValidAgyModel, TASK_COLORS } from '../shared/protocol.ts';
+import { sanitizeCliPrefs, sanitizeStoredCustomClis } from './cliRegistry.ts';
 import { cleanTitle } from './titles.ts';
 
 // Pre-muted palette; tasks stored with these are migrated to the TASK_COLORS entry at the same index.
@@ -50,9 +51,13 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
   if (typeof init?.settings?.autoDelegate === 'boolean') settings.autoDelegate = init.settings.autoDelegate;
   if (typeof init?.settings?.delegationRules === 'string') settings.delegationRules = init.settings.delegationRules;
   if (isValidAgyModel(init?.settings?.agyModel) && init.settings.agyModel) settings.agyModel = init.settings.agyModel;
+  const restoredPrefs = sanitizeCliPrefs(init?.settings?.cliPrefs);
+  if (restoredPrefs) settings.cliPrefs = restoredPrefs;
+  const restoredCustom = sanitizeStoredCustomClis(init?.settings?.customClis);
+  if (restoredCustom) settings.customClis = restoredCustom;
   const store: Store = {
-    settings: () => ({ ...settings }),
-    setSettings: s => { settings = { ...s }; onChange(store); },
+    settings: () => structuredClone(settings),
+    setSettings: s => { settings = structuredClone(s); onChange(store); },
     projects: () => [...projects.values()],
     tasks: () => [...tasks.values()],
     sessions: () => [...sessions.values()],

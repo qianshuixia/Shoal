@@ -3,6 +3,7 @@ import type { SessionStatus } from '../shared/protocol.ts';
 export type StatusEvent =
   | { type: 'hook'; event: string }
   | { type: 'input'; data: string }
+  | { type: 'ready' } // generic CLI emitted output or settled without hooks: starting -> idle
   | { type: 'quiet' } // no PTY output for a while while still `starting`
   | { type: 'exit' };
 
@@ -29,6 +30,8 @@ export function reduceStatus(current: SessionStatus, ev: StatusEvent): SessionSt
     case 'input':
       // Ctrl+C interrupts a turn without firing a Stop hook.
       return current === 'working' && ev.data.includes('\x03') ? 'needs_you' : current;
+    case 'ready':
+      return current === 'starting' ? 'idle' : current;
     case 'quiet':
       return current === 'starting' ? 'needs_you' : current;
   }

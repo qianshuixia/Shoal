@@ -14,8 +14,8 @@ test.beforeEach(() => {
 
 test('smoke: one-click optimize from empty agy home (cancel preserves disk, confirm writes all 3)', async ({ page }) => {
   await page.goto('/');
-  await page.getByTestId('settings-btn').click();
-  const dlg = page.getByTestId('settings-dialog');
+  await page.getByTestId('tab-settings').click();
+  const dlg = page.getByTestId('settings-view');
   await expect(dlg).toBeVisible();
 
   const card = dlg.getByTestId('agy-optimize-card');
@@ -101,8 +101,8 @@ test('non-destructive upgrade: preserves BOM settings, custom model, trustedWork
   fs.writeFileSync(mcpPath, origMcp, 'utf8');
 
   await page.goto('/');
-  await page.getByTestId('settings-btn').click();
-  const dlg = page.getByTestId('settings-dialog');
+  await page.getByTestId('tab-settings').click();
+  const dlg = page.getByTestId('settings-view');
   const card = dlg.getByTestId('agy-optimize-card');
 
   await expect(card.getByTestId('agy-optimize-status')).toHaveText('待优化');

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AgentKind, Card, ForwardBody, Project, Task } from '../../../shared/protocol.ts';
-import { AGENT_LABEL, AGY_MODELS, FORWARD_NOTE } from '../../../shared/protocol.ts';
+import { agentLabel, AGY_MODELS, FORWARD_NOTE } from '../../../shared/protocol.ts';
 import { mobilePatch, mobilePost, mobileUploadImage } from './api.ts';
 import { clearDraft, loadDraft, NEW_TASK_DRAFT_KEY, saveDraft } from './drafts.ts';
 
@@ -135,7 +135,7 @@ export function NewTaskSheet({
         <span>智能体</span>
         <select className="mob-input" value={agent} onChange={(e) => setAgent(e.target.value as AgentKind)}>
           {agents.map((a) => (
-            <option key={a} value={a}>{AGENT_LABEL[a]}</option>
+            <option key={a} value={a}>{agentLabel(a)}</option>
           ))}
         </select>
       </label>
@@ -221,7 +221,7 @@ export function SwitchAgentSheet({
         <span>接手智能体</span>
         <select className="mob-input" value={target} onChange={(e) => setTarget(e.target.value as AgentKind)}>
           {agents.map((a) => (
-            <option key={a} value={a}>{AGENT_LABEL[a]}</option>
+            <option key={a} value={a}>{agentLabel(a)}</option>
           ))}
         </select>
       </label>
@@ -297,13 +297,13 @@ export function ForwardSheet({
       {mode === 'existing' ? (
         <select className="mob-input" value={targetTaskId} onChange={(e) => setTargetTaskId(e.target.value)}>
           {peerTasks.map((t) => (
-            <option key={t.id} value={t.id}>{t.title}（{AGENT_LABEL[t.agent]}）</option>
+            <option key={t.id} value={t.id}>{t.title}（{agentLabel(t.agent)}）</option>
           ))}
         </select>
       ) : (
         <select className="mob-input" value={newAgent} onChange={(e) => setNewAgent(e.target.value as AgentKind)}>
           {agents.map((a) => (
-            <option key={a} value={a}>{AGENT_LABEL[a]}</option>
+            <option key={a} value={a}>{agentLabel(a)}</option>
           ))}
         </select>
       )}

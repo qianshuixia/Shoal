@@ -1,14 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
-import type { ActivityPhase, Card, Project, QuotaInfo, SessionActivity, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
-import { AGENT_LABEL, DELEGATION_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
+import type { ActivityPhase, Card, CliToolInfo, Project, QuotaInfo, SessionActivity, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
+import { agentLabel, DELEGATION_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
 import { attach, detach, fitEntry, focusOnly, isReplayEmpty, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty } from './terms.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
 import { liveWindows } from './quota.ts';
 import { fmtClock } from './util.ts';
-import { DelegationHud, type DelegateView } from './DelegationHud.tsx';
+import { DelegationHud, hudVisibleBox, type DelegateView } from './DelegationHud.tsx';
 
 interface Props {
   index: number;
@@ -39,6 +39,7 @@ interface Props {
   parentTask?: Task; // set on a delegated task: the main task that dispatched it (when it still exists)
   onOpenParent?(): void;
   onOpenPath?(path: string): void; // open a file outside the project (the CLI's transcript) with the system handler
+  cliTools?: CliToolInfo[];
 }
 
 export const SESSION_DRAG_TYPE = 'application/x-wb-session';
@@ -107,35 +108,22 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
     ...activity.filesWritten,
     ...activity.filesRead.filter((f) => !writtenSet.has(f)),
   ].slice(0, 12);
-  const hasInterrupt = !!onInterrupt;
 
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const w = el.offsetWidth;
-    const h = el.offsetHeight;
-    const top = el.offsetTop;
+    // The container has a fixed width; what is drawn is the bar plus the popover (absolute, below the bar).
+    const box = hudVisibleBox(el, '.activity-bar', '.activity-popover');
     const prev = prevBoxRef.current;
-    prevBoxRef.current = { w, h, top };
-    if (prev.w > 0 && (w < prev.w || h < prev.h || top !== prev.top)) {
+    prevBoxRef.current = box;
+    if (prev.w > 0 && (box.w < prev.w || box.h < prev.h || box.top !== prev.top)) {
       cancelAnimationFrame(vacateRafRef.current);
       vacateRafRef.current = requestAnimationFrame(() => {
         vacateRafRef.current = 0;
         onVacateRef.current?.();
       });
     }
-  }, [
-    activity.summary,
-    activity.stepCount,
-    stalled,
-    stalled ? idleSec : 0,
-    hasInterrupt,
-    open,
-    open ? activity.thinkingSnippet : '',
-    open ? activity.recentSteps.length : 0,
-    open ? touchedFiles.length : 0,
-    turnSec,
-  ]);
+  });
 
   useEffect(() => () => {
     cancelAnimationFrame(vacateRafRef.current);
@@ -407,7 +395,7 @@ const limitText = (l: NonNullable<SessionInfo['limit']>) =>
   `额度用完：${l.message}${l.resetsAt ? `，${new Date(l.resetsAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })} 重置` : ''}`;
 
 // Shown on the session that took over from another agent: one line; its expanded body floats over the terminal so expanding never resizes the PTY.
-function HandoffBar({ card, onVacate }: { card: Card; onVacate?(): void }) {
+function HandoffBar({ card, cliTools, onVacate }: { card: Card; cliTools?: CliToolInfo[]; onVacate?(): void }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const openRef = useRef(false);
@@ -453,7 +441,7 @@ function HandoffBar({ card, onVacate }: { card: Card; onVacate?(): void }) {
   return (
     <div className="handoff-bar" data-testid="pane-handoff" ref={ref}>
       <div className="handoff-line">
-        <span>由 {from ? AGENT_LABEL[from] : '另一个 agent'} 交接（{card.meta?.generated === false ? '按记录摘录' : '自动整理'}）</span>
+        <span>由 {from ? agentLabel(from, cliTools) : '另一个 agent'} 交接（{card.meta?.generated === false ? '按记录摘录' : '自动整理'}）</span>
         <button type="button" className="btn" data-testid="pane-handoff-expand" aria-expanded={open} onClick={() => setOpen((v) => !v)}>{open ? '收起' : '展开'}</button>
       </div>
       {open && <div className="handoff-body" data-testid="pane-handoff-body" data-private="">{card.body}</div>}
@@ -469,8 +457,10 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath, cliTools }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
+  const mountedSessionRef = useRef<string | null>(null);
+  const repaintFrameRef = useRef(0);
   const reviewToggleRef = useRef<HTMLButtonElement>(null);
   const [editing, setEditing] = useState(false);
   // Secondary review actions live in a floating popover anchored to the header; Approve sits directly in the header.
@@ -486,6 +476,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
   useLayoutEffect(() => {
     const body = bodyRef.current;
     if (!body) return;
+    mountedSessionRef.current = sessionId;
     if (!sessionId) {
       body.replaceChildren();
       return;
@@ -499,9 +490,23 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
     return () => {
       ro.disconnect();
       cancelAnimationFrame(raf);
+      mountedSessionRef.current = null;
       detach(sessionId, body);
     };
   }, [sessionId]);
+
+  const repaintPane = useCallback(() => {
+    if (repaintFrameRef.current || !bodyRef.current) return;
+    repaintFrameRef.current = requestAnimationFrame(() => {
+      repaintFrameRef.current = 0;
+      refreshTerminalCanvas(mountedSessionRef.current);
+    });
+  }, []);
+
+  useLayoutEffect(() => () => {
+    cancelAnimationFrame(repaintFrameRef.current);
+    repaintFrameRef.current = 0;
+  }, []);
 
   // An exited session's terminal starts empty after a reload or a Shoal restart: fetch its saved output.
   const exited = session?.status === 'exited';
@@ -511,19 +516,19 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
   const noReplay = useSyncExternalStore(subscribeReplayEmpty, () => !!sessionId && isReplayEmpty(sessionId));
 
   // Repaint the WebGL2 canvas when floating notices/popovers vanish or shift vertically so WebView2 clears vacated pixels.
-  const hasActivity = session?.status === 'working' && !!activity;
+  const hasActivity = session?.status === 'working' && activity?.sessionId === sessionId;
   const hasDelegation = !!delegates?.length && !!onOpenDelegate;
   const queued = !!session?.queued;
   const prevFloatingRef = useRef({ sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation });
-  useEffect(() => {
+  useLayoutEffect(() => {
     const prev = prevFloatingRef.current;
     prevFloatingRef.current = { sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation };
     const queuedShifted = prev.queued && queued && (prev.hasActivity !== hasActivity || prev.hasDelegation !== hasDelegation);
-    if (sessionId && prev.sid === sessionId && ((prev.queued && !queued) || queuedShifted || (prev.reviewOpen && !reviewOpen))) {
-      const raf = requestAnimationFrame(() => refreshTerminalCanvas(sessionId));
-      return () => cancelAnimationFrame(raf);
+    const switchedWithOverlay = prev.sid !== sessionId && (prev.hasActivity || prev.hasDelegation || prev.queued || prev.reviewOpen);
+    if (switchedWithOverlay || (prev.queued && !queued) || queuedShifted || (prev.reviewOpen && !reviewOpen)) {
+      repaintPane();
     }
-  }, [sessionId, queued, reviewOpen, hasActivity, hasDelegation]);
+  }, [sessionId, queued, reviewOpen, hasActivity, hasDelegation, repaintPane]);
 
   const privacy = usePrivacy();
   const [dropOver, setDropOver] = useState(false);
@@ -573,6 +578,15 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             <button className="icon-btn pane-rename" data-testid="pane-rename" title="改名（也可以双击标题）" onClick={() => setEditing(true)}>
               <PencilIcon />
             </button>
+          )}
+          {session?.permissionMode === 'normal' && (
+            <span
+              className="pane-perm-badge"
+              data-testid="pane-perm-mode"
+              title="该会话以正常模式运行，未跳过 CLI 权限确认"
+            >
+              正常模式
+            </span>
           )}
           {delegState && (
             <span className={`pane-delegation st-deleg-${delegState}`} data-testid="pane-delegation" data-state={delegState}>
@@ -641,7 +655,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           }}
           onFeedback={onFeedback}
           onForward={onForward}
-          onVacate={() => refreshTerminalCanvas(sessionId)}
+          onVacate={repaintPane}
         />
       )}
       {session?.limit && (
@@ -650,7 +664,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           <button className="btn primary" data-testid="pane-limit-switch" onClick={onSwitch}>换 agent</button>
         </div>
       )}
-      {handoff && handoff.sessionId === sessionId && <HandoffBar key={handoff.id} card={handoff} onVacate={() => refreshTerminalCanvas(sessionId)} />}
+      {handoff && handoff.sessionId === sessionId && <HandoffBar key={handoff.id} card={handoff} cliTools={cliTools} onVacate={repaintPane} />}
       <div className="pane-stage">
         <div
           className="pane-body"
@@ -659,32 +673,37 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             if (sessionId && e.target === e.currentTarget) focusOnly(sessionId);
           }}
         />
-        {hasActivity && activity && (
-          <ActivityHud
-            key={sessionId ?? 'none'}
-            activity={activity}
-            now={now}
-            onInterrupt={onInterrupt}
-            onInspectFile={onInspectFile}
-            onRestoreFocus={() => {
-              if (!dual || focused) focusOnly(sessionId);
-            }}
-            onVacate={() => refreshTerminalCanvas(sessionId)}
-          />
-        )}
-        {hasDelegation && delegates && onOpenDelegate && (
-          <DelegationHud
-            key={sessionId ?? 'none'}
-            delegates={delegates}
-            now={now}
-            hasActivity={hasActivity}
-            onOpen={onOpenDelegate}
-            onRestoreFocus={() => {
-              if (!dual || focused) focusOnly(sessionId);
-            }}
-            onVacate={() => refreshTerminalCanvas(sessionId)}
-          />
-        )}
+        <div className="pane-status" data-testid="pane-status">
+          <div className="pane-status-row pane-status-activity" data-occupied={hasActivity}>
+            {hasActivity && activity && (
+              <ActivityHud
+                key={sessionId}
+                activity={activity}
+                now={now}
+                onInterrupt={onInterrupt}
+                onInspectFile={onInspectFile}
+                onRestoreFocus={() => {
+                  if (!dual || focused) focusOnly(sessionId);
+                }}
+                onVacate={repaintPane}
+              />
+            )}
+          </div>
+          <div className="pane-status-row pane-status-delegation" data-occupied={hasDelegation}>
+            {hasDelegation && delegates && onOpenDelegate && (
+              <DelegationHud
+                key={sessionId}
+                delegates={delegates}
+                now={now}
+                onOpen={onOpenDelegate}
+                onRestoreFocus={() => {
+                  if (!dual || focused) focusOnly(sessionId);
+                }}
+                onVacate={repaintPane}
+              />
+            )}
+          </div>
+        </div>
         {exited && noReplay && (
           <ExitedSummary card={card} transcriptPath={session?.transcriptPath} onOpenPath={onOpenPath} />
         )}

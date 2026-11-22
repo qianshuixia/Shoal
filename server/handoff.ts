@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import type { AgentKind, Card, SessionInfo, Task } from '../shared/protocol.ts';
-import { AGENT_LABEL } from '../shared/protocol.ts';
+import { agentLabel, isDeepAgent } from '../shared/protocol.ts';
 import { availableAgents, buildGenerator } from './agents.ts';
 import { ENV_STRIP } from './sessions.ts';
 import { excerpt } from './transcript.ts';
@@ -42,7 +42,7 @@ export function generatorPrompt(i: HandoffInput): string {
     `卡片小节固定为：${SECTIONS.map(s => `\`## ${s}\``).join('、')}。没有信息的小节写「（记录里没有）」，不要编造。`,
     '',
     `# 任务：${i.task.title}`,
-    `原来由 ${AGENT_LABEL[i.from]} 做，现在交给 ${AGENT_LABEL[i.to]}。${i.limit ? '原因：额度用完。' : ''}`,
+    `原来由 ${agentLabel(i.from)} 做，现在交给 ${agentLabel(i.to)}。${i.limit ? '原因：额度用完。' : ''}`,
     '',
     '## 任务需求',
     cap(i.task.prompt.trim(), 2000) || '（创建任务时没有写需求）',
@@ -83,12 +83,12 @@ export function fallbackCard(i: HandoffInput): string {
 
 export function handoffPrompt(task: Pick<Task, 'title'>, card: string, o: { from: AgentKind; transcriptPath?: string; note?: string; limit?: boolean }): string {
   return [
-    `继续任务「${task.title}」。之前由 ${AGENT_LABEL[o.from]} 做，${o.limit ? '它的额度用完了' : '用户决定换人'}，现在交给你。`,
+    `继续任务「${task.title}」。之前由 ${agentLabel(o.from)} 做，${o.limit ? '它的额度用完了' : '用户决定换人'}，现在交给你。`,
     '',
     '## 交接卡片',
     card.trim(),
     ...(o.note?.trim() ? ['', '## 用户的补充', o.note.trim()] : []),
-    ...(o.transcriptPath ? ['', '## 原始记录', `${AGENT_LABEL[o.from]} 的完整对话记录在 ${o.transcriptPath}。卡片没写清的地方可以去查，不要整份读进来。`] : []),
+    ...(o.transcriptPath ? ['', '## 原始记录', `${agentLabel(o.from)} 的完整对话记录在 ${o.transcriptPath}。卡片没写清的地方可以去查，不要整份读进来。`] : []),
     '',
     '先用几句话确认你理解的当前状态和下一步，然后继续做。',
   ].join('\n');
@@ -137,10 +137,13 @@ export async function runHeadless(agent: AgentKind, prompt: string, o: { cwd: st
   }
 }
 
-// Runs the target agent headless to write the card (when switching to agy, borrows claude/codex if installed, else falls back to excerpt).
+// Runs the target agent headless to write the card (when switching to agy or a generic CLI, borrows claude/codex if enabled, else falls back to excerpt).
 // Null on any failure (logged); never throws.
-export function generateCard(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number }): Promise<string | null> {
-  const runner = agent === 'agy' ? availableAgents().find((a): a is 'claude' | 'codex' | 'fake' => a === 'claude' || a === 'codex' || a === 'fake') : agent;
+export function generateCard(agent: AgentKind, prompt: string, o: { cwd: string; stateDir: string; timeoutMs?: number; available?: AgentKind[] }): Promise<string | null> {
+  const pool = o.available ?? availableAgents();
+  const runner = (agent === 'agy' || !isDeepAgent(agent))
+    ? pool.find((a): a is 'claude' | 'codex' | 'fake' => a === 'claude' || a === 'codex' || a === 'fake')
+    : agent;
   if (!runner) return Promise.resolve(null);
   return runHeadless(runner, prompt, { ...o, what: '生成交接卡片' });
 }

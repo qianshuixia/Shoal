@@ -65,6 +65,8 @@ function applyServerMsg(prev: Snapshot, m: ServerMsg): Snapshot {
     }
     case 'settings':
       return { ...prev, settings: m.settings };
+    case 'clis':
+      return { ...prev, agents: m.agents, cliTools: m.cliTools };
     case 'git':
       return { ...prev, git: { ...prev.git, [m.projectId]: m.git } };
     case 'quota':

@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { adoptLoginShellEnv, defaultStateDir } from './platform.ts';
-import { availableAgents, writeHookFiles } from './agents.ts';
+import { writeHookFiles } from './agents.ts';
+import { enabledAgentsFrom } from './cliRegistry.ts';
 import { createApp } from './http.ts';
 import { SessionManager } from './sessions.ts';
 import { createFileStore } from './store.ts';
@@ -32,7 +33,7 @@ const { server, mobile } = createApp({ port, token, store, sessions, stateDir, u
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`Shoal on http://127.0.0.1:${port}`);
-  console.log(`agents: ${availableAgents().join(', ') || '(none)'}  state: ${stateDir}`);
+  console.log(`agents: ${enabledAgentsFrom(store.settings()).join(', ') || '(none)'}  state: ${stateDir}`);
   // Keeps the totals current even if nobody opens the stats tab, before the CLIs clean up old transcripts.
   setTimeout(() => usage.scan(), 1000).unref();
   setInterval(() => usage.scan(), 60_000).unref();

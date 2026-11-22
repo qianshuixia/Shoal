@@ -48,18 +48,18 @@ test('off by default: first-line title stays; the ? tip explains the cost only w
   expect((await state(request)).settings).toEqual({ aiTitles: false, autoDelegate: true });
   const project = await createProject(request, token('aioff'));
   await page.goto('/');
-  await page.getByTestId('settings-btn').click();
-  const dlg = page.getByTestId('settings-dialog');
-  await expect(dlg).toBeVisible();
-  await expect(dlg.getByTestId('setting-ai-titles')).not.toBeChecked();
-  const tip = dlg.getByTestId('setting-ai-titles-tip');
+  await page.getByTestId('tab-settings').click();
+  const settingsView = page.getByTestId('settings-view');
+  await expect(settingsView).toBeVisible();
+  await expect(settingsView.getByTestId('setting-ai-titles')).not.toBeChecked();
+  const tip = settingsView.getByTestId('setting-ai-titles-tip');
   await expect(tip).toBeHidden();
-  await dlg.getByTestId('setting-ai-titles-help').hover();
+  await settingsView.getByTestId('setting-ai-titles-help').hover();
   await expect(tip).toBeVisible();
   await expect(tip).toContainText('少量额度');
   await expect(tip).toContainText('Haiku');
   await expect(tip).toContainText('默认关闭');
-  // The whole tip is on screen, not clipped by the dialog or the window.
+  // The whole tip is on screen, not clipped by the card or the window.
   const box = (await tip.boundingBox())!;
   const view = page.viewportSize()!;
   expect(box.x).toBeGreaterThanOrEqual(0);
@@ -69,8 +69,8 @@ test('off by default: first-line title stays; the ? tip explains the cost only w
   await page.screenshot({ path: path.join(OUT, 'settings-tip.png') });
   await page.mouse.move(5, 5);
   await expect(tip).toBeHidden();
-  await dlg.getByTestId('settings-close').click();
-  await expect(dlg).toHaveCount(0);
+  await page.getByTestId('tab-work').click();
+  await expect(settingsView).toBeHidden();
 
   const prompt = 'plain first line of the request';
   const { task } = await createUntitled(request, project.id, prompt);
@@ -80,10 +80,10 @@ test('off by default: first-line title stays; the ? tip explains the cost only w
   expect(titleFromPrompt(prompt)).toContain('…'); // cut at 24 characters, not the generated form
 });
 
-test('switched on in the dialog: persists, and both title paths get the generated title', async ({ page, request }) => {
+test('switched on in the settings tab: persists, and both title paths get the generated title', async ({ page, request }) => {
   const project = await createProject(request, token('aion'));
   await page.goto('/');
-  await page.getByTestId('settings-btn').click();
+  await page.getByTestId('tab-settings').click();
   const box = page.getByTestId('setting-ai-titles');
   await box.click();
   await expect(box).toBeChecked();
@@ -91,10 +91,10 @@ test('switched on in the dialog: persists, and both title paths get the generate
   await page.screenshot({ path: path.join(OUT, 'settings-on.png') });
 
   await page.reload();
-  await page.getByTestId('settings-btn').click();
+  await page.getByTestId('tab-settings').click();
   await expect(page.getByTestId('setting-ai-titles')).toBeChecked();
-  await page.keyboard.press('Escape');
-  await expect(page.getByTestId('settings-dialog')).toHaveCount(0);
+  await page.getByTestId('tab-work').click();
+  await expect(page.getByTestId('settings-view')).toBeHidden();
 
   // Path 1: created with a prompt and no title.
   const prompt = '重构登录表单的校验逻辑，顺便补上单元测试\n第二行不该出现';

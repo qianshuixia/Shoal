@@ -133,8 +133,8 @@ test.describe('mobile access gateway & Android PWA', () => {
     const desktopRows = desktopSessionBefore.rows;
     expect(desktopCols).toBeGreaterThan(20);
 
-    // Desktop enables Mobile Gateway from SettingsDialog.
-    await page.getByTestId('settings-btn').click();
+    // Desktop enables Mobile Gateway from SettingsView.
+    await page.getByTestId('tab-settings').click();
     await expect(page.getByTestId('mobile-settings-section')).toBeVisible();
     await page.getByTestId('mobile-enable-toggle').check();
     await expect(page.getByTestId('mobile-settings-section')).toContainText(`监听中 :${MOBILE_PORT}`);

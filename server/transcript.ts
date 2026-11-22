@@ -103,7 +103,8 @@ function fakeTurns(v: Obj, out: Turn[]) {
 }
 
 export function parseTranscript(agent: AgentKind, raw: string): Turn[] {
-  const each = agent === 'claude' ? claudeTurns : agent === 'codex' ? codexTurns : agent === 'agy' ? agyTurns : fakeTurns;
+  const each = agent === 'claude' ? claudeTurns : agent === 'codex' ? codexTurns : agent === 'agy' ? agyTurns : agent === 'fake' ? fakeTurns : null;
+  if (!each) return [];
   const out: Turn[] = [];
   for (const line of raw.split('\n')) {
     const l = line.trim();

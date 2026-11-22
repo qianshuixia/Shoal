@@ -1,6 +1,50 @@
 // Contract shared by server/ and web/. Change it only together with both sides.
 
-export type AgentKind = 'claude' | 'codex' | 'agy' | 'fake';
+export type BuiltinDeepAgent = 'claude' | 'codex' | 'agy' | 'fake';
+export type AgentKind = string;
+export type PermissionMode = 'full' | 'normal';
+export type CliTier = 'deep' | 'generic';
+
+export const DEEP_AGENTS = new Set<string>(['claude', 'codex', 'agy', 'fake']);
+export const BUILTIN_CLI_IDS = new Set<string>([
+  'claude', 'codex', 'agy', 'fake',
+  'gemini', 'kimi', 'droid', 'qwen', 'opencode', 'copilot', 'cursor-agent', 'aider', 'amp', 'cline', 'goose',
+]);
+export const RESERVED_CLI_IDS = new Set<string>([
+  ...BUILTIN_CLI_IDS,
+  'all', 'none', 'default', 'constructor', 'prototype', '__proto__', 'tostring', 'valueof',
+]);
+
+export const isDeepAgent = (agent: string): boolean => DEEP_AGENTS.has(agent);
+
+export function isValidCustomCliId(id: string): boolean {
+  return /^[a-z][a-z0-9_-]{0,31}$/.test(id) && !RESERVED_CLI_IDS.has(id);
+}
+
+export function parseCliArgs(raw: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      else if (ch === '\\' && quote === '"' && i + 1 < raw.length && (raw[i + 1] === '"' || raw[i + 1] === '\\')) {
+        cur += raw[++i];
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (cur) { out.push(cur); cur = ''; }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
 
 // starting: spawned, no hook yet. idle: the CLI reported SessionStart and sits at an empty prompt (就绪), nothing to look at.
 // working: a turn is running.
@@ -48,6 +92,7 @@ export interface Task {
   color: string; // CSS color, assigned by the server from TASK_COLORS
   agent: AgentKind;
   model?: string; // optional per-task CLI model slug (currently used for agy --model <slug>)
+  permissionMode?: PermissionMode; // effective permission mode of this task's session (inherited by delegated children)
   sessionId: string | null; // current session
   createdAt: number;
   phase: TaskPhase; // missing in state saved before M2: loaded as 'active'
@@ -237,6 +282,8 @@ export interface SessionInfo {
   limit?: { message: string; resetsAt: number | null; at: number };
   // Set while paused at an interactive CLI permission or startup folder-trust prompt.
   blocked?: 'startup' | 'permission';
+  // Permission mode this session was spawned with ('full' = skip approvals, 'normal' = CLI defaults).
+  permissionMode?: PermissionMode;
 }
 
 // Subscription quota windows of one agent's account (claude: 5-hour and 7-day, codex: from its rollout's rate_limits,
@@ -279,6 +326,48 @@ export interface SessionActivity {
   filesWritten: string[]; // recent distinct file paths written/edited in this turn
 }
 
+export interface CliToolPreference {
+  enabled?: boolean;
+  permissionMode?: PermissionMode;
+}
+
+export interface CustomCliConfig {
+  id: string; // lowercase slug (/^[a-z][a-z0-9_-]{0,31}$/), cannot collide with built-in ids
+  label: string;
+  command: string; // executable name on PATH or absolute file path
+  normalArgs?: string[];
+  fullAccessArgs?: string[];
+  promptArg?: 'positional' | 'none';
+}
+
+export interface CliToolInfo {
+  id: string;
+  label: string;
+  tier: CliTier;
+  source: 'builtin' | 'custom';
+  installed: boolean;
+  usable: boolean;
+  unusableReason?: string;
+  path: string | null;
+  version?: string | null;
+  command: string;
+  enabled: boolean;
+  permissionMode: PermissionMode;
+  fullAccessArgs: string[];
+  normalArgs: string[];
+  supportsFullAccessFlag: boolean;
+  fullAccessNote?: string;
+  capabilities: string[];
+  limitations?: string;
+  promptArg: 'positional' | 'none';
+}
+
+export interface CliScanResult {
+  agents: AgentKind[];
+  cliTools: CliToolInfo[];
+  scannedAt: number;
+}
+
 // Workbench-wide settings, stored in the state file.
 export interface Settings {
   aiTitles: boolean; // replace a task's first-line title with one written by a short headless call of its agent
@@ -289,6 +378,10 @@ export interface Settings {
   // Which kind of work goes to which CLI and when to ask the other two for a joint review; appended to the standing
   // delegation instructions. undefined = the built-in DEFAULT_DELEGATION_RULES, '' = inject no rules.
   delegationRules?: string;
+  // Per-CLI enablement and permission mode preferences (keyed by CLI id). Default permissionMode = 'full'.
+  cliPrefs?: Record<string, CliToolPreference>;
+  // User-defined custom CLIs added manually from Settings.
+  customClis?: CustomCliConfig[];
 }
 export const DELEGATION_RULES_MAX = 4000;
 // Built-in division of labor, from each vendor's own docs (Nov 2026). Names capabilities, not model versions, so it
@@ -354,7 +447,8 @@ export interface Snapshot {
   tasks: Task[];
   sessions: SessionInfo[];
   cards: Card[];
-  agents: AgentKind[]; // agents that can be launched on this machine
+  agents: AgentKind[]; // enabled & usable agents that can be launched on this machine
+  cliTools?: CliToolInfo[]; // full catalog + detected/custom CLIs for labels, badges & Settings
   settings: Settings;
   git: Record<string, GitInfo | null>; // by project id; null = not a git repo. Derived, not stored in state.json
   quota: Partial<Record<AgentKind, QuotaInfo>>; // from <stateDir>/quota.json
@@ -480,7 +574,7 @@ const VENDORS: [RegExp, string][] = [
   [/minimax|abab/, 'MiniMax'],
   [/grok/, 'xAI'],
 ];
-const AGENT_VENDOR: Record<AgentKind, string> = { claude: 'Anthropic', codex: 'OpenAI', agy: 'Google', fake: '测试' };
+const AGENT_VENDOR: Partial<Record<string, string>> = { claude: 'Anthropic', codex: 'OpenAI', agy: 'Google', fake: '测试' };
 
 // Vendor from the model name (a CLI can be pointed at another vendor's model), else from the CLI.
 export function vendorOf(model: string, agent: AgentKind): string {
@@ -551,7 +645,28 @@ export interface FeedbackResult {
   card: Card; // the saved feedback card
 }
 
-export const AGENT_LABEL: Record<AgentKind, string> = { claude: 'Claude Code', codex: 'Codex', agy: 'Antigravity', fake: 'Fake' };
+export const AGENT_LABEL: Partial<Record<string, string>> = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  agy: 'Antigravity',
+  fake: 'Fake',
+  gemini: 'Gemini CLI',
+  kimi: 'Kimi Code',
+  droid: 'Factory Droid',
+  qwen: 'Qwen Code',
+  opencode: 'OpenCode',
+  copilot: 'GitHub Copilot CLI',
+  'cursor-agent': 'Cursor Agent',
+  aider: 'Aider',
+  amp: 'Amp',
+  cline: 'Cline CLI',
+  goose: 'Goose',
+};
+
+export function agentLabel(agent: AgentKind, cliTools?: readonly Pick<CliToolInfo, 'id' | 'label'>[]): string {
+  const fromTools = cliTools?.find((t) => t.id === agent)?.label;
+  return fromTools ?? AGENT_LABEL[agent] ?? agent;
+}
 
 export interface SwitchAgentBody {
   agent: AgentKind;
@@ -692,7 +807,7 @@ export function composeDelegationInstructions(opts: { host: AgentKind; available
   return [
     DELEGATION_INSTRUCTIONS,
     '',
-    `This session runs ${AGENT_LABEL[opts.host]}. CLIs installed in this Shoal: ${opts.available.map(a => AGENT_LABEL[a]).join(', ')}. Only these can be delegated to.`,
+    `This session runs ${agentLabel(opts.host)}. CLIs installed in this Shoal: ${opts.available.map(a => agentLabel(a)).join(', ')}. Only these can be delegated to.`,
     ...(rules ? ['', '## 分工与评审规则（Shoal 设置，用户可修改）', rules] : []),
   ].join('\n');
 }
@@ -701,7 +816,7 @@ export function composeDelegationInstructions(opts: { host: AgentKind; available
 export function delegationPrompt(parent: { title: string; agent: AgentKind }, brief: string, opts?: { review?: boolean }): string {
   if (opts?.review) {
     return [
-      `你是任务「${parent.title}」（${AGENT_LABEL[parent.agent]}）请来的独立评审者。只按下面「任务」里给的评审对象和角度评审。`,
+      `你是任务「${parent.title}」（${agentLabel(parent.agent)}）请来的独立评审者。只按下面「任务」里给的评审对象和角度评审。`,
       '',
       '- 只读：不修改、创建或删除项目文件，不提交，不安装依赖，不运行会改动工作区或外部状态的命令；可以读文件、搜索、运行只读检查。',
       '- 用一条回复交付：第一行写「结论：PASS」或「结论：FAIL」，然后列 BLOCKING（必须改才能继续的问题）和 NON-BLOCKING（建议）。每条写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
@@ -713,7 +828,7 @@ export function delegationPrompt(parent: { title: string; agent: AgentKind }, br
     ].join('\n');
   }
   return [
-    `你是任务「${parent.title}」（${AGENT_LABEL[parent.agent]}）委派的子任务执行者。只做下面「任务」里的事。`,
+    `你是任务「${parent.title}」（${agentLabel(parent.agent)}）委派的子任务执行者。只做下面「任务」里的事。`,
     '',
     '- 完成后用一条回复交付：做了什么、改了哪些文件、跑了哪些检查和结果、还有什么没解决。这条回复会自动送回主任务验收，不需要你自己回传。',
     '- 需求不清楚时直接在回复里提问并结束本轮，主任务会补充。',
@@ -730,7 +845,7 @@ export function delegationResultText(child: { id: string; title: string; agent: 
   const h = delegationHandle(child.id);
   if (child.mode === 'review') {
     return [
-      `评审者「${child.title}」（${AGENT_LABEL[child.agent]}，第 ${child.round} 轮）给出了评审结论。它是只读的，修改由你来做。`,
+      `评审者「${child.title}」（${agentLabel(child.agent)}，第 ${child.round} 轮）给出了评审结论。它是只读的，修改由你来做。`,
       '',
       '## 评审结论',
       reply.trim() || '（没有拿到这一轮的回复，请打开子任务的终端查看）',
@@ -742,7 +857,7 @@ export function delegationResultText(child: { id: string; title: string; agent: 
     ].join('\n');
   }
   return [
-    `委派任务「${child.title}」（${AGENT_LABEL[child.agent]}，第 ${child.round} 轮）交付了结果，请验收。`,
+    `委派任务「${child.title}」（${agentLabel(child.agent)}，第 ${child.round} 轮）交付了结果，请验收。`,
     '',
     '## 结果',
     reply.trim() || '（没有拿到这一轮的回复，请打开子任务的终端查看）',
@@ -768,7 +883,7 @@ export function delegationReworkText(parent: { title: string }, round: number, f
 // Pasted into the main task once per round when a delegated task stops at a dialog only the user can answer.
 export function delegationBlockedText(child: { title: string; agent: AgentKind }, blocked: NonNullable<SessionInfo['blocked']>): string {
   const what = blocked === 'startup' ? '启动确认' : '权限确认';
-  return `委派任务「${child.title}」（${AGENT_LABEL[child.agent]}）停在${what}提示上，需要用户到它的终端里处理，你无法代为确认。请告诉用户，然后继续其他工作。这一轮里同类提示不再重复通知。`;
+  return `委派任务「${child.title}」（${agentLabel(child.agent)}）停在${what}提示上，需要用户到它的终端里处理，你无法代为确认。请告诉用户，然后继续其他工作。这一轮里同类提示不再重复通知。`;
 }
 
 export const FORWARD_NOTE = '下面是另一个任务的结果，供你参考。';
@@ -779,7 +894,7 @@ export function forwardText(
   note?: string,
   opts?: { replyBack?: boolean },
 ): string {
-  const base = [note?.trim() || FORWARD_NOTE, '', `## 转发自任务「${source.title}」（${AGENT_LABEL[source.agent]}）`, body.trim()].join('\n');
+  const base = [note?.trim() || FORWARD_NOTE, '', `## 转发自任务「${source.title}」（${agentLabel(source.agent)}）`, body.trim()].join('\n');
   if (!opts?.replyBack) return base;
   return `${base}\n\n（注：你完成本轮回复后，工作台会自动把你的结论回传给任务「${source.title}」。）`;
 }
@@ -930,6 +1045,7 @@ export type ServerMsg =
   | { t: 'project-removed'; id: string } // sent after a task-removed for each of its tasks
   | { t: 'card'; card: Card }
   | { t: 'settings'; settings: Settings }
+  | { t: 'clis'; agents: AgentKind[]; cliTools: CliToolInfo[] }
   | { t: 'git'; projectId: string; git: GitInfo | null } // sent only when the value changed
   | { t: 'quota'; agent: AgentKind; quota: QuotaInfo } // sent only when the windows changed
   | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
