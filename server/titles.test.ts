@@ -21,6 +21,12 @@ describe('titleFromPrompt', () => {
   it('returns empty when nothing usable', () => {
     expect(titleFromPrompt('')).toBe('');
     expect(titleFromPrompt(' \n\t\n ')).toBe('');
+    expect(titleFromPrompt('<task-notification><task-id>abc</task-id></task-notification>')).toBe('');
+    expect(titleFromPrompt('  <system-reminder>do not show</system-reminder>')).toBe('');
+  });
+  it('strips leading markdown heading hashes', () => {
+    expect(titleFromPrompt('# Reddit 评论评审 brief')).toBe('Reddit 评论评审 brief');
+    expect(titleFromPrompt('## 修复构建脚本')).toBe('修复构建脚本');
   });
 });
 
@@ -88,6 +94,11 @@ describe('promptPreview', () => {
   it('returns an empty string when nothing is left', () => {
     expect(promptPreview('')).toBe('');
     expect(promptPreview(' \n [Image #2] \n')).toBe('');
+    expect(promptPreview('<task-notification><task-id>bzhj16q8k</task-id></task-notification>')).toBe('');
+    expect(promptPreview('<system-reminder>internal context</system-reminder>')).toBe('');
+  });
+  it('strips leading markdown heading hashes', () => {
+    expect(promptPreview('# 任务包 P8a: 一键分解确认')).toBe('任务包 P8a: 一键分解确认');
   });
 });
 
@@ -95,6 +106,7 @@ describe('delegationTitle', () => {
   it('drops a leading label, bracketed paths and backticks', () => {
     expect(delegationTitle('任务：在项目根目录（G:\\Workspace\\agent-workbench）下新建 `hello.txt`')).toBe('在项目根目录下新建 hello.txt');
     expect(delegationTitle('Task: fix the login (/srv/app/login.ts) bug')).toBe('fix the login bug');
+    expect(delegationTitle('# Reddit 评论评审 brief (c56)')).toBe('Reddit 评论评审 brief (c56)');
   });
   it('skips lines left empty by the cleanup and cuts like a prompt title', () => {
     expect(delegationTitle('任务：\n目标：' + '中'.repeat(30))).toBe('中'.repeat(24) + '…');

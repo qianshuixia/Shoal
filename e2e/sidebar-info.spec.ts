@@ -157,12 +157,18 @@ test('task preview: shows the latest prompt, follows follow-ups, hides when redu
   expect(Math.abs((await preview(withPrompt.session.id).boundingBox())!.x - tx2)).toBeLessThan(1);
   await page.locator('aside.sidebar').screenshot({ path: path.join(OUT, 'preview.png') });
 
-  // A follow-up typed into the terminal replaces the preview; slash commands do not.
+  // A follow-up typed into the terminal replaces the preview; slash commands and system XML notifications do not.
   await pane(page, 0).locator('.xterm-helper-textarea').focus();
-  await page.keyboard.type('/status\r'
-);
+  await page.keyboard.type('/status\r');
   await page.keyboard.type('now add a regression test\r');
   await expect(preview(withPrompt.session.id)).toHaveText('now add a regression test');
+  await page.keyboard.type('<task-notification><task-id>abc</task-id></task-notification>\r');
+  await expect(preview(withPrompt.session.id)).toHaveText('now add a regression test');
+
+  // Approving a task collapses it back to a clean single line.
+  expect((await request.post(`/api/tasks/${withPrompt.task.id}/approve`, { data: {} })).ok()).toBeTruthy();
+  await expect(row(page, withPrompt.session.id)).toHaveAttribute('data-phase', 'approved');
+  await expect(preview(withPrompt.session.id)).toHaveCount(0);
 
   // Ending the task hides the preview; the data stays on the task.
   await page.keyboard.type('exit 0\r');

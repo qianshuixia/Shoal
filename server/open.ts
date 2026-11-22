@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import type { OpenMode } from '../shared/protocol.ts';
 import { findExecutable } from './platform.ts';
 
 // Opens a link clicked in a terminal (file: URI or bare absolute path) in VS Code / Explorer. Nothing here ever executes the target.
@@ -101,11 +102,24 @@ const MAC_SELECT_ONLY = new Set([...SELECT_ONLY, 'app', 'command', 'tool', 'term
 const MAC_BUNDLE_DIRS = new Set(['app', 'bundle', 'framework', 'pkg', 'mpkg', 'prefpane', 'workflow']);
 
 // What to run for a resolved path. Never a shell, never `start`; programs and shortcuts are only selected in Explorer.
-export function openAction(resolved: Resolved, isDir: boolean, editor: string | null, platform: NodeJS.Platform = process.platform): OpenCommand {
+export function openAction(
+  resolved: Resolved,
+  isDir: boolean,
+  editor: string | null,
+  platform: NodeJS.Platform = process.platform,
+  mode: OpenMode = 'default',
+): OpenCommand {
   const file = resolved.path;
-  if (platform !== 'win32') return posixOpenAction(resolved, isDir, editor, platform === 'darwin');
+  if (mode === 'editor') {
+    if (!editor) throw new OpenError(404, '未找到外部编辑器（可安装 VS Code 或设置 WORKBENCH_EDITOR）');
+    if (isDir || resolved.line === undefined) return { kind: 'editor', cmd: editor, args: [file] };
+    const at = resolved.col === undefined ? `${resolved.line}` : `${resolved.line}:${resolved.col}`;
+    return { kind: 'editor', cmd: editor, args: ['--goto', `${file}:${at}`] };
+  }
+  if (platform !== 'win32') return posixOpenAction(resolved, isDir, editor, platform === 'darwin', mode);
   const explorer = 'explorer.exe';
   if (isDir) return { kind: 'dir', cmd: explorer, args: [file] };
+  if (mode === 'reveal') return { kind: 'select', cmd: explorer, args: [`/select,"${file}"`], verbatim: true };
   const ext = path.extname(file).slice(1).toLowerCase();
   if (DEFAULT_OPEN.has(ext)) return { kind: 'default', cmd: explorer, args: [file] };
   if (SELECT_ONLY.has(ext) || !editor) return { kind: 'select', cmd: explorer, args: [`/select,"${file}"`], verbatim: true };
@@ -115,7 +129,7 @@ export function openAction(resolved: Resolved, isDir: boolean, editor: string | 
 }
 
 // macOS: open / open -R (reveal in Finder); elsewhere xdg-open, and a file is revealed by opening its folder.
-function posixOpenAction(resolved: Resolved, isDir: boolean, editor: string | null, mac: boolean): OpenCommand {
+function posixOpenAction(resolved: Resolved, isDir: boolean, editor: string | null, mac: boolean, mode: OpenMode = 'default'): OpenCommand {
   const file = resolved.path;
   const ext = path.extname(file).slice(1).toLowerCase();
   const opener = mac ? 'open' : 'xdg-open';
@@ -123,6 +137,7 @@ function posixOpenAction(resolved: Resolved, isDir: boolean, editor: string | nu
     ? { kind: 'select', cmd: opener, args: ['-R', file] }
     : { kind: 'select', cmd: opener, args: [path.posix.dirname(file)] };
   if (isDir) return mac && MAC_BUNDLE_DIRS.has(ext) ? select() : { kind: 'dir', cmd: opener, args: [file] };
+  if (mode === 'reveal') return select();
   if (DEFAULT_OPEN.has(ext)) return { kind: 'default', cmd: opener, args: [file] };
   if ((mac ? MAC_SELECT_ONLY : SELECT_ONLY).has(ext) || !editor) return select();
   if (resolved.line === undefined) return { kind: 'editor', cmd: editor, args: [file] };

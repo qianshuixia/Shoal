@@ -271,8 +271,13 @@ describe('mobile gateway & security integration', () => {
       ['GET', '/api/dirs'],
       ['POST', '/api/shutdown'],
       ['POST', '/api/open'],
+      ['POST', '/api/clipboard/files'],
       ['PUT', `/api/projects/${project.id}/file`],
       ['POST', `/api/projects/${project.id}/discard`],
+      ['POST', `/api/projects/${project.id}/fs/create`],
+      ['POST', `/api/projects/${project.id}/fs/rename`],
+      ['POST', `/api/projects/${project.id}/fs/delete`],
+      ['POST', `/api/projects/${project.id}/fs/paste`],
       ['DELETE', `/api/tasks/${createdTask.task.id}`],
       ['DELETE', `/api/projects/${project.id}`],
     ] as const) {

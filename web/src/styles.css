@@ -161,8 +161,8 @@ kbd {
 .side-list { flex: 1; overflow-y: auto; padding: 0 0.375rem 1rem; }
 .side-empty { padding: 0.75rem 0.625rem; color: var(--text-3); }
 
-.group { padding-bottom: 0.25rem; }
-.group + .group { margin-top: 0.25rem; padding-top: 0.25rem; border-top: 1px solid var(--line); }
+.group { padding-bottom: 0.3125rem; }
+.group + .group { margin-top: 0.375rem; padding-top: 0.375rem; border-top: 1px solid var(--line); }
 .group.dragging { opacity: .45; }
 .group.drop-before { box-shadow: 0 -0.0625rem 0 0 var(--text-3); }
 .group.drop-after { box-shadow: 0 0.0625rem 0 0 var(--text-3); }
@@ -172,10 +172,11 @@ kbd {
   flex: 0 1 auto; min-width: 0; display: flex; align-items: center; gap: 0.375rem; height: 100%;
   padding: 0 0.25rem; background: transparent; border: 0; border-radius: 0.375rem; text-align: left; color: var(--text-2);
 }
+.group[data-collapsed="false"] .group-toggle { color: var(--text); }
 .group-head:hover .group-toggle, .group-toggle:hover:not(:disabled) { background: transparent; color: var(--text); }
 .chev { flex: none; width: 0.875rem; height: 0.875rem; color: var(--text-3); transition: transform .15s; }
 .group-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
-.group-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.group-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; letter-spacing: 0.01em; }
 .group-branch {
   flex: 0 20 auto; min-width: 2.75rem; overflow: hidden; display: inline-flex; align-items: center; gap: 0.25rem; padding: 0 0.4375rem; margin-left: 0.125rem;
   background: transparent; border: 0; border-radius: 999px;
@@ -238,7 +239,8 @@ kbd {
 /* Task rows */
 .task-row {
   --c: var(--text-3);
-  display: flex; align-items: center; gap: 0.5rem; height: 1.875rem; padding: 0 0.25rem 0 0.625rem;
+  position: relative;
+  display: flex; align-items: center; gap: 0.5rem; height: 1.875rem; padding: 0 0.375rem 0 0.625rem;
   border-radius: 0.375rem; cursor: pointer; color: var(--text-2);
 }
 .task-row:hover { background: var(--hover); color: var(--text); }
@@ -254,9 +256,11 @@ kbd {
   flex: 0 0 calc(100% - 1rem); margin-left: 1rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 0.75rem; line-height: 1rem; color: var(--text-3); text-align: left;
 }
-.task-row.in-pane .task-preview { flex-basis: calc(100% - 1.6875rem); margin-left: 1.6875rem; }
-/* Row layout: state glyph at the left edge, then the task-color swatch (only on rows shown in a pane), title, status, and the agent icon last, in its brand colors. */
-.task-swatch { width: 0.1875rem; height: 0.875rem; flex: none; border-radius: 0.125rem; background: var(--c); }
+/* Row layout: swatch hugs the left edge without shifting the column alignment; then glyph, title, status, and agent icon. */
+.task-swatch {
+  position: absolute; left: 0; top: 0.3125rem; bottom: 0.3125rem; width: 0.1875rem;
+  border-radius: 0 0.125rem 0.125rem 0; background: var(--c); pointer-events: none;
+}
 .row-glyph { flex: none; box-sizing: border-box; width: 0.5rem; height: 0.5rem; border-radius: 50%; }
 .row-glyph.g-needs { background: var(--signal); }
 .row-glyph.g-working { position: relative; background: var(--work); }
@@ -265,28 +269,36 @@ kbd {
 @keyframes ping { 70%, 100% { box-shadow: 0 0 0 0.4rem transparent; } }
 .row-glyph.g-review { border: 1.5px solid var(--text-2); }
 .row-glyph.g-idle { border: 1.5px solid var(--line-2); }
-.row-glyph.g-approved { border-radius: 0; width: 0.5rem; height: 0.3125rem; border-left: 1.5px solid var(--text-3); border-bottom: 1.5px solid var(--text-3); transform: translateY(-1px) rotate(-45deg) scale(.9); }
+.row-glyph.g-approved {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 0.5rem; height: 0.5rem; border-radius: 0; color: var(--text-3);
+}
+.approved-check { width: 0.6875rem; height: 0.6875rem; flex: none; fill: none; stroke: currentColor; stroke-width: 1.85; stroke-linecap: round; stroke-linejoin: round; }
 .row-glyph.g-exited, .row-glyph.g-archived { width: 0.25rem; height: 0.25rem; margin: 0 0.125rem; background: var(--text-3); }
 .agent-icon { width: 0.875rem; height: 0.875rem; flex: none; color: var(--text-2); }
 .agent-mark { display: flex; flex: none; }
 .menu button { color: var(--text); }
 .task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.task-row .status { min-width: 3.25rem; text-align: right; }
-.task-row[data-status="exited"] .task-title { color: var(--text-3); }
+.task-row .status { min-width: 2.75rem; text-align: right; }
+.task-row[data-status="exited"] .task-title,
+.task-row[data-phase="approved"]:not(.in-pane) .task-title { color: var(--text-3); }
 /* Keyed on the glyph the row shows, not data-status: a 待验收 / 已通过 row keeps a live session but is not "working". */
-.task-row:has(> .g-working) .task-title { color: var(--text); }
+.task-row:has(> .g-working, > .g-needs) .task-title { color: var(--text); }
 /* The agent mark keeps its brand colours only on rows that are alive; elsewhere it would outshine the state. */
 .task-row:not(:has(> .g-working, > .g-needs)) .agent-icon { opacity: .45; filter: saturate(.35); }
 .task-row:hover .agent-icon { opacity: 1; filter: none; }
 /* Rename / close take the status slot on hover instead of reserving width. */
-.task-row { padding-right: 0.375rem; }
 .row-actions { display: none; flex: none; gap: 0.125rem; }
 .row-actions .icon-btn { width: 1.25rem; height: 1.25rem; }
 .row-actions .icon-btn:hover:not(:disabled) { color: var(--text); background: var(--line-2); }
 .task-row:hover .row-actions, .task-row:focus-within .row-actions { display: flex; }
 .task-row:hover > .status, .task-row:focus-within > .status,
 .task-row:hover > .queued-mark, .task-row:focus-within > .queued-mark { display: none; }
-.queued-mark { flex: none; font-size: 0.75rem; color: var(--text-3); }
+.queued-mark {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  height: 1rem; padding: 0 0.25rem; border-radius: 0.25rem;
+  font-size: 0.625rem; line-height: 1; color: var(--text-3); background: var(--raised); box-shadow: inset 0 0 0 1px var(--line-2);
+}
 .task-row .remove:hover:not(:disabled) { color: var(--danger); background: rgba(224, 122, 115, .12); }
 /* Stopped-history fold & one-click project tidy bar. */
 .group-foot { display: flex; align-items: center; gap: 0.25rem; padding: 0.125rem 0.375rem 0.125rem 1.625rem; }
@@ -306,10 +318,10 @@ kbd {
 }
 /* Quiet until the row is hovered: a column of outlined chips was the loudest thing in the sidebar. */
 .resume-chip {
-  flex: none; height: 1.25rem; padding: 0 0.5rem; font-size: 0.75rem; line-height: 1.125rem;
-  background: transparent; border-color: transparent; border-radius: 999px; color: var(--text-3);
+  flex: none; height: 1.25rem; padding: 0 0.4375rem; font-size: 0.7188rem; line-height: 1.125rem;
+  background: transparent; border-color: transparent; border-radius: 999px; color: var(--text-3); opacity: .55;
 }
-.task-row:hover .resume-chip, .resume-chip:focus-visible { border-color: var(--line-2); color: var(--text-2); }
+.task-row:hover .resume-chip, .resume-chip:focus-visible { opacity: 1; border-color: var(--line-2); color: var(--text-2); }
 .resume-chip:hover:not(:disabled) { background: var(--active); color: var(--text); border-color: var(--text-3); }
 .title-input {
   flex: 1; min-width: 0; height: 1.375rem; padding: 0 0.375rem;
@@ -378,13 +390,14 @@ kbd {
 .pane-stage { --pane-status-h: 4rem; flex: 1; position: relative; min-height: 0; display: flex; flex-direction: column; padding-top: var(--pane-status-h); }
 .pane-status {
   position: absolute; inset: 0 0 auto; height: var(--pane-status-h); z-index: 8;
-  background: var(--surface); pointer-events: none;
+  background: var(--term); pointer-events: none;
 }
 .pane-status-row {
   position: absolute; right: 0.75rem; width: min(34rem, calc(100% - 1.5rem)); height: 1.625rem;
-  background: var(--surface);
+  background: var(--term);
 }
-.pane-status-row[data-occupied="false"] { background: #191c21; }
+/* Imperceptible 1-step RGB delta vs --term (#0f1012) forces WebView2 to repaint and clear vacated HUD pixels without a visible bar. */
+.pane-status-row[data-occupied="false"] { background: #0f1013; }
 .pane-status-activity { top: 0.375rem; }
 .pane-status-delegation { top: 2.1875rem; }
 .pane-status-row:has(.activity-popover, .delegation-popover) { z-index: 1; }
@@ -1298,30 +1311,41 @@ kbd {
 }
 
 
-/* Delegated tasks: nested sidebar rows, status chip, pane header marker and the HUD on the main task's pane. */
-/* A delegated row is a smaller row hung under its main task by a tree elbow. */
-.task-row.nested { position: relative; height: 1.5rem; gap: 0.4375rem; padding-left: 1.6875rem; font-size: 0.75rem; }
+/* Delegated tasks: nested sidebar rows inside a continuous rail, status chip, pane header marker and the HUD. */
+.task-kids {
+  position: relative; margin: 0.0625rem 0 0.25rem; padding-left: 1.125rem;
+}
+.task-kids::before {
+  content: ""; position: absolute; left: 0.875rem; top: 0.125rem; bottom: 0.25rem; width: 1px;
+  background: var(--line-2); opacity: .75;
+}
+.task-row.nested { height: 1.5625rem; gap: 0.4375rem; padding-left: 0.5rem; font-size: 0.75rem; }
 .task-row.nested.has-preview { height: auto; }
-.task-row.nested.has-preview::before { height: 1.5rem; margin-right: -0.4375rem; }
+.task-row.nested.has-preview::before { height: 1.5625rem; margin-right: -0.4375rem; }
 .task-row.nested .task-preview { flex-basis: calc(100% - 0.9375rem); margin-left: 0.9375rem; font-size: 0.6875rem; }
-.task-row.nested.in-pane .task-preview { flex-basis: calc(100% - 1.5rem); margin-left: 1.5rem; }
 .task-row.nested .status { min-width: 0; font-size: 0.6875rem; }
 .task-row.nested[data-phase="archived"] .task-title { color: var(--text-3); }
-.nest-mark {
-  position: absolute; left: 0.8125rem; top: -0.125rem; width: 0.5rem; height: 0.875rem;
-  border-left: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); border-bottom-left-radius: 0.3125rem;
+.kids-fold-btn {
+  flex: none; display: inline-flex; align-items: center; gap: 0.125rem;
+  height: 1.125rem; padding: 0 0.3125rem 0 0.1875rem; border: 0; border-radius: 999px;
+  background: var(--raised); color: var(--text-3); font-size: 0.6875rem; line-height: 1; font-variant-numeric: tabular-nums;
 }
+.kids-fold-btn:hover:not(:disabled) { background: var(--active); color: var(--text); }
+.kids-chev { width: 0.75rem; height: 0.75rem; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; transition: transform .15s; }
+.kids-fold-btn[aria-expanded="true"] .kids-chev,
+.kids-toggle[aria-expanded="true"] .kids-chev { transform: rotate(90deg); }
 .kids-toggle {
-  display: block; margin: 0 0 0.125rem 1.6875rem; padding: 0.0625rem 0.375rem; border: 0; border-radius: 0.25rem;
-  background: transparent; color: var(--text-3); font-size: 0.6875rem; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 0.1875rem;
+  margin: 0.0625rem 0; padding: 0.125rem 0.375rem 0.125rem 0.25rem; border: 0; border-radius: 0.25rem;
+  background: transparent; color: var(--text-3); font-size: 0.6875rem; line-height: 1.25; cursor: pointer;
 }
-.kids-toggle:hover { background: var(--hover); color: var(--text-2); }
-.status.st-deleg { padding: 0 0.4375rem; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--text-2); }
+.kids-toggle:hover:not(:disabled) { background: var(--hover); color: var(--text-2); }
+.status.st-deleg { padding: 0 0.375rem; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--text-2); }
 .status.st-deleg-working, .status.st-deleg-rework { color: var(--work); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--work) 40%, var(--line-2)); font-weight: 500; }
 .status.st-deleg-needs_you { color: var(--signal); background: var(--signal-bg); box-shadow: none; font-weight: 600; }
 .status.st-deleg-failed { color: var(--danger); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 45%, var(--line-2)); }
-.status.st-deleg-accepted { color: #6fd396; box-shadow: none; }
-.status.st-deleg-canceled { color: var(--text-3); box-shadow: none; }
+.status.st-deleg-accepted { padding: 0; color: color-mix(in srgb, #6fd396 52%, var(--text-3)); box-shadow: none; }
+.status.st-deleg-canceled { padding: 0; color: var(--text-3); box-shadow: none; }
 .pane-delegation {
   flex: none; height: 1.375rem; padding: 0 0.5rem; border-radius: 999px; font-size: 0.75rem; line-height: 1.375rem; white-space: nowrap;
   color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-2);
@@ -1389,3 +1413,37 @@ kbd {
 .delegation-item-line { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); }
 .delegation-item-elapsed { flex: none; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .delegation-item-steps { display: flex; flex-direction: column; gap: 0.1875rem; padding-left: 1.3125rem; }
+
+/* Context menu (projects & files) */
+.ctx-menu {
+  position: fixed; z-index: 90;
+  min-width: 13.5rem; max-width: 21rem; max-height: calc(100vh - 1rem); overflow-y: auto; outline: none;
+  display: flex; flex-direction: column; padding: 0.25rem;
+  background: rgb(22, 24, 28); border: 1px solid var(--line-2); border-radius: 0.5rem;
+  box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .55);
+  user-select: none;
+}
+.ctx-item {
+  display: flex; align-items: center; gap: 0.75rem; width: 100%;
+  padding: 0.3125rem 0.5625rem; border: 0; border-radius: 0.3125rem;
+  background: transparent; color: var(--text); font-size: 0.78125rem; line-height: 1.35;
+  text-align: left; cursor: pointer;
+}
+.ctx-item:hover:not(:disabled), .ctx-item:focus-visible:not(:disabled) {
+  background: var(--active); color: var(--text); outline: none;
+}
+.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger:hover:not(:disabled), .ctx-item.danger:focus-visible:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 15%, var(--active)); color: var(--danger);
+}
+.ctx-item:disabled { opacity: .4; cursor: default; }
+.ctx-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-hint { flex: none; color: var(--text-3); font-size: 0.6875rem; white-space: nowrap; }
+.ctx-sep { height: 1px; margin: 0.25rem 0.375rem; background: var(--line); flex: none; }
+.group-head.ctx-active, .tree-row.ctx-active, .change-row.ctx-active {
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--work) 55%, var(--line-2));
+}
+.insp-filepath.ctx-active { color: var(--text); text-decoration: underline dotted var(--work); }
+.tree-row.is-cut { opacity: .48; }
+.ctx-prompt-dialog { width: min(25rem, calc(100vw - 2rem)); }

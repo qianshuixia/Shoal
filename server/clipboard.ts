@@ -30,3 +30,46 @@ export function clipboardFiles(): Promise<string[]> {
     });
   });
 }
+
+const WRITE_SCRIPT_WIN = [
+  'Add-Type -AssemblyName System.Windows.Forms;',
+  '$col = New-Object System.Collections.Specialized.StringCollection;',
+  '$raw = [Environment]::GetEnvironmentVariable("SHOAL_CLIP_PATHS");',
+  'foreach ($p in ($raw -split "`n")) { if ($p) { [void]$col.Add($p) } }',
+  'if ($col.Count -gt 0) { [System.Windows.Forms.Clipboard]::SetFileDropList($col) }',
+].join(' ');
+
+const WRITE_SCRIPT_MAC = [
+  "ObjC.import('AppKit');",
+  "ObjC.import('Foundation');",
+  'var raw = $.NSProcessInfo.processInfo.environment.objectForKey("SHOAL_CLIP_PATHS").js || "";',
+  'var lines = raw.split("\\n").filter(Boolean);',
+  'var pb = $.NSPasteboard.generalPasteboard;',
+  'pb.clearContents;',
+  'var arr = $.NSMutableArray.alloc.init;',
+  'for (var i = 0; i < lines.length; i++) arr.addObject($.NSURL.fileURLWithPath(lines[i]));',
+  'if (lines.length > 0) pb.writeObjects(arr);',
+].join('\n');
+
+export function writeClipboardFiles(paths: string[]): Promise<void> {
+  const clean = paths.map((p) => p.trim()).filter(Boolean);
+  if (clean.length === 0) return Promise.resolve();
+  // Never touch the host clipboard during automated tests.
+  if (process.env.WORKBENCH_OPEN_LOG || process.env.WORKBENCH_FAKE_AGENT === '1') return Promise.resolve();
+  const env = { ...process.env, SHOAL_CLIP_PATHS: clean.join('\n') };
+  if (process.platform === 'darwin') {
+    return new Promise((resolve, reject) => {
+      execFile('osascript', ['-l', 'JavaScript', '-e', WRITE_SCRIPT_MAC], { env, timeout: 5000 }, (err) => {
+        if (err) reject(new Error(`写入剪贴板失败：${err.message}`));
+        else resolve();
+      });
+    });
+  }
+  if (process.platform !== 'win32') return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', WRITE_SCRIPT_WIN], { env, windowsHide: true, timeout: 5000 }, (err) => {
+      if (err) reject(new Error(`写入剪贴板失败：${err.message}`));
+      else resolve();
+    });
+  });
+}

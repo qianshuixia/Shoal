@@ -280,6 +280,17 @@ test('activity uses the same paint row through status changes, popovers and task
   await expect(p0).toHaveAttribute('data-session-id', other.id);
   await expect(hud).toHaveCount(0);
   await expect(paintRow).toHaveAttribute('data-occupied', 'false');
+  const statusColors = await paintRow.evaluate((el) => {
+    const parseRgb = (s: string) => s.match(/\d+/g)?.slice(0, 3).map(Number) ?? [];
+    const statusBg = getComputedStyle(el.parentElement!).backgroundColor;
+    const paneBg = getComputedStyle(el.closest('.pane')!).backgroundColor;
+    const idleBg = getComputedStyle(el).backgroundColor;
+    return { statusBg, paneBg, idleBg, statusRgb: parseRgb(statusBg), idleRgb: parseRgb(idleBg) };
+  });
+  expect(statusColors.statusBg).toBe(statusColors.paneBg);
+  // Keep a distinct idle background to force WebView2 repaint on vacate, while staying visually indistinguishable (<= 2/255).
+  expect(statusColors.idleBg).not.toBe(statusColors.statusBg);
+  expect(Math.max(...statusColors.idleRgb.map((c, i) => Math.abs(c - statusColors.statusRgb[i]!)))).toBeLessThanOrEqual(2);
   expect(await rowHandle?.evaluate((element) => element.isConnected)).toBe(true);
   expect(await paintRow.boundingBox()).toEqual(hudBox);
   expect(await p0.locator('.pane-body').boundingBox()).toEqual(terminalBox);

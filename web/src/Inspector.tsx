@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  ChangedFile, ChangeStatus, DiffPayload, FileListResult, FilePayload, GitInfo, Project, ProjectChanges, TreeEntry, TreeListing, WriteFileResult,
+  ChangedFile, ChangeStatus, DiffPayload, FileListResult, FilePayload, FsCreateResult, FsDeleteResult, FsPasteResult, FsRenameResult, GitInfo, OpenMode, Project, ProjectChanges, TreeEntry, TreeListing, WriteFileResult,
 } from '../../shared/protocol.ts';
 import { CodeEditor, type JumpTarget } from './Editor.tsx';
 import { MarkdownPreview } from './MarkdownPreview.tsx';
+import {
+  ContextMenu, NamePromptDialog, contextMenuPointForElement, copyText, isContextMenuKey, isMacClient, joinProjectPath,
+  type ContextMenuEntry, type ContextMenuState, type FsClipboardItem, type FsMutationEvent, type NamePromptConfig,
+} from './ContextMenu.tsx';
 
 export type InspectorTab = 'changes' | 'files';
 
@@ -22,6 +26,12 @@ export interface InspectorProps {
   git: GitInfo | null;
   watchRev: number;
   openRequest: InspectOpenRequest | null;
+  fsClipboard: FsClipboardItem | null;
+  onSetFsClipboard: (item: FsClipboardItem | null) => void;
+  fsMutation: FsMutationEvent | null;
+  dirtyGuardRef?: React.MutableRefObject<((pid: string, pathPrefix: string) => boolean) | null>;
+  canSendToTerminal: boolean;
+  onSendPathToTerminal: (rawPath: string) => void;
   onSelectProject: (projectId: string) => void;
   onClose: () => void;
   onNotice: (msg: string) => void;
@@ -141,7 +151,7 @@ function useVirtualContainer(ref: React.RefObject<HTMLDivElement | null>, enable
 }
 
 export function Inspector({
-  project, projects, git, watchRev, openRequest, onSelectProject, onClose, onNotice,
+  project, projects, git, watchRev, openRequest, fsClipboard, onSetFsClipboard, fsMutation, dirtyGuardRef, canSendToTerminal, onSendPathToTerminal, onSelectProject, onClose, onNotice,
 }: InspectorProps) {
   const memRef = useRef<Map<string, ProjectViewMem>>(new Map());
   const rootRef = useRef<HTMLElement>(null);
@@ -179,6 +189,12 @@ export function Inspector({
   const [saving, setSaving] = useState(false);
   const [loadingDoc, setLoadingDoc] = useState(false);
   const [jump, setJump] = useState<JumpTarget | null>(null);
+
+  // Context menu & name prompt modal (new file/folder, rename)
+  const [ctxMenu, setCtxMenu] = useState<(ContextMenuState & { targetKey: string }) | null>(null);
+  const [namePrompt, setNamePrompt] = useState<NamePromptConfig | null>(null);
+  const pendingScrollPathRef = useRef<string | null>(null);
+  const handledFsMutationSeqRef = useRef(0);
 
   // Ctrl+P quick file finder
   const [finderOpen, setFinderOpen] = useState(false);
@@ -224,6 +240,21 @@ export function Inspector({
     if (!liveRef.current.isDirty) return true;
     return confirm('当前打开的文件有未保存修改，确定放弃这些修改吗？');
   }, []);
+
+  useEffect(() => {
+    if (!dirtyGuardRef) return;
+    dirtyGuardRef.current = (pid: string, pathPrefix: string) => {
+      const s = liveRef.current;
+      if (!s.isDirty || s.projectId !== pid || !s.activePath) return true;
+      if (s.activePath === pathPrefix || s.activePath.startsWith(`${pathPrefix}/`)) {
+        return confirmDiscardDraft();
+      }
+      return true;
+    };
+    return () => {
+      dirtyGuardRef.current = null;
+    };
+  }, [dirtyGuardRef, confirmDiscardDraft]);
 
   // Fetch changes list for a project with single-flight abort & race protection
   const fetchChanges = useCallback(async (pid: string, autoPick = false, force = false) => {
@@ -488,17 +519,17 @@ export function Inspector({
     }
   }, [openRequest, projectId, fetchChanges, fetchTreeDir]);
 
-  // Load active document whenever tab or selected path changes
+  // Load active document only when the active tab's selected path actually changes (updating an inactive tab's path must never wipe the active draft).
   useEffect(() => {
     if (!projectId) return;
     if (tab === 'changes') {
-      if (changePath) void loadDiffFile(projectId, changePath, false);
+      if (activePath) void loadDiffFile(projectId, activePath, false);
       else setDiffData(null);
     } else {
-      if (filePath) void loadTreeFile(projectId, filePath, false);
+      if (activePath) void loadTreeFile(projectId, activePath, false);
       else setFileData(null);
     }
-  }, [projectId, tab, changePath, filePath, loadDiffFile, loadTreeFile]);
+  }, [projectId, tab, activePath, loadDiffFile, loadTreeFile]);
 
   // Check if disk mtime changed externally (Agent edit, terminal command, etc.)
   const checkExternalUpdate = useCallback(async () => {
@@ -639,24 +670,330 @@ export function Inspector({
     }
   };
 
-  // Open current file (or project folder) in external editor (VS Code)
-  const openExternal = async () => {
+  // Open file or directory in external editor / Explorer
+  const openInSystem = useCallback(async (relPosix: string, mode: OpenMode = 'default') => {
     if (!project) return;
-    const target = activePath ? `${project.path}\\${activePath.replace(/\//g, '\\')}` : project.path;
+    const target = relPosix ? joinProjectPath(project.path, relPosix) : project.path;
     try {
       const res = await fetch('/api/open', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ target }),
+        body: JSON.stringify({ target, mode }),
       });
       if (!res.ok) {
         const json = (await res.json().catch(() => ({}))) as { error?: string };
-        onNotice(json.error ?? `打开外部编辑器失败 (${res.status})`);
+        onNotice(json.error ?? `打开失败 (${res.status})`);
       }
     } catch (e) {
-      onNotice(`打开外部编辑器失败：${(e as Error).message}`);
+      onNotice(`打开失败：${(e as Error).message}`);
     }
-  };
+  }, [project, onNotice]);
+
+  // Open current file (or project folder) in external editor (VS Code)
+  const openExternal = () => openInSystem(activePath ?? '', 'default');
+
+  const refreshTreeDirs = useCallback((pid: string, dirs: string[]) => {
+    const uniq = new Set(dirs);
+    for (const d of uniq) void fetchTreeDir(pid, d);
+    if (liveRef.current.tab === 'changes') void fetchChanges(pid, false, true);
+    else setChangesStale(true);
+  }, [fetchTreeDir, fetchChanges]);
+
+  const copyPathValue = useCallback(async (text: string, label: string) => {
+    const ok = await copyText(text);
+    onNotice(ok ? `已复制${label}` : `复制${label}失败`);
+  }, [onNotice]);
+
+  const copyEntry = useCallback((relPosix: string, kind: 'file' | 'dir', mode: 'copy' | 'cut') => {
+    if (!projectId) return;
+    const name = splitDirBase(relPosix).base;
+    onSetFsClipboard({ mode, projectId, path: relPosix, name, kind });
+    if (mode === 'copy') {
+      void fetch('/api/clipboard/files', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ projectId, path: relPosix }),
+      }).catch(() => {});
+    }
+    onNotice(`${mode === 'copy' ? '已复制' : '已剪切'}「${name}」`);
+  }, [projectId, onSetFsClipboard, onNotice]);
+
+  const applyPathMutation = useCallback((
+    targetPid: string,
+    oldPath: string,
+    newPath: string | null,
+    extraRefreshDirs: string[] = [],
+  ) => {
+    const matches = (p: string | null) => !!p && (p === oldPath || p.startsWith(`${oldPath}/`));
+    const remap = (p: string | null): string | null => {
+      if (!p) return p;
+      if (!matches(p)) return p;
+      if (newPath === null) return null;
+      return p === oldPath ? newPath : `${newPath}${p.slice(oldPath.length)}`;
+    };
+
+    // Always synchronize remembered state for non-active projects too.
+    const saved = memRef.current.get(targetPid);
+    if (saved) {
+      const nextExp = new Set<string>();
+      for (const d of saved.expanded) {
+        const mapped = remap(d);
+        if (mapped) nextExp.add(mapped);
+      }
+      memRef.current.set(targetPid, {
+        ...saved,
+        changeFile: remap(saved.changeFile),
+        treeFile: remap(saved.treeFile),
+        expanded: nextExp,
+      });
+    }
+
+    if (liveRef.current.projectId !== targetPid) return;
+
+    const activeAffected = matches(liveRef.current.activePath);
+    if (newPath === null) {
+      if (matches(filePath)) {
+        setFilePath(null);
+        setFileData(null);
+      }
+      if (matches(changePath)) {
+        setChangePath(null);
+        setDiffData(null);
+      }
+      if (activeAffected) {
+        setDraft('');
+        setSavedText('');
+        setConflict(false);
+      }
+    } else {
+      setFilePath((p) => remap(p));
+      setChangePath((p) => remap(p));
+    }
+
+    const dirsToReload = new Set<string>(extraRefreshDirs);
+    dirsToReload.add(splitDirBase(oldPath).dir);
+    if (newPath !== null) dirsToReload.add(splitDirBase(newPath).dir);
+
+    const nextExpanded = new Set<string>();
+    for (const d of expandedRef.current) {
+      const mapped = remap(d);
+      if (mapped) {
+        nextExpanded.add(mapped);
+        if (matches(d)) dirsToReload.add(mapped);
+      }
+    }
+    for (const d of extraRefreshDirs) {
+      if (d) nextExpanded.add(d);
+    }
+    setExpanded(nextExpanded);
+
+    // Drop stale treeMap cache entries under oldPath before reloading remapped directories.
+    setTreeMap((prev) => {
+      const next: Record<string, TreeEntry[]> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        if (!matches(k)) next[k] = v;
+      }
+      return next;
+    });
+    refreshTreeDirs(targetPid, [...dirsToReload]);
+  }, [filePath, changePath, refreshTreeDirs]);
+
+  // Synchronize source/target Inspector state when a sidebar project context-menu paste/move completes.
+  useEffect(() => {
+    if (!fsMutation || fsMutation.seq === handledFsMutationSeqRef.current) return;
+    handledFsMutationSeqRef.current = fsMutation.seq;
+    if (fsMutation.kind === 'move' && fsMutation.sourceProjectId && fsMutation.sourcePath) {
+      const sameProject = fsMutation.sourceProjectId === fsMutation.targetProjectId;
+      applyPathMutation(
+        fsMutation.sourceProjectId,
+        fsMutation.sourcePath,
+        sameProject ? (fsMutation.movedTo ?? fsMutation.sourcePath) : null,
+        sameProject ? [fsMutation.targetDir] : [],
+      );
+      if (!sameProject && liveRef.current.projectId === fsMutation.targetProjectId) {
+        refreshTreeDirs(fsMutation.targetProjectId, [fsMutation.targetDir]);
+      }
+    } else if (liveRef.current.projectId === fsMutation.targetProjectId) {
+      refreshTreeDirs(fsMutation.targetProjectId, [fsMutation.targetDir]);
+    }
+  }, [fsMutation, applyPathMutation, refreshTreeDirs]);
+
+  const pasteIntoDir = useCallback(async (targetDir: string, source: 'internal' | 'system') => {
+    if (!projectId || !project) return;
+    try {
+      let body: Record<string, unknown>;
+      let wasCut = false;
+      let cutSourceProjectId = '';
+      let cutSourcePath = '';
+      if (source === 'internal' && fsClipboard) {
+        wasCut = fsClipboard.mode === 'cut';
+        cutSourceProjectId = fsClipboard.projectId;
+        cutSourcePath = fsClipboard.path;
+        if (wasCut && cutSourceProjectId === projectId && activePath
+          && (activePath === cutSourcePath || activePath.startsWith(`${cutSourcePath}/`))) {
+          if (!confirmDiscardDraft()) return;
+        }
+        body = {
+          mode: fsClipboard.mode,
+          targetDir,
+          sourceProjectId: fsClipboard.projectId,
+          sourcePath: fsClipboard.path,
+        };
+      } else {
+        const clipRes = await fetch('/api/clipboard/files');
+        const clipJson = (await clipRes.json().catch(() => ({}))) as { paths?: string[]; error?: string };
+        const externalPaths = clipRes.ok && Array.isArray(clipJson.paths) ? clipJson.paths : [];
+        if (externalPaths.length === 0) {
+          onNotice('剪贴板中没有可粘贴的文件');
+          return;
+        }
+        body = { mode: 'copy', targetDir, externalPaths };
+      }
+
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/fs/paste`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const json = (await res.json().catch(() => ({}))) as FsPasteResult & { error?: string };
+      if (!res.ok) {
+        onNotice(json.error ?? `粘贴失败 (${res.status})`);
+        return;
+      }
+      if (wasCut) {
+        onSetFsClipboard(null);
+        if (!json.skipped) {
+          const sameProj = cutSourceProjectId === projectId;
+          applyPathMutation(
+            cutSourceProjectId,
+            cutSourcePath,
+            sameProj ? (json.paths[0] ?? cutSourcePath) : null,
+            sameProj ? [targetDir] : [],
+          );
+          if (!sameProj) {
+            if (targetDir) setExpanded((prev) => new Set(prev).add(targetDir));
+            refreshTreeDirs(projectId, [targetDir]);
+          }
+        }
+      } else {
+        if (targetDir) {
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            next.add(targetDir);
+            return next;
+          });
+        }
+        refreshTreeDirs(projectId, [targetDir]);
+      }
+      if (json.skipped) {
+        onNotice('文件已在当前目录，未移动');
+      } else if (json.paths.length === 1) {
+        onNotice(`${wasCut ? '已移动' : '已粘贴'}「${splitDirBase(json.paths[0]).base}」`);
+      } else {
+        onNotice(`已粘贴 ${json.paths.length} 个项目`);
+      }
+    } catch (e) {
+      onNotice(`粘贴失败：${(e as Error).message}`);
+    }
+  }, [projectId, project, fsClipboard, activePath, confirmDiscardDraft, onSetFsClipboard, applyPathMutation, refreshTreeDirs, onNotice]);
+
+  const promptCreate = useCallback((parentDir: string, kind: 'file' | 'dir') => {
+    if (!projectId) return;
+    if (kind === 'file' && !confirmDiscardDraft()) return;
+    const isDir = kind === 'dir';
+    setNamePrompt({
+      title: isDir ? '新建文件夹' : '新建文件',
+      label: parentDir ? `在 ${parentDir}/ 中创建` : '在项目根目录创建',
+      placeholder: isDir ? '例如 components' : '例如 notes.md',
+      initialValue: '',
+      submitLabel: '创建',
+      onSubmit: async (name) => {
+        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/fs/create`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ parentDir, name, kind }),
+        });
+        const json = (await res.json().catch(() => ({}))) as FsCreateResult & { error?: string };
+        if (!res.ok) return json.error ?? `创建失败 (${res.status})`;
+        if (parentDir) {
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            next.add(parentDir);
+            return next;
+          });
+        }
+        refreshTreeDirs(projectId, [parentDir]);
+        if (kind === 'file') {
+          pendingScrollPathRef.current = json.path;
+          setTab('files');
+          setFilePath(json.path);
+          if (isMarkdownPath(json.path)) setMdMode('source');
+        }
+        onNotice(`已创建${isDir ? '文件夹' : '文件'}「${name}」`);
+        return null;
+      },
+    });
+  }, [projectId, confirmDiscardDraft, refreshTreeDirs, onNotice]);
+
+  const promptRename = useCallback((relPosix: string, kind: 'file' | 'dir') => {
+    if (!projectId) return;
+    const affectsOpen = activePath === relPosix || (!!activePath && activePath.startsWith(`${relPosix}/`));
+    if (affectsOpen && !confirmDiscardDraft()) return;
+    const { dir: parentDir, base } = splitDirBase(relPosix);
+    setNamePrompt({
+      title: kind === 'dir' ? '重命名文件夹' : '重命名文件',
+      label: `原路径：${relPosix}`,
+      initialValue: base,
+      submitLabel: '重命名',
+      selectStem: kind === 'file',
+      onSubmit: async (newName) => {
+        if (newName === base) return null;
+        const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/fs/rename`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ path: relPosix, newName }),
+        });
+        const json = (await res.json().catch(() => ({}))) as FsRenameResult & { error?: string };
+        if (!res.ok) return json.error ?? `重命名失败 (${res.status})`;
+        applyPathMutation(projectId, json.oldPath, json.newPath, [parentDir]);
+        if (fsClipboard && fsClipboard.projectId === projectId && (fsClipboard.path === json.oldPath || fsClipboard.path.startsWith(`${json.oldPath}/`))) {
+          onSetFsClipboard(null);
+        }
+        onNotice(`已重命名为「${newName}」`);
+        return null;
+      },
+    });
+  }, [projectId, activePath, confirmDiscardDraft, fsClipboard, onSetFsClipboard, applyPathMutation, onNotice]);
+
+  const deleteEntry = useCallback(async (relPosix: string, kind: 'file' | 'dir') => {
+    if (!projectId) return;
+    const affectsActive = !!activePath && (activePath === relPosix || activePath.startsWith(`${relPosix}/`));
+    if (affectsActive && !confirmDiscardDraft()) return;
+    const msg = kind === 'dir'
+      ? `确定删除文件夹「${relPosix}」及其全部内容吗？删除后无法恢复。`
+      : `确定删除文件「${relPosix}」吗？删除后无法恢复。`;
+    if (!confirm(msg)) return;
+    try {
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/fs/delete`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: relPosix }),
+      });
+      const json = (await res.json().catch(() => ({}))) as FsDeleteResult & { error?: string };
+      if (!res.ok) {
+        onNotice(json.error ?? `删除失败 (${res.status})`);
+        return;
+      }
+      applyPathMutation(projectId, relPosix, null, [splitDirBase(relPosix).dir]);
+      if (fsClipboard && fsClipboard.projectId === projectId
+        && (fsClipboard.path === relPosix || fsClipboard.path.startsWith(`${relPosix}/`))) {
+        onSetFsClipboard(null);
+      }
+      onNotice(`已删除「${splitDirBase(relPosix).base}」`);
+    } catch (e) {
+      onNotice(`删除失败：${(e as Error).message}`);
+    }
+  }, [projectId, activePath, confirmDiscardDraft, fsClipboard, onSetFsClipboard, applyPathMutation, onNotice]);
 
   // Open Ctrl+P quick file finder
   const openFinder = useCallback(async () => {
@@ -706,9 +1043,10 @@ export function Inspector({
       .map((x) => x.f);
   }, [allFiles, finderQuery]);
 
-  const pickFileFromTreeOrFinder = useCallback((relPosix: string, line?: number) => {
+  const pickFileFromTreeOrFinder = useCallback((relPosix: string, line?: number, scrollIntoView = false) => {
     if (relPosix !== filePath && !confirmDiscardDraft()) return;
     setFinderOpen(false);
+    if (scrollIntoView) pendingScrollPathRef.current = relPosix;
     setTab('files');
     setFilePath(relPosix);
     if (isMarkdownPath(relPosix)) {
@@ -744,6 +1082,172 @@ export function Inspector({
       return next;
     });
     if (willOpen && projectId) void fetchTreeDir(projectId, dirPosix);
+  };
+
+  const revealFileLabel = isMacClient() ? '在访达中显示' : '在文件资源管理器中显示';
+  const revealDirLabel = isMacClient() ? '在访达中打开' : '在文件资源管理器中打开';
+  const buildPasteEntries = (targetDir: string, hint?: string): ContextMenuEntry[] => (
+    fsClipboard
+      ? [
+        {
+          id: 'paste',
+          label: `${fsClipboard.mode === 'cut' ? '粘贴并移动' : '粘贴'}「${fsClipboard.name}」`,
+          hint,
+          onSelect: () => void pasteIntoDir(targetDir, 'internal'),
+        },
+        {
+          id: 'paste-system',
+          label: '粘贴系统剪贴板文件',
+          hint,
+          onSelect: () => void pasteIntoDir(targetDir, 'system'),
+        },
+      ]
+      : [
+        {
+          id: 'paste-system',
+          label: '粘贴系统剪贴板文件',
+          hint,
+          onSelect: () => void pasteIntoDir(targetDir, 'system'),
+        },
+      ]
+  );
+
+  const openTreeEntryMenuAt = (x: number, y: number, entry: TreeEntry) => {
+    if (!project) return;
+    const isDir = entry.kind === 'dir';
+    const absPath = joinProjectPath(project.path, entry.path);
+    const pasteTargetDir = isDir ? entry.path : splitDirBase(entry.path).dir;
+    const items: ContextMenuEntry[] = [
+      ...(isDir ? [
+        { id: 'new-file', label: '新建文件…', onSelect: () => promptCreate(entry.path, 'file') },
+        { id: 'new-dir', label: '新建文件夹…', onSelect: () => promptCreate(entry.path, 'dir') },
+        { kind: 'sep' as const },
+      ] : []),
+      { id: 'copy', label: '复制', onSelect: () => copyEntry(entry.path, entry.kind, 'copy') },
+      { id: 'cut', label: '剪切', onSelect: () => copyEntry(entry.path, entry.kind, 'cut') },
+      ...buildPasteEntries(pasteTargetDir, isDir ? undefined : '当前目录'),
+      { kind: 'sep' },
+      { id: 'copy-abs-path', label: '复制绝对路径', onSelect: () => void copyPathValue(absPath, '绝对路径') },
+      { id: 'copy-rel-path', label: '复制相对路径', onSelect: () => void copyPathValue(entry.path, '相对路径') },
+      {
+        id: 'send-to-term',
+        label: '发送路径到当前终端',
+        disabled: !canSendToTerminal,
+        onSelect: () => onSendPathToTerminal(entry.path),
+      },
+      { kind: 'sep' },
+      { id: 'reveal', label: isDir ? revealDirLabel : revealFileLabel, onSelect: () => void openInSystem(entry.path, 'reveal') },
+      { id: 'open-editor', label: '在外部编辑器中打开', onSelect: () => void openInSystem(entry.path, 'editor') },
+      { kind: 'sep' },
+      { id: 'rename', label: '重命名…', onSelect: () => promptRename(entry.path, entry.kind) },
+      { id: 'delete', label: '删除', danger: true, onSelect: () => void deleteEntry(entry.path, entry.kind) },
+    ];
+    setCtxMenu({ x, y, items, targetKey: `tree:${entry.path}` });
+  };
+
+  const openTreeEntryMenu = (e: React.MouseEvent, entry: TreeEntry) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openTreeEntryMenuAt(e.clientX, e.clientY, entry);
+  };
+
+  const openTreeRootMenu = (e: React.MouseEvent) => {
+    if (!project) return;
+    if ((e.target as Element | null)?.closest('.tree-row, .tree-search-bar')) return;
+    e.preventDefault();
+    const items: ContextMenuEntry[] = [
+      { id: 'new-file', label: '新建文件…', onSelect: () => promptCreate('', 'file') },
+      { id: 'new-dir', label: '新建文件夹…', onSelect: () => promptCreate('', 'dir') },
+      ...buildPasteEntries(''),
+      { kind: 'sep' },
+      { id: 'copy-abs-path', label: '复制项目路径', onSelect: () => void copyPathValue(project.path, '项目路径') },
+      { id: 'reveal', label: revealDirLabel, onSelect: () => void openInSystem('', 'reveal') },
+      { id: 'open-editor', label: '在外部编辑器中打开', onSelect: () => void openInSystem('', 'editor') },
+      { kind: 'sep' },
+      { id: 'refresh', label: '刷新文件树', onSelect: manualRefresh },
+    ];
+    setCtxMenu({ x: e.clientX, y: e.clientY, items, targetKey: 'tree-root' });
+  };
+
+  const openChangeEntryMenuAt = (x: number, y: number, item: ChangedFile) => {
+    if (!project) return;
+    const deleted = item.status === 'D';
+    const absPath = joinProjectPath(project.path, item.path);
+    const parentDir = splitDirBase(item.path).dir;
+    const items: ContextMenuEntry[] = [
+      ...(!deleted ? [
+        { id: 'locate-tree', label: '在文件树中定位', onSelect: () => pickFileFromTreeOrFinder(item.path, undefined, true) },
+        { id: 'copy', label: '复制', onSelect: () => copyEntry(item.path, 'file', 'copy') },
+        { kind: 'sep' as const },
+      ] : []),
+      { id: 'copy-abs-path', label: '复制绝对路径', onSelect: () => void copyPathValue(absPath, '绝对路径') },
+      { id: 'copy-rel-path', label: '复制相对路径', onSelect: () => void copyPathValue(item.path, '相对路径') },
+      {
+        id: 'send-to-term',
+        label: '发送路径到当前终端',
+        disabled: !canSendToTerminal,
+        onSelect: () => onSendPathToTerminal(item.path),
+      },
+      { kind: 'sep' },
+      {
+        id: 'reveal',
+        label: deleted ? (isMacClient() ? '在访达中打开所在目录' : '在文件资源管理器中打开所在目录') : revealFileLabel,
+        onSelect: () => void openInSystem(deleted ? parentDir : item.path, 'reveal'),
+      },
+      ...(!deleted ? [
+        { id: 'open-editor', label: '在外部编辑器中打开', onSelect: () => void openInSystem(item.path, 'editor') },
+      ] : []),
+      { kind: 'sep' },
+      {
+        id: 'discard',
+        label: item.status === '?' ? '删除未跟踪文件' : '放弃未提交改动',
+        danger: true,
+        onSelect: () => void discardSingle(item),
+      },
+    ];
+    setCtxMenu({ x, y, items, targetKey: `change:${item.path}` });
+  };
+
+  const openChangeEntryMenu = (e: React.MouseEvent, item: ChangedFile) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openChangeEntryMenuAt(e.clientX, e.clientY, item);
+  };
+
+  const openFilebarMenu = (e: React.MouseEvent) => {
+    if (!project || !activePath) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const absPath = joinProjectPath(project.path, activePath);
+    const missing = (tab === 'changes' && diffData?.status === 'D') || (tab === 'files' && fileData?.kind === 'missing');
+    const parentDir = splitDirBase(activePath).dir;
+    const items: ContextMenuEntry[] = [
+      ...(!missing ? [
+        { id: 'copy', label: '复制', onSelect: () => copyEntry(activePath, 'file', 'copy') },
+        { kind: 'sep' as const },
+      ] : []),
+      { id: 'copy-abs-path', label: '复制绝对路径', onSelect: () => void copyPathValue(absPath, '绝对路径') },
+      { id: 'copy-rel-path', label: '复制相对路径', onSelect: () => void copyPathValue(activePath, '相对路径') },
+      {
+        id: 'send-to-term',
+        label: '发送路径到当前终端',
+        disabled: !canSendToTerminal,
+        onSelect: () => onSendPathToTerminal(activePath),
+      },
+      { kind: 'sep' },
+      {
+        id: 'reveal',
+        label: missing ? (isMacClient() ? '在访达中打开所在目录' : '在文件资源管理器中打开所在目录') : revealFileLabel,
+        onSelect: () => void openInSystem(missing ? parentDir : activePath, 'reveal'),
+      },
+      ...(!missing ? [
+        { id: 'open-editor', label: '在外部编辑器中打开', onSelect: () => void openInSystem(activePath, 'editor') },
+        { kind: 'sep' as const },
+        { id: 'rename', label: '重命名…', onSelect: () => promptRename(activePath, 'file') },
+        { id: 'delete', label: '删除', danger: true, onSelect: () => void deleteEntry(activePath, 'file') },
+      ] : []),
+    ];
+    setCtxMenu({ x: e.clientX, y: e.clientY, items, targetKey: 'filebar' });
   };
 
   const manualRefresh = () => {
@@ -820,9 +1324,25 @@ export function Inspector({
   const { setScrollTop: setTreeScrollTop } = treeVirt;
 
   useEffect(() => {
+    if (pendingScrollPathRef.current && tab === 'files') return;
     setTreeScrollTop(0);
     if (treeScrollRef.current) treeScrollRef.current.scrollTop = 0;
   }, [projectId, tab, setTreeScrollTop]);
+
+  // Scroll the file tree to bring a located/created entry into view (works for both plain and virtualized trees).
+  useEffect(() => {
+    const target = pendingScrollPathRef.current;
+    if (!target || tab !== 'files') return;
+    const idx = flatTreeRows.findIndex((r) => r.entry.path === target);
+    if (idx === -1) return;
+    pendingScrollPathRef.current = null;
+    const scroller = treeScrollRef.current;
+    if (!scroller) return;
+    const rowPx = TREE_ROW_REM * (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16);
+    const desiredTop = Math.max(0, idx * rowPx - Math.max(0, scroller.clientHeight - rowPx) / 2);
+    scroller.scrollTop = desiredTop;
+    setTreeScrollTop(desiredTop);
+  }, [tab, flatTreeRows, setTreeScrollTop]);
 
   const treeSlice = useMemo(
     () => (isVirtualTree
@@ -1048,10 +1568,19 @@ export function Inspector({
                           return (
                             <div
                               key={item.path}
-                              className={`change-row ${on ? 'on' : ''}`}
+                              className={`change-row ${on ? 'on' : ''} ${ctxMenu?.targetKey === `change:${item.path}` ? 'ctx-active' : ''}`}
+                              tabIndex={0}
                               data-testid="change-entry"
                               data-path={item.path}
                               data-status={item.status}
+                              onContextMenu={(e) => openChangeEntryMenu(e, item)}
+                              onKeyDown={(e) => {
+                                if (isContextMenuKey(e)) {
+                                  e.preventDefault();
+                                  const pt = contextMenuPointForElement(e.currentTarget);
+                                  openChangeEntryMenuAt(pt.x, pt.y, item);
+                                }
+                              }}
                               onClick={() => {
                                 if (changePath === item.path) return;
                                 if (!confirmDiscardDraft()) return;
@@ -1093,7 +1622,7 @@ export function Inspector({
                   </>
                 )
               ) : (
-                <div className="insp-tree" data-testid="insp-tree">
+                <div className="insp-tree" data-testid="insp-tree" onContextMenu={openTreeRootMenu}>
                   <button type="button" className="tree-search-bar" data-testid="tree-search-trigger" onClick={() => void openFinder()}>
                     <svg viewBox="0 0 16 16" aria-hidden="true">
                       <circle cx="7" cy="7" r="4.25" />
@@ -1116,15 +1645,25 @@ export function Inspector({
                       {visibleTreeRows.map(({ entry, depth }) => {
                         const isOpen = entry.kind === 'dir' && expanded.has(entry.path);
                         const isSelected = entry.kind === 'file' && filePath === entry.path;
+                        const isCut = fsClipboard?.mode === 'cut' && fsClipboard.projectId === projectId && fsClipboard.path === entry.path;
+                        const isCtx = ctxMenu?.targetKey === `tree:${entry.path}`;
                         return (
                           <button
                             key={entry.path}
                             type="button"
-                            className={`tree-row ${entry.kind} ${isSelected ? 'on' : ''} ${entry.ignored ? 'ignored' : ''}`}
+                            className={`tree-row ${entry.kind} ${isSelected ? 'on' : ''} ${entry.ignored ? 'ignored' : ''} ${isCut ? 'is-cut' : ''} ${isCtx ? 'ctx-active' : ''}`}
                             style={{ paddingLeft: `${0.5 + depth * 0.8125}rem` }}
                             data-testid="tree-entry"
                             data-path={entry.path}
                             data-kind={entry.kind}
+                            onContextMenu={(e) => openTreeEntryMenu(e, entry)}
+                            onKeyDown={(e) => {
+                              if (isContextMenuKey(e)) {
+                                e.preventDefault();
+                                const pt = contextMenuPointForElement(e.currentTarget);
+                                openTreeEntryMenuAt(pt.x, pt.y, entry);
+                              }
+                            }}
                             onClick={() => (entry.kind === 'dir' ? toggleDir(entry.path) : pickFileFromTreeOrFinder(entry.path))}
                           >
                             {entry.kind === 'dir' ? (
@@ -1155,7 +1694,13 @@ export function Inspector({
             {activePath ? (
               <>
                 <div className="insp-filebar" data-testid="insp-filebar">
-                  <span className="insp-filepath" data-testid="insp-filepath" data-private="" title={activePath}>
+                  <span
+                    className={`insp-filepath ${ctxMenu?.targetKey === 'filebar' ? 'ctx-active' : ''}`}
+                    data-testid="insp-filepath"
+                    data-private=""
+                    title={activePath}
+                    onContextMenu={openFilebarMenu}
+                  >
                     {activePath}
                   </span>
                   {isDirty && <span className="unsaved-dot" data-testid="unsaved-dot" title="有未保存的修改">● 未保存</span>}
@@ -1430,6 +1975,8 @@ export function Inspector({
           )}
         </div>
       )}
+      <ContextMenu state={ctxMenu} onClose={() => setCtxMenu(null)} />
+      <NamePromptDialog config={namePrompt} onClose={() => setNamePrompt(null)} />
     </section>
   );
 }

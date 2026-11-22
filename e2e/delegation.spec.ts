@@ -79,8 +79,16 @@ test.describe('cross-CLI delegation e2e', () => {
     // The child's result comes back to the main task by itself.
     await expect.poll(async () => stateOf(await state(request), child.id), { timeout: 25_000 }).toBe('review');
     await expect(childRow).toHaveAttribute('data-delegation-state', 'review');
-    // Its row keeps showing the brief, not the boilerplate that opens every delegated task's prompt.
-    await expect(childRow.getByTestId('task-preview')).toContainText('build feature');
+    // Delegated rows stay compact single-line (no redundant second-line preview) and keep the brief in their tooltip.
+    await expect(childRow.getByTestId('task-preview')).toHaveCount(0);
+    await expect(childRow).toHaveAttribute('title', /build feature/);
+    // The main task can fold and unfold its active delegation subtree in one click.
+    const treeToggle = taskRow(page, main.task.id).getByTestId('delegation-tree-toggle');
+    await expect(treeToggle).toHaveAttribute('aria-expanded', 'true');
+    await treeToggle.click();
+    await expect(childRow).toHaveCount(0);
+    await treeToggle.click();
+    await expect(childRow).toHaveCount(1);
     await expect.poll(async () => delegationCards(await state(request), main.task.id, 'result').length, { timeout: 20_000 }).toBe(1);
     await expect.poll(() => fakeLines(main.session.id).some(l => l.includes(`shoal done ${handle}`)), { timeout: 20_000 }).toBe(true);
 
@@ -115,11 +123,16 @@ test.describe('cross-CLI delegation e2e', () => {
       const t = st.tasks.find(x => x.id === child.id);
       return { phase: t?.phase, outcome: t?.delegation?.outcome, status: st.sessions.find(s => s.id === child.sessionId)?.status };
     }, { timeout: 20_000 }).toEqual({ phase: 'archived', outcome: 'accepted', status: 'exited' });
-    // The closed child stays under its main task as a compact row with its outcome, not in 已归档.
+    // Closed children stay folded behind a compact toggle under their main task by default, not in 已归档.
     const closedRow = page.locator(`[data-testid="project-group"] [data-testid="task-row"][data-task-id="${child.id}"]`);
+    await expect(closedRow).toHaveCount(0);
+    const kidsToggle = page.locator('[data-testid="delegation-kids-toggle"]');
+    await expect(kidsToggle).toHaveText('1 个已完成委派');
+    await kidsToggle.click();
     await expect(closedRow).toHaveAttribute('data-nested', 'true');
     await expect(closedRow).toHaveAttribute('data-delegation-state', 'accepted');
-    await expect(closedRow.getByTestId('task-delegation-status')).toHaveText('已通过 · 第2轮');
+    await expect(closedRow.getByTestId('task-delegation-status')).toHaveText('已通过 · R2');
+    await expect(closedRow.getByTestId('task-delegation-status')).toHaveAttribute('title', '已通过 · 第2轮');
     await expect(closedRow.getByTestId('task-unarchive')).toHaveCount(0);
     await expect(page.locator(`[data-testid="archive-section"] [data-task-id="${child.id}"]`)).toHaveCount(0);
     await page.locator('.side-list').screenshot({ path: path.join(ARTIFACT_DIR, 'sidebar-closed-child.png') });

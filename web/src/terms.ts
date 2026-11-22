@@ -332,6 +332,16 @@ export function disposeExcept(keep: Set<string>): void {
   for (const id of [...registry.keys()]) if (!keep.has(id)) dispose(id);
 }
 
+// Sends plain text to a live terminal via xterm's paste channel (uses bracketed paste when supported).
+export function pasteToTerminal(id: string | null, text: string): boolean {
+  if (!id || !text) return false;
+  const entry = registry.get(id);
+  if (!entry || !entry.opened) return false;
+  entry.term.focus();
+  entry.term.paste(text);
+  return true;
+}
+
 // Move the terminal's element into `host`; term.open() runs only once per terminal.
 export function attach(id: string, host: HTMLElement): void {
   const entry = getEntry(id);

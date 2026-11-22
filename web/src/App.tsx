@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, CliToolInfo, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, GitInfo, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, ArchiveStoppedResult, Card, CliToolInfo, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, FsPasteResult, GitInfo, OpenMode, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
-import { agentLabel, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
+import { agentLabel, cleanPreviewText, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
 import { connect, send } from './ws.ts';
-import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
+import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, pasteToTerminal, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
 import type { TermGlDebug } from './terms.ts';
 import { ACTIVITY_STALL_MS, Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
+import {
+  ContextMenu, contextMenuPointForElement, copyText, formatPathForTerminal, isContextMenuKey, isMacClient,
+  type ContextMenuEntry, type ContextMenuState, type FsClipboardItem, type FsMutationEvent,
+} from './ContextMenu.tsx';
 import { matchProjectFileLink } from './linkParse.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
 import { FeedbackDialog, ForwardDialog, ProjectDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
@@ -48,8 +52,8 @@ const FILTER_KEY = 'wb.sideFilter';
 const RECENT_STOPPED_LIMIT = 2;
 // A closed delegated task stays in the main task's HUD this long, so the outcome can still be seen.
 const DELEGATION_LINGER_MS = 5 * 60_000;
-// Closed delegated tasks listed under their main task before older ones fold behind a toggle.
-const CLOSED_KIDS_SHOWN = 2;
+// Closed delegated tasks stay folded behind a single summary toggle by default so active tasks stay scannable.
+const CLOSED_KIDS_SHOWN = 0;
 const loadFilter = (): SideFilter => (localStorage.getItem(FILTER_KEY) === 'active' ? 'active' : 'all');
 function loadCollapsed(): Set<string> {
   try {
@@ -151,6 +155,11 @@ export function App() {
   const [expandedHistory, setExpandedHistory] = useState<Set<string>>(() => new Set());
   const [resumingAll, setResumingAll] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(() => localStorage.getItem(ARCHIVE_OPEN_KEY) === '1');
+  const [fsClipboard, setFsClipboard] = useState<FsClipboardItem | null>(null);
+  const [fsMutation, setFsMutation] = useState<FsMutationEvent | null>(null);
+  const fsMutationSeqRef = useRef(0);
+  const inspectorDirtyGuardRef = useRef<((pid: string, pathPrefix: string) => boolean) | null>(null);
+  const [projectCtx, setProjectCtx] = useState<(ContextMenuState & { projectId: string }) | null>(null);
 
   // Latest state for handlers registered once (WebSocket, window listeners).
   const live = useRef({ data, panes, focusedPane, layout, dialog, pinnedInspectProjectId, order });
@@ -275,6 +284,7 @@ export function App() {
     live.current.data.tasks.filter((t) => t.projectId === projectId).forEach((t) => removeTaskLocal(t.id));
     setData((d) => ({ ...d, projects: d.projects.filter((p) => p.id !== projectId) }));
     setCollapsed((c) => (c.has(projectId) ? new Set([...c].filter((x) => x !== projectId)) : c));
+    setFsClipboard((c) => (c?.projectId === projectId ? null : c));
   }, [removeTaskLocal]);
 
   const currentInspectProjectId = useCallback((): string | undefined => {
@@ -824,6 +834,155 @@ export function App() {
     });
 
   const focusedSessionId = panes[layout === 2 ? focusedPane : 0];
+  const focusedSession = focusedSessionId ? sessionsById.get(focusedSessionId) : undefined;
+  const canSendToTerminal = !!focusedSessionId && !!focusedSession && focusedSession.status !== 'exited';
+  const sendPathToTerminal = useCallback((rawPath: string) => {
+    const sid = live.current.panes[live.current.layout === 2 ? live.current.focusedPane : 0];
+    const ses = sid ? live.current.data.sessions.find((s) => s.id === sid) : undefined;
+    if (!sid || !ses || ses.status === 'exited') {
+      setNotice('当前没有可输入的活跃终端');
+      return;
+    }
+    const formatted = formatPathForTerminal(rawPath);
+    if (!formatted) {
+      setNotice('路径包含控制或特殊求值字符，已取消发送到终端（可使用「复制路径」）');
+      return;
+    }
+    if (!pasteToTerminal(sid, `${formatted} `)) {
+      setNotice('当前终端尚未就绪，无法发送路径');
+      return;
+    }
+    setNotice('已发送路径到当前终端');
+  }, []);
+
+  const openProjectPath = useCallback(async (target: string, mode: OpenMode) => {
+    try {
+      await post('/api/open', { target, mode });
+    } catch (e) {
+      setNotice(`打开失败：${(e as Error).message}`);
+    }
+  }, []);
+
+  const pasteIntoProjectRoot = useCallback(async (project: Project, source: 'internal' | 'system') => {
+    try {
+      let body: Record<string, unknown>;
+      let wasCut = false;
+      let cutSourceProjectId = '';
+      let cutSourcePath = '';
+      if (source === 'internal' && fsClipboard) {
+        wasCut = fsClipboard.mode === 'cut';
+        cutSourceProjectId = fsClipboard.projectId;
+        cutSourcePath = fsClipboard.path;
+        if (wasCut && inspectorDirtyGuardRef.current && !inspectorDirtyGuardRef.current(cutSourceProjectId, cutSourcePath)) {
+          return;
+        }
+        body = {
+          mode: fsClipboard.mode,
+          targetDir: '',
+          sourceProjectId: fsClipboard.projectId,
+          sourcePath: fsClipboard.path,
+        };
+      } else {
+        const clipRes = await fetch('/api/clipboard/files');
+        const clipJson = (await clipRes.json().catch(() => ({}))) as { paths?: string[] };
+        const externalPaths = clipRes.ok && Array.isArray(clipJson.paths) ? clipJson.paths : [];
+        if (externalPaths.length === 0) {
+          setNotice('剪贴板中没有可粘贴的文件');
+          return;
+        }
+        body = { mode: 'copy', targetDir: '', externalPaths };
+      }
+      const r = await post<FsPasteResult>(`/api/projects/${encodeURIComponent(project.id)}/fs/paste`, body);
+      if (wasCut) setFsClipboard(null);
+      setFsMutation({
+        seq: ++fsMutationSeqRef.current,
+        kind: wasCut ? 'move' : 'copy',
+        ...(wasCut ? { sourceProjectId: cutSourceProjectId, sourcePath: cutSourcePath, movedTo: r.skipped ? undefined : r.paths[0] } : {}),
+        targetProjectId: project.id,
+        targetDir: '',
+      });
+      setInspectWatchRev((n) => n + 1);
+      if (r.skipped) setNotice('文件已在项目根目录，未移动');
+      else setNotice(`${wasCut ? '已移动' : '已粘贴'} ${r.paths.length} 项到「${project.name}」根目录`);
+    } catch (e) {
+      setNotice(`粘贴失败：${(e as Error).message}`);
+    }
+  }, [fsClipboard]);
+
+  const openProjectMenuAt = (x: number, y: number, project: Project) => {
+    const projectGit = data.git[project.id] ?? null;
+    const pasteItems: ContextMenuEntry[] = fsClipboard
+      ? [
+        {
+          id: 'project-paste',
+          label: `${fsClipboard.mode === 'cut' ? '移动' : '粘贴'}「${fsClipboard.name}」到根目录`,
+          onSelect: () => void pasteIntoProjectRoot(project, 'internal'),
+        },
+        {
+          id: 'project-paste-system',
+          label: '粘贴系统剪贴板文件到根目录',
+          onSelect: () => void pasteIntoProjectRoot(project, 'system'),
+        },
+      ]
+      : [
+        {
+          id: 'project-paste-system',
+          label: '粘贴系统剪贴板文件到根目录',
+          onSelect: () => void pasteIntoProjectRoot(project, 'system'),
+        },
+      ];
+    const items: ContextMenuEntry[] = [
+      { id: 'project-files', label: '查看文件', onSelect: () => openInspectorAt(project.id, 'files') },
+      ...(projectGit ? [
+        { id: 'project-changes', label: '查看 Git 变更', hint: projectGit.dirty > 0 ? `${projectGit.dirty}` : undefined, onSelect: () => openInspectorAt(project.id, 'changes') },
+      ] : []),
+      {
+        id: 'project-new-task',
+        label: '新建任务',
+        hint: agentLabel(defaultAgentFor(data, project.id), data.cliTools),
+        onSelect: () => void quickCreate(project.id, defaultAgentFor(data, project.id)),
+      },
+      { kind: 'sep' },
+      {
+        id: 'project-reveal',
+        label: isMacClient() ? '在访达中打开' : '在文件资源管理器中打开',
+        onSelect: () => void openProjectPath(project.path, 'reveal'),
+      },
+      {
+        id: 'project-editor',
+        label: '在外部编辑器中打开',
+        onSelect: () => void openProjectPath(project.path, 'editor'),
+      },
+      { kind: 'sep' },
+      {
+        id: 'project-copy-path',
+        label: '复制项目路径',
+        onSelect: () => void copyText(project.path).then((ok) => setNotice(ok ? '已复制项目路径' : '复制路径失败')),
+      },
+      {
+        id: 'project-send-path',
+        label: '发送路径到当前终端',
+        disabled: !canSendToTerminal,
+        onSelect: () => sendPathToTerminal(project.path),
+      },
+      ...pasteItems,
+      { kind: 'sep' },
+      {
+        id: 'project-remove',
+        label: '从工作台移除项目',
+        danger: true,
+        onSelect: () => void removeProject(project),
+      },
+    ];
+    setProjectCtx({ x, y, items, projectId: project.id });
+  };
+
+  const openProjectMenu = (e: React.MouseEvent, project: Project) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openProjectMenuAt(e.clientX, e.clientY, project);
+  };
+
   const focusedTaskId = focusedSessionId ? sessionsById.get(focusedSessionId)?.taskId : undefined;
   const focusedProjectId = focusedTaskId ? tasksById.get(focusedTaskId)?.projectId : undefined;
   const visibleIds = panes.slice(0, paneCount(layout));
@@ -1035,6 +1194,9 @@ export function App() {
               defaultAgent={defaultAgentFor(data, project.id)}
               git={data.git[project.id] ?? null}
               onInspectChanges={() => openInspectorAt(project.id, 'changes')}
+              ctxActive={projectCtx?.projectId === project.id}
+              onContextMenu={(e) => openProjectMenu(e, project)}
+              onOpenContextMenuAt={(x, y) => openProjectMenuAt(x, y, project)}
               onToggle={() => toggleProject(project.id)}
               onReorder={reorderProject}
               onQuick={(agent) => void quickCreate(project.id, agent)}
@@ -1169,6 +1331,12 @@ export function App() {
               git={activeInspectProject ? (data.git[activeInspectProject.id] ?? null) : null}
               watchRev={inspectWatchRev}
               openRequest={inspectReq}
+              fsClipboard={fsClipboard}
+              onSetFsClipboard={setFsClipboard}
+              fsMutation={fsMutation}
+              dirtyGuardRef={inspectorDirtyGuardRef}
+              canSendToTerminal={canSendToTerminal}
+              onSendPathToTerminal={sendPathToTerminal}
               onSelectProject={(pid) => setPinnedInspectProjectId(pid)}
               onClose={() => switchLayout(1)}
               onNotice={setNotice}
@@ -1252,6 +1420,7 @@ export function App() {
           onFeedback={(text) => sendFeedback(tasksById.get(dialogTarget)!, text, 'new')}
         />
       )}
+      <ContextMenu state={projectCtx} onClose={() => setProjectCtx(null)} />
     </div>
   );
 }
@@ -1289,7 +1458,7 @@ function BranchChip({ git, onInspect }: { git: GitInfo; onInspect?: () => void }
   );
 }
 
-function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, cliTools, defaultAgent, git, onInspectChanges, onToggle, onReorder, onQuick, onOpen, onOpenChild, onRemove, onRemoveProject, onRename, onResume }: {
+function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, focusedId, now, filter, historyExpanded, onToggleHistory, onArchiveStopped, collapsed, agents, cliTools, defaultAgent, git, onInspectChanges, ctxActive, onContextMenu, onOpenContextMenuAt, onToggle, onReorder, onQuick, onOpen, onOpenChild, onRemove, onRemoveProject, onRename, onResume }: {
   project: Project;
   tasks: Task[];
   sessionsById: Map<string, SessionInfo>;
@@ -1307,6 +1476,9 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   defaultAgent: AgentKind;
   git: GitInfo | null;
   onInspectChanges(): void;
+  ctxActive?: boolean;
+  onContextMenu(e: React.MouseEvent): void;
+  onOpenContextMenuAt(x: number, y: number): void;
   onToggle(): void;
   onReorder(dragged: string, target: string, after: boolean): void;
   onQuick(agent: AgentKind): void;
@@ -1322,6 +1494,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   const [edge, setEdge] = useState<'before' | 'after' | null>(null); // insertion line while another project is dragged over
   const [menu, setMenu] = useState(false);
   const [expandedKids, setExpandedKids] = useState<ReadonlySet<string>>(() => new Set()); // main tasks listing every closed delegation
+  const [collapsedTrees, setCollapsedTrees] = useState<ReadonlySet<string>>(() => new Set()); // main tasks whose active delegation subtree is folded
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
   const reviewing = tasks.filter((t) => t.phase === 'review' && !t.delegation).length;
   const working = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'working').length;
@@ -1347,7 +1520,12 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   const hidden = top.length - shown.length;
   const canCollapseBack = historyExpanded && stoppedTasks.length > visibleLimit;
   const showArchiveStopped = stoppedTasks.length >= 2 || (filter === 'active' && stoppedTasks.length >= 1);
-  const row = (task: Task, nested = false) => (
+  const toggleTree = (id: string) => setCollapsedTrees((s) => {
+    const n = new Set(s);
+    if (n.has(id)) n.delete(id); else n.add(id);
+    return n;
+  });
+  const row = (task: Task, nested = false, tree?: { activeKidsCount: number; kidsCollapsed: boolean; onToggleKids(): void }) => (
     <TaskRow
       key={task.id}
       task={task}
@@ -1359,6 +1537,9 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
       paneMark={task.sessionId && visibleIds.length === 2 ? (['左', '右'] as const)[visibleIds.indexOf(task.sessionId)] : undefined}
       draggable={visibleIds.length === 2}
       now={now}
+      activeKidsCount={tree?.activeKidsCount}
+      kidsCollapsed={tree?.kidsCollapsed}
+      onToggleKids={tree?.onToggleKids}
       onOpen={nested && task.delegation ? (sid) => onOpenChild(sid, task.delegation!.parentTaskId) : onOpen}
       onRemove={() => onRemove(task)}
       onRename={(title) => onRename(task, title)}
@@ -1366,40 +1547,63 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
       onUnarchive={() => {}}
     />
   );
-  // A main task's delegated tasks, oldest dispatch first. Closed ones stay listed as compact rows; past CLOSED_KIDS_SHOWN
-  // the earlier closed ones fold behind a toggle.
-  const kidRows = (parent: Task) => {
+  // A main task's delegated tasks in a continuous vertical rail: active ones stay grouped at the top, and closed ones
+  // fold behind a single compact toggle by default so they never drown out live work.
+  const renderTaskWithKids = (parent: Task) => {
     const kids = childrenOf.get(parent.id);
-    if (!kids?.length) return [];
+    if (!kids?.length) return [row(parent)];
+    const active = kids.filter((k) => k.phase !== 'archived');
     const closed = kids.filter((k) => k.phase === 'archived')
       .sort((a, b) => (b.delegation?.settledAt ?? 0) - (a.delegation?.settledAt ?? 0));
-    const all = expandedKids.has(parent.id);
-    const keep = new Set(all ? closed : closed.slice(0, CLOSED_KIDS_SHOWN));
-    const rows = kids.filter((k) => k.phase !== 'archived' || keep.has(k)).map((k) => row(k, true));
-    if (closed.length > CLOSED_KIDS_SHOWN) {
-      rows.push(
-        <button
-          key={`${parent.id}-kids`}
-          type="button"
-          className="kids-toggle"
-          data-testid="delegation-kids-toggle"
-          onClick={() => setExpandedKids((s) => {
-            const n = new Set(s);
-            if (n.has(parent.id)) n.delete(parent.id); else n.add(parent.id);
-            return n;
-          })}
-        >
-          {all ? '收起已关闭的委派' : `还有 ${closed.length - CLOSED_KIDS_SHOWN} 个已关闭的委派`}
-        </button>,
-      );
-    }
-    return rows;
+    const treeCollapsed = active.length > 0 && collapsedTrees.has(parent.id);
+    const parentRow = row(
+      parent,
+      false,
+      active.length > 0
+        ? { activeKidsCount: active.length, kidsCollapsed: treeCollapsed, onToggleKids: () => toggleTree(parent.id) }
+        : undefined,
+    );
+    if (treeCollapsed) return [parentRow];
+    const allClosed = expandedKids.has(parent.id);
+    const visibleClosed = allClosed ? closed : closed.slice(0, CLOSED_KIDS_SHOWN);
+    const hiddenClosed = closed.length - CLOSED_KIDS_SHOWN;
+    return [
+      parentRow,
+      <div key={`${parent.id}-kids`} className="task-kids" data-testid="task-kids">
+        {active.map((k) => row(k, true))}
+        {hiddenClosed > 0 && (
+          <button
+            type="button"
+            className="kids-toggle"
+            data-testid="delegation-kids-toggle"
+            aria-expanded={allClosed}
+            onClick={() => setExpandedKids((s) => {
+              const n = new Set(s);
+              if (n.has(parent.id)) n.delete(parent.id); else n.add(parent.id);
+              return n;
+            })}
+          >
+            <svg className="kids-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
+            <span>{allClosed ? `收起已完成委派 (${closed.length})` : `${hiddenClosed} 个已完成委派`}</span>
+          </button>
+        )}
+        {visibleClosed.map((k) => row(k, true))}
+      </div>,
+    ];
   };
   return (
     <section className={`group ${dragging ? 'dragging' : ''} ${edge ? 'drop-' + edge : ''}`} data-testid="project-group" data-project-id={project.id} data-collapsed={collapsed ? 'true' : 'false'}>
       <div
-        className="group-head"
+        className={`group-head ${ctxActive ? 'ctx-active' : ''}`}
         draggable
+        onContextMenu={onContextMenu}
+        onKeyDown={(e) => {
+          if (isContextMenuKey(e)) {
+            e.preventDefault();
+            const pt = contextMenuPointForElement(e.currentTarget);
+            onOpenContextMenuAt(pt.x, pt.y);
+          }
+        }}
         onClick={(e) => {
           if (!(e.target as HTMLElement).closest('button, .menu')) onToggle();
         }}
@@ -1436,7 +1640,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
         {collapsed && working > 0 && <span className="group-live" data-testid="group-live">{working} 工作中</span>}
         {collapsed && waiting > 0 && <span className="group-needs" data-testid="group-needs">{waiting} 个在等你</span>}
         {collapsed && reviewing > 0 && <span className="group-review" data-testid="group-review">{reviewing} 待验收</span>}
-        {collapsed && !waiting && !reviewing && <span className="group-count">{tasks.filter((t) => t.phase !== 'archived').length || ''}</span>}
+        {collapsed && !working && !waiting && !reviewing && <span className="group-count">{tasks.filter((t) => t.phase !== 'archived').length || ''}</span>}
         <button className="icon-btn remove-project" data-testid="project-remove" title="从工作台移除项目" onClick={onRemoveProject}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8h6l.5-8M7 7v3.5M9 7v3.5" /></svg>
         </button>
@@ -1465,7 +1669,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
           )}
         </div>
       </div>
-      {!collapsed && shown.flatMap((t) => [row(t), ...kidRows(t)])}
+      {!collapsed && shown.flatMap((t) => renderTaskWithKids(t))}
       {!collapsed && (hidden > 0 || canCollapseBack || showArchiveStopped) && (
         <div className="group-foot" data-testid="group-foot">
           {hidden > 0 && (
@@ -1598,7 +1802,7 @@ function QuickMenu({ agents, cliTools, defaultAgent, onPick, onClose }: {
   );
 }
 
-function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMark, draggable, now, onOpen, onRemove, onRename, onResume, onUnarchive }: {
+function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMark, draggable, now, activeKidsCount, kidsCollapsed, onToggleKids, onOpen, onRemove, onRename, onResume, onUnarchive }: {
   task: Task;
   nested?: boolean; // shown under its main task (delegated tasks only)
   session?: SessionInfo;
@@ -1608,19 +1812,26 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
   paneMark?: '左' | '右'; // which pane shows this task (dual layout only)
   draggable: boolean; // dual layout: the row can be dropped on a pane
   now: number;
+  activeKidsCount?: number; // number of open delegated children under this main task
+  kidsCollapsed?: boolean;
+  onToggleKids?(): void;
   onOpen(sessionId: string): void;
   onRemove(): void;
   onRename(title: string): void;
   onResume(): void;
   onUnarchive(): void;
 }) {
+  const privacy = usePrivacy();
   const status = session?.status ?? 'exited';
   const glyph = rowGlyph(task, session);
   const delegState = delegationState(task, session);
   const round = task.delegation?.round ?? 1;
+  const delegFullLabel = delegState
+    ? `${task.delegation?.mode === 'review' ? '评审 · ' : ''}${DELEGATION_LABEL[delegState]}${round > 1 ? ` · 第${round}轮` : ''}`
+    : undefined;
   const delegStatus = delegState && (
-    <span className={`status st-deleg st-deleg-${delegState}`} data-testid="task-delegation-status">
-      {task.delegation?.mode === 'review' ? '评审 · ' : ''}{DELEGATION_LABEL[delegState]}{round > 1 ? ` · 第${round}轮` : ''}
+    <span className={`status st-deleg st-deleg-${delegState}`} data-testid="task-delegation-status" title={delegFullLabel}>
+      {task.delegation?.mode === 'review' ? '审 · ' : ''}{DELEGATION_LABEL[delegState]}{round > 1 ? ` · R${round}` : ''}
     </span>
   );
   const [editing, setEditing] = useState(false);
@@ -1631,12 +1842,18 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
   const actLine = showLiveAct
     ? (actStalled ? `已 ${actIdleSec}s 无新进展 · ${liveAct.summary}` : liveAct.summary)
     : '';
-  // The latest prompt as a second line, unless the row is closed or it only repeats the title.
-  const lastPrompt = task.lastPrompt ?? '';
-  const preview = !showLiveAct && task.phase !== 'archived' && status !== 'exited' && lastPrompt && !lastPrompt.startsWith(task.title.replace(/…$/, '')) ? lastPrompt : '';
-  // Delegated rows under a main task are a smaller version of a row; closed ones (archived) have no second line.
+  // Delegated rows under a main task stay compact single-line (full brief is in hover tooltip & DelegationHud)
+  // unless actively reporting live tool progress. Main tasks only show a second prompt line when attention is needed
+  // (working / needs_you / review), never when approved, idle, or exited, and never for system XML payloads.
   const compact = !!nested && !!delegState;
+  const displayTitle = delegState ? delegationDisplayTitle(task.title) : task.title;
+  const cleanedPrompt = cleanPreviewText(task.lastPrompt ?? '');
+  const normTitle = displayTitle.replace(/…$/, '').replace(/^(?:任务包|只读评审|评审)\s*[:：]?\s*/i, '').trim();
+  const normPrompt = cleanedPrompt.replace(/^(?:任务包|只读评审|评审)\s*[:：]?\s*/i, '').trim();
+  const previewAllowed = !compact && !showLiveAct && task.phase !== 'archived' && task.phase !== 'approved' && status !== 'exited' && status !== 'idle';
+  const preview = previewAllowed && cleanedPrompt && (!normTitle || !normPrompt.startsWith(normTitle)) ? cleanedPrompt : '';
   const hasSecondLine = showLiveAct || !!preview;
+  const rowTooltip = !privacy && compact && cleanedPrompt ? cleanedPrompt : undefined;
   return (
     <div
       className={`task-row ${inPane ? 'in-pane' : ''} ${paneFocused ? 'pane-focused' : ''} ${hasSecondLine ? 'has-preview' : ''} ${compact ? 'nested' : ''}`}
@@ -1650,6 +1867,7 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
       data-delegated={delegState ? 'true' : undefined}
       data-delegation-state={delegState ?? undefined}
       data-nested={compact ? 'true' : undefined}
+      title={rowTooltip}
       draggable={draggable && !!session}
       onDragStart={(e) => {
         if (!session) return;
@@ -1658,13 +1876,32 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
       }}
       onClick={() => session && onOpen(session.id)}
     >
-      {compact && <span className="nest-mark" aria-hidden="true" />}
-      <span className={`row-glyph g-${glyph}`} data-testid="row-glyph" data-glyph={glyph} />
+      <span className={`row-glyph g-${glyph}`} data-testid="row-glyph" data-glyph={glyph}>
+        {glyph === 'approved' && (
+          <svg className="approved-check" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.2 6.4l2.5 2.5L9.8 3.5" /></svg>
+        )}
+      </span>
       {inPane && <span className="task-swatch" data-testid="task-swatch" />}
-      <EditableTitle className="task-title" title={delegState ? delegationDisplayTitle(task.title) : task.title} onSave={onRename} editing={editing} onEditingChange={setEditing} />
+      <EditableTitle className="task-title" title={displayTitle} onSave={onRename} editing={editing} onEditingChange={setEditing} />
+      {!compact && !!activeKidsCount && onToggleKids && (
+        <button
+          type="button"
+          className="kids-fold-btn"
+          data-testid="delegation-tree-toggle"
+          aria-expanded={!kidsCollapsed}
+          title={kidsCollapsed ? `展开 ${activeKidsCount} 个进行中的委派` : `折叠 ${activeKidsCount} 个进行中的委派`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleKids();
+          }}
+        >
+          <svg className="kids-chev" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4l4 4-4 4" /></svg>
+          <span>{activeKidsCount}</span>
+        </button>
+      )}
       {paneMark && <span className="pane-mark" data-testid="pane-mark">{paneMark}</span>}
       {!!session?.queued && status !== 'exited' && (
-        <span className="queued-mark" data-testid="task-queued" title="有消息排队，agent 空闲后自动发送">排队</span>
+        <span className="queued-mark" data-testid="task-queued" title="有消息排队，agent 空闲后自动发送">队</span>
       )}
       {task.phase === 'archived' && delegStatus ? (
         delegStatus

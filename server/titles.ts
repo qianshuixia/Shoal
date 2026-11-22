@@ -1,12 +1,16 @@
+import { isSystemPromptText } from '../shared/protocol.ts';
+
 const MAX_TITLE = 24;
 
 // Pasted-image placeholders and absolute file paths say nothing about the task.
 const NOISE = /\[Image #\d+\]|"(?:[A-Za-z]:[\\/]|\/)[^"]*"|(?<=^|\s)(?:[A-Za-z]:[\\/]|\/(?=[^\s/]+\/))\S*/g;
+const MD_HEADING = /^#+\s+/;
 
 // First line with real words (noise removed, whitespace collapsed), cut to 24 code points (+ '…'). '' if nothing usable.
 export function titleFromPrompt(text: string): string {
+  if (isSystemPromptText(text)) return '';
   for (const line of text.split(/\r\n|\r|\n/)) {
-    const s = line.replace(NOISE, ' ').replace(/\s+/g, ' ').trim();
+    const s = line.replace(NOISE, ' ').replace(/\s+/g, ' ').trim().replace(MD_HEADING, '').trim();
     if (!s) continue;
     const cps = [...s];
     return cps.length > MAX_TITLE ? cps.slice(0, MAX_TITLE).join('') + '…' : s;
@@ -18,7 +22,8 @@ const MAX_PREVIEW = 120;
 
 // Whole prompt on one line (noise removed, whitespace collapsed), cut to 120 code points (+ '…'). '' if nothing usable.
 export function promptPreview(text: string): string {
-  const s = text.replace(NOISE, ' ').replace(/\s+/g, ' ').trim();
+  if (isSystemPromptText(text)) return '';
+  const s = text.replace(NOISE, ' ').replace(/\s+/g, ' ').trim().replace(MD_HEADING, '').trim();
   const cps = [...s];
   return cps.length > MAX_PREVIEW ? cps.slice(0, MAX_PREVIEW).join('') + '…' : s;
 }
@@ -26,7 +31,7 @@ export function promptPreview(text: string): string {
 // A title saved before the noise filter existed, cleaned the same way; unchanged if cleaning leaves nothing.
 // A placeholder cut off by the 24-character limit ("[Ima…") goes too.
 export function cleanTitle(title: string): string {
-  const s = title.replace(NOISE, ' ').replace(/\[[^\]]*…$/, '').replace(/\s+/g, ' ').trim();
+  const s = title.replace(NOISE, ' ').replace(/\[[^\]]*…$/, '').replace(/\s+/g, ' ').trim().replace(MD_HEADING, '').trim();
   return s && s !== '…' ? s : title;
 }
 

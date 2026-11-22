@@ -119,6 +119,25 @@ describe('openAction', () => {
   it('falls back to selecting the file without an editor', () => {
     expect(openAction(at('C:\\d\\a.ts', 12), false, null, 'win32')).toEqual({ kind: 'select', cmd: 'explorer.exe', args: ['/select,"C:\\d\\a.ts"'], verbatim: true });
   });
+
+  it('supports explicit reveal and editor modes across platforms', () => {
+    expect(openAction(at('C:\\d\\a.ts'), false, editor, 'win32', 'reveal')).toEqual({
+      kind: 'select', cmd: 'explorer.exe', args: ['/select,"C:\\d\\a.ts"'], verbatim: true,
+    });
+    expect(openAction(at('C:\\d'), true, editor, 'win32', 'reveal')).toEqual({
+      kind: 'dir', cmd: 'explorer.exe', args: ['C:\\d'],
+    });
+    expect(openAction(at('C:\\d'), true, editor, 'win32', 'editor')).toEqual({
+      kind: 'editor', cmd: editor, args: ['C:\\d'],
+    });
+    expect(() => openAction(at('C:\\d\\a.ts'), false, null, 'win32', 'editor')).toThrow(OpenError);
+    expect(openAction(at('/d/a.ts'), false, '/usr/local/bin/code', 'darwin', 'reveal')).toEqual({
+      kind: 'select', cmd: 'open', args: ['-R', '/d/a.ts'],
+    });
+    expect(openAction(at('/d/a.ts'), false, '/usr/local/bin/code', 'linux', 'reveal')).toEqual({
+      kind: 'select', cmd: 'xdg-open', args: ['/d'],
+    });
+  });
 });
 
 describe('findEditor and runOpen', () => {

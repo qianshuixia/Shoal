@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, discardFile, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
+  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, createFsEntry, deleteFsEntry, discardFile, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
 } from './workspace.ts';
 import { gitInfo } from './git.ts';
 import { matchProjectFileLink, parseLocalFileLink } from '../web/src/linkParse.ts';
@@ -352,5 +352,133 @@ describe('workspace large changes & git consistency', () => {
     expect(c3.files.map((f) => f.path)).toContain('base.txt');
     expect(c3.git?.dirty).toBe(1);
     expect(info2?.dirty).toBe(1);
+  });
+
+  it('creates, renames, copies, moves, pastes external files, and deletes safely with strict guards', async () => {
+    const projA = makeTempDir('fs-a');
+    const projB = makeTempDir('fs-b');
+    const externalDir = makeTempDir('fs-ext');
+    fs.writeFileSync(path.join(externalDir, 'clip.txt'), 'from-clipboard\n', 'utf8');
+
+    // Create dir & file
+    expect(createFsEntry(projA, { parentDir: '', name: 'src', kind: 'dir' })).toEqual({ path: 'src', kind: 'dir' });
+    expect(createFsEntry(projA, { parentDir: 'src', name: 'a.ts', kind: 'file' })).toEqual({ path: 'src/a.ts', kind: 'file' });
+    fs.writeFileSync(path.join(projA, 'src', 'a.ts'), 'export const a = 1;\n', 'utf8');
+
+    // Conflict & invalid name rejection
+    expect(() => createFsEntry(projA, { parentDir: 'src', name: 'a.ts', kind: 'file' })).toThrow(WorkspaceError);
+    expect(() => createFsEntry(projA, { parentDir: '', name: '.git', kind: 'dir' })).toThrow(WorkspaceError);
+    expect(() => createFsEntry(projA, { parentDir: '', name: 'CON.txt', kind: 'file' })).toThrow(WorkspaceError);
+    expect(() => createFsEntry(projA, { parentDir: '', name: 'bad/name', kind: 'file' })).toThrow(WorkspaceError);
+
+    // Leading-space existing filename must stay isolated from trimmed neighbor across read, write, paste, and delete
+    fs.writeFileSync(path.join(projA, ' notes.txt'), 'leading-space\n', 'utf8');
+    fs.writeFileSync(path.join(projA, 'notes.txt'), 'plain\n', 'utf8');
+    expect(readFileEntry(projA, ' notes.txt').content).toBe('leading-space\n');
+    expect(readFileEntry(projA, 'notes.txt').content).toBe('plain\n');
+    writeFileEntry(projA, { path: ' notes.txt', content: 'leading-updated\n' });
+    expect(fs.readFileSync(path.join(projA, ' notes.txt'), 'utf8')).toBe('leading-updated\n');
+    expect(fs.readFileSync(path.join(projA, 'notes.txt'), 'utf8')).toBe('plain\n');
+    const spacedPaste = await pasteFsEntries(projA, { mode: 'copy', targetDir: 'src', sourcePath: ' notes.txt' });
+    expect(spacedPaste).toEqual({ paths: ['src/ notes.txt'], targetDir: 'src' });
+    expect(fs.readFileSync(path.join(projA, 'src', ' notes.txt'), 'utf8')).toBe('leading-updated\n');
+    expect(deleteFsEntry(projA, { path: ' notes.txt' })).toEqual({ path: ' notes.txt', kind: 'file' });
+    expect(deleteFsEntry(projA, { path: 'src/ notes.txt' })).toEqual({ path: 'src/ notes.txt', kind: 'file' });
+    expect(fs.existsSync(path.join(projA, ' notes.txt'))).toBe(false);
+    expect(fs.readFileSync(path.join(projA, 'notes.txt'), 'utf8')).toBe('plain\n');
+
+    // Distinct hard-linked filenames sharing an inode must still reject rename conflict with 409 (keeping both entries)
+    fs.writeFileSync(path.join(projA, 'hl-one.txt'), 'shared\n', 'utf8');
+    let hardLinkCreated = false;
+    try {
+      fs.linkSync(path.join(projA, 'hl-one.txt'), path.join(projA, 'hl-two.txt'));
+      hardLinkCreated = true;
+    } catch { /* skip on filesystems without hard link support */ }
+    if (hardLinkCreated) {
+      let err: unknown;
+      try {
+        renameFsEntry(projA, { path: 'hl-one.txt', newName: 'hl-two.txt' });
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(WorkspaceError);
+      expect((err as WorkspaceError).status).toBe(409);
+      expect(fs.existsSync(path.join(projA, 'hl-one.txt'))).toBe(true);
+      expect(fs.existsSync(path.join(projA, 'hl-two.txt'))).toBe(true);
+      fs.unlinkSync(path.join(projA, 'hl-two.txt'));
+    }
+    fs.unlinkSync(path.join(projA, 'hl-one.txt'));
+
+    // Directory rename onto an existing empty directory must reject with 409 and preserve both directories
+    expect(createFsEntry(projA, { parentDir: '', name: 'dir-src', kind: 'dir' })).toEqual({ path: 'dir-src', kind: 'dir' });
+    fs.writeFileSync(path.join(projA, 'dir-src', 'keep.txt'), 'keep\n', 'utf8');
+    expect(createFsEntry(projA, { parentDir: '', name: 'dir-empty', kind: 'dir' })).toEqual({ path: 'dir-empty', kind: 'dir' });
+    let dirConflictErr: unknown;
+    try {
+      renameFsEntry(projA, { path: 'dir-src', newName: 'dir-empty' });
+    } catch (e) {
+      dirConflictErr = e;
+    }
+    expect(dirConflictErr).toBeInstanceOf(WorkspaceError);
+    expect((dirConflictErr as WorkspaceError).status).toBe(409);
+    expect(fs.readFileSync(path.join(projA, 'dir-src', 'keep.txt'), 'utf8')).toBe('keep\n');
+    expect(fs.existsSync(path.join(projA, 'dir-empty'))).toBe(true);
+    expect(deleteFsEntry(projA, { path: 'dir-src' })).toEqual({ path: 'dir-src', kind: 'dir' });
+    expect(deleteFsEntry(projA, { path: 'dir-empty' })).toEqual({ path: 'dir-empty', kind: 'dir' });
+
+    // Nested .git metadata is protected against delete and copy
+    fs.mkdirSync(path.join(projA, 'nested-git', '.git'), { recursive: true });
+    fs.writeFileSync(path.join(projA, 'nested-git', '.git', 'HEAD'), 'ref: refs/heads/main\n', 'utf8');
+    expect(() => deleteFsEntry(projA, { path: 'nested-git/.git/HEAD' })).toThrow(WorkspaceError);
+    expect(() => deleteFsEntry(projA, { path: 'nested-git' })).toThrow(WorkspaceError);
+    await expect(pasteFsEntries(projB, {
+      mode: 'copy', targetDir: '', sourceProjectId: 'a', sourcePath: 'nested-git',
+    }, (id) => (id === 'a' ? projA : null))).rejects.toThrow(WorkspaceError);
+
+    // Copy in same dir auto-generates unique suffix without overwriting
+    const copy1 = await pasteFsEntries(projA, { mode: 'copy', targetDir: 'src', sourcePath: 'src/a.ts' });
+    expect(copy1).toEqual({ paths: ['src/a copy.ts'], targetDir: 'src' });
+    const copy2 = await pasteFsEntries(projA, { mode: 'copy', targetDir: 'src', sourcePath: 'src/a.ts' });
+    expect(copy2).toEqual({ paths: ['src/a copy 2.ts'], targetDir: 'src' });
+
+    // Copying a directory into itself or its child is rejected
+    expect(createFsEntry(projA, { parentDir: 'src', name: 'nested', kind: 'dir' })).toEqual({ path: 'src/nested', kind: 'dir' });
+    await expect(pasteFsEntries(projA, { mode: 'copy', targetDir: 'src/nested', sourcePath: 'src' })).rejects.toThrow(WorkspaceError);
+
+    // Cut into same dir skips cleanly; cut into subdir moves without leaving source
+    expect(await pasteFsEntries(projA, { mode: 'cut', targetDir: 'src', sourcePath: 'src/a copy.ts' })).toEqual({
+      paths: ['src/a copy.ts'], targetDir: 'src', skipped: true,
+    });
+    expect(await pasteFsEntries(projA, { mode: 'cut', targetDir: 'src/nested', sourcePath: 'src/a copy.ts' })).toEqual({
+      paths: ['src/nested/a copy.ts'], targetDir: 'src/nested',
+    });
+    expect(fs.existsSync(path.join(projA, 'src', 'a copy.ts'))).toBe(false);
+    expect(fs.existsSync(path.join(projA, 'src', 'nested', 'a copy.ts'))).toBe(true);
+
+    // Cross-project copy & external clipboard paste (plus rollback on batch error)
+    const cross = await pasteFsEntries(projB, {
+      mode: 'copy', targetDir: '', sourceProjectId: 'a', sourcePath: 'src/a.ts',
+    }, (id) => (id === 'a' ? projA : null));
+    expect(cross).toEqual({ paths: ['a.ts'], targetDir: '' });
+    expect(fs.readFileSync(path.join(projB, 'a.ts'), 'utf8')).toBe('export const a = 1;\n');
+
+    await expect(pasteFsEntries(projB, {
+      mode: 'copy', targetDir: '', externalPaths: [path.join(externalDir, 'clip.txt'), path.join(externalDir, 'missing.txt')],
+    })).rejects.toThrow(WorkspaceError);
+    expect(fs.existsSync(path.join(projB, 'clip.txt'))).toBe(false);
+
+    const extPaste = await pasteFsEntries(projB, { mode: 'copy', targetDir: '', externalPaths: [path.join(externalDir, 'clip.txt')] });
+    expect(extPaste).toEqual({ paths: ['clip.txt'], targetDir: '' });
+    expect(fs.readFileSync(path.join(projB, 'clip.txt'), 'utf8')).toBe('from-clipboard\n');
+
+    // Rename + conflict protection + delete
+    expect(renameFsEntry(projA, { path: 'src/a copy 2.ts', newName: 'b.ts' })).toEqual({
+      oldPath: 'src/a copy 2.ts', newPath: 'src/b.ts', kind: 'file',
+    });
+    expect(() => renameFsEntry(projA, { path: 'src/b.ts', newName: 'a.ts' })).toThrow(WorkspaceError);
+    expect(deleteFsEntry(projA, { path: 'src/b.ts' })).toEqual({ path: 'src/b.ts', kind: 'file' });
+    expect(fs.existsSync(path.join(projA, 'src', 'b.ts'))).toBe(false);
+    expect(() => deleteFsEntry(projA, { path: '' })).toThrow(WorkspaceError);
+    expect(() => deleteFsEntry(projA, { path: '../outside' })).toThrow(WorkspaceError);
   });
 });

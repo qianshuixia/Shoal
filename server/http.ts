@@ -10,9 +10,9 @@ import type {
   AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
   GitInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
-import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isValidAgyModel } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel } from '../shared/protocol.ts';
 import { createActivityTracker } from './activity.ts';
-import { clipboardFiles } from './clipboard.ts';
+import { clipboardFiles, writeClipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
 import { agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
@@ -33,7 +33,7 @@ import type { Usage } from './usage.ts';
 import { titleFromPrompt, titleFromReply, titlePrompt, promptPreview } from './titles.ts';
 import { gitInfo } from './git.ts';
 import {
-  WorkspaceError, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, readDiff, readFileEntry, resolveRawImage, writeFileEntry,
+  WorkspaceError, createFsEntry, deleteFsEntry, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, resolveProjectPath, resolveRawImage, writeFileEntry,
 } from './workspace.ts';
 import { createMobileController } from './mobile.ts';
 import { AgyOptimizeError, applyAgyOptimization, getAgyOptimizeStatus } from './agyOptimize.ts';
@@ -781,7 +781,7 @@ export function createApp(cfg: AppConfig) {
   function updateLastPrompt(body: HookBody, userTurn: boolean) {
     const p = (body.payload ?? {}) as Record<string, unknown>;
     const text = body.event === 'UserPromptSubmit' ? p.prompt : body.event === 'PreInvocation' ? p.lastUserInput : undefined;
-    const preview = typeof text === 'string' && !text.trimStart().startsWith('/') ? promptPreview(text) : '';
+    const preview = typeof text === 'string' && !text.trimStart().startsWith('/') && !isSystemPromptText(text) ? promptPreview(text) : '';
     if (!preview && !userTurn) return;
     const session = sessions.list().find(s => s.id === body.sessionId);
     const old = session ? store.getTask(session.taskId) : undefined;
@@ -824,7 +824,7 @@ export function createApp(cfg: AppConfig) {
   function autoRename(body: HookBody) {
     const p = (body.payload ?? {}) as Record<string, unknown>;
     const text = body.event === 'UserPromptSubmit' ? p.prompt : body.event === 'PreInvocation' ? p.lastUserInput : undefined;
-    if (typeof text !== 'string' || text.trimStart().startsWith('/')) return;
+    if (typeof text !== 'string' || text.trimStart().startsWith('/') || isSystemPromptText(text)) return;
     const taskId = sessions.list().find(s => s.id === body.sessionId)?.taskId;
     const old = taskId ? store.getTask(taskId) : undefined;
     if (!old || !old.titleAuto) return;
@@ -892,12 +892,16 @@ export function createApp(cfg: AppConfig) {
     return { path: abs, parent: up === abs ? null : up, entries };
   }
 
-  // A link clicked in a terminal: opens the file in the editor / Explorer, never executes it.
+  // A link clicked in a terminal or context menu: opens the file in the editor / Explorer, never executes it.
   function openTarget(b: Record<string, unknown>): { action: string; path: string } {
     if (typeof b.target !== 'string') throw new HttpError(400, '缺少链接');
+    const mode = b.mode === undefined ? 'default' : b.mode;
+    if (mode !== 'default' && mode !== 'reveal' && mode !== 'editor') {
+      throw new HttpError(400, '无效的打开方式');
+    }
     try {
       const resolved = resolveOpenTarget(b.target);
-      const action = openAction(resolved, fs.statSync(resolved.path).isDirectory(), findEditor());
+      const action = openAction(resolved, fs.statSync(resolved.path).isDirectory(), findEditor(), process.platform, mode);
       runOpen(action);
       return { action: action.kind, path: resolved.path };
     } catch (e) {
@@ -941,6 +945,20 @@ export function createApp(cfg: AppConfig) {
     if (method === 'GET' && pathname === '/api/clipboard/files') {
       try {
         return send(res, 200, { paths: await clipboardFiles() });
+      } catch (e) {
+        throw new HttpError(500, (e as Error).message);
+      }
+    }
+    if (method === 'POST' && pathname === '/api/clipboard/files') {
+      const pid = typeof body.projectId === 'string' ? body.projectId : '';
+      const rel = typeof body.path === 'string' ? body.path : '';
+      const project = store.getProject(pid);
+      if (!project) throw new HttpError(404, '项目不存在');
+      const resolved = resolveProjectPath(project.path, rel, { allowRoot: true, preserveSpaces: true });
+      if (!fs.existsSync(resolved.absPath)) throw new HttpError(404, `文件或目录不存在：${resolved.relPosix || project.name}`);
+      try {
+        await writeClipboardFiles([resolved.absPath]);
+        return send(res, 200, { ok: true, path: resolved.absPath });
       } catch (e) {
         throw new HttpError(500, (e as Error).message);
       }
@@ -1126,6 +1144,34 @@ export function createApp(cfg: AppConfig) {
         return send(res, 200, { ok: true });
       }
       throw new HttpError(405, '请求方法不支持');
+    }
+    const pfs = pathname.match(/^\/api\/projects\/([^/]+)\/fs\/(create|rename|delete|paste)$/);
+    if (pfs) {
+      if (method !== 'POST') throw new HttpError(405, '请求方法不支持');
+      const project = store.getProject(decodeURIComponent(pfs[1]));
+      if (!project) throw new HttpError(404, '项目不存在');
+      const op = pfs[2];
+      if (op === 'create') {
+        const created = createFsEntry(project.path, body);
+        void refreshGit(project.id);
+        return send(res, 200, created);
+      }
+      if (op === 'rename') {
+        const renamed = renameFsEntry(project.path, body);
+        void refreshGit(project.id);
+        return send(res, 200, renamed);
+      }
+      if (op === 'delete') {
+        const deleted = deleteFsEntry(project.path, body);
+        void refreshGit(project.id);
+        return send(res, 200, deleted);
+      }
+      const pasted = await pasteFsEntries(project.path, body, (srcId) => store.getProject(srcId)?.path ?? null);
+      void refreshGit(project.id);
+      if (typeof body.sourceProjectId === 'string' && body.sourceProjectId !== project.id && body.mode === 'cut') {
+        void refreshGit(body.sourceProjectId);
+      }
+      return send(res, 200, pasted);
     }
     const pm = pathname.match(/^\/api\/projects\/([^/]+)$/);
     if (method === 'DELETE' && pm) {

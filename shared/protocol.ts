@@ -143,8 +143,21 @@ export function delegationState(
   return d.round > 1 ? 'rework' : 'working';
 }
 
-// Title of a delegated task for display: tasks dispatched before titles were cleaned up start with a redundant '委派：'.
-export const delegationDisplayTitle = (title: string): string => title.replace(/^委派[：:]\s*/, '') || title;
+// Title of a delegated task for display: strips legacy '委派：' prefix and leading markdown heading hashes.
+export const delegationDisplayTitle = (title: string): string =>
+  title.replace(/^委派[：:]\s*/, '').replace(/^#+\s+/, '').trim() || title;
+
+// System-injected XML messages (e.g. Claude Code background-task completion notifications) are never user prompts.
+const SYSTEM_PROMPT_TAG = /^\s*<(?:task-notification|system-reminder|command-message|command-name|command-args|local-command-stdout|local-command-caveat)\b/i;
+
+export const isSystemPromptText = (text: string): boolean => SYSTEM_PROMPT_TAG.test(text);
+
+// Display-time sanitizer for stored prompt previews (drops legacy system XML payloads and leading markdown '# ').
+export const cleanPreviewText = (text: string): string => {
+  const trimmed = text.trim();
+  if (!trimmed || isSystemPromptText(trimmed)) return '';
+  return trimmed.replace(/^#+\s+/, '').trim();
+};
 
 // Short id the main agent uses in `shoal rework / done / cancel`: '#n' indexes shift when tasks are archived.
 export const delegationHandle = (taskId: string): string => taskId.slice(0, 8);
@@ -228,6 +241,53 @@ export interface WriteFileResult {
   path: string;
   size: number;
   mtimeMs: number;
+}
+
+export type OpenMode = 'default' | 'reveal' | 'editor';
+
+export interface FsCreateBody {
+  parentDir: string; // '' for project root
+  name: string;
+  kind: 'file' | 'dir';
+}
+
+export interface FsCreateResult {
+  path: string;
+  kind: 'file' | 'dir';
+}
+
+export interface FsRenameBody {
+  path: string;
+  newName: string;
+}
+
+export interface FsRenameResult {
+  oldPath: string;
+  newPath: string;
+  kind: 'file' | 'dir';
+}
+
+export interface FsDeleteBody {
+  path: string;
+}
+
+export interface FsDeleteResult {
+  path: string;
+  kind: 'file' | 'dir';
+}
+
+export interface FsPasteBody {
+  mode: 'copy' | 'cut';
+  targetDir: string; // '' for project root
+  sourceProjectId?: string;
+  sourcePath?: string;
+  externalPaths?: string[];
+}
+
+export interface FsPasteResult {
+  paths: string[];
+  targetDir: string;
+  skipped?: boolean;
 }
 
 // result: the agent's last reply when a turn ended (Stop hook). feedback: what the user wrote back.
