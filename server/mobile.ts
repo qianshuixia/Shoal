@@ -1084,7 +1084,7 @@ export function createMobileController(handlers: MobileHandlers) {
       pathname === '/api/projects' ||
       /^\/api\/projects\/[^/]+$/.test(pathname) ||
       /^\/api\/tasks\/[^/]+$/.test(pathname) && method === 'DELETE' ||
-      /^\/api\/projects\/[^/]+\/(tree|files|file|discard)$/.test(pathname) ||
+      /^\/api\/projects\/[^/]+\/(tree|files|ignored-files|file|discard)$/.test(pathname) ||
       /^\/api\/projects\/[^/]+\/fs\//.test(pathname)
     ) {
       throw new MobileGatewayError(403, '手机端网关已禁用此接口');

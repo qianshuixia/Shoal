@@ -12,7 +12,8 @@ const USAGE = [
   '  shoal ask  <target> [-m "短说明"] [--file <path>] [--stdin] [--new]',
   '',
   '委派（把一件事派给另一个 CLI 的新任务，每轮结果自动送回当前会话）：',
-  '  shoal delegate <claude|codex|agy> [--review] [--title "标题"] [-m "一行说明"] [--file <path>] [--stdin]',
+  '  shoal delegate <claude|codex|agy> [--review|--plan] [--title "标题"] [-m "一行说明"] [--file <path>] [--stdin]',
+  '      --review 派只读评审者（回 PASS/FAIL）；--plan 派只读方案顾问（独立出一份方案）；都不加是执行者',
   '  shoal status [--json]                      查看已委派的任务和状态',
   '  shoal rework <句柄|#序号|标题片段> [-m "意见"] [--file <path>] [--stdin]   打回返工',
   '  shoal done   <句柄|#序号|标题片段>          验收通过并关闭',
@@ -28,6 +29,8 @@ const DELEGATION_LABEL = {
   working: '执行中', rework: '返工中', needs_you: '等你处理', review: '待验收', failed: '已中断', accepted: '已通过', canceled: '已取消',
 };
 const stateLabel = state => DELEGATION_LABEL[state] ?? state;
+// Mirrors DELEGATION_MODE_LABEL in shared/protocol.ts.
+const MODE_LABEL = { review: '评审', plan: '方案' };
 
 const port = process.env.WORKBENCH_PORT;
 const token = process.env.WORKBENCH_PEER_TOKEN;
@@ -101,7 +104,7 @@ if (cmd === 'status') {
   process.stdout.write(`项目「${data.projectName}」中由当前会话委派的任务：\n`);
   for (const t of data.tasks) {
     const reply = t.latestReplyFile ? ` -> ${t.latestReplyFile}` : '';
-    process.stdout.write(`  ${t.handle} [${t.agent}] ${t.title} · ${stateLabel(t.state)} · 第 ${t.round} 轮 · ${t.brief}${reply}\n`);
+    process.stdout.write(`  ${t.handle} [${t.agent}${t.mode ? ` · ${MODE_LABEL[t.mode] ?? t.mode}` : ''}] ${t.title} · ${stateLabel(t.state)} · 第 ${t.round} 轮 · ${t.brief}${reply}\n`);
   }
   process.exit(0);
 }
@@ -117,6 +120,7 @@ let filePath = '';
 let useStdin = false;
 let createIfAgent = false;
 let review = false;
+let plan = false;
 const positionals = [];
 
 for (let i = 1; i < args.length; i++) {
@@ -134,6 +138,8 @@ for (let i = 1; i < args.length; i++) {
     useStdin = true;
   } else if (a === '--review') {
     review = true;
+  } else if (a === '--plan') {
+    plan = true;
   } else if (a === '--new') {
     createIfAgent = true;
   } else if (a.startsWith('-')) {
@@ -143,10 +149,11 @@ for (let i = 1; i < args.length; i++) {
   }
 }
 
+if (review && plan) fail('--review 和 --plan 只能选一个', 2);
 target = (positionals[0] ?? '').replace(/^@+/, '');
 if (!target) {
   fail(cmd === 'delegate'
-    ? '用法：shoal delegate <claude|codex|agy> [--review] [--title "标题"] [-m "说明"] [--file <path>] [--stdin]'
+    ? '用法：shoal delegate <claude|codex|agy> [--review|--plan] [--title "标题"] [-m "说明"] [--file <path>] [--stdin]'
     : `用法：shoal ${cmd} <${cmd === 'send' || cmd === 'ask' ? 'target' : '句柄|#序号|标题片段'}>${cmd === 'done' || cmd === 'cancel' ? '' : ' [-m "内容"] [--file <path>] [--stdin]'}`, 2);
 }
 if (cmd === 'done' || cmd === 'cancel') {
@@ -177,11 +184,16 @@ if (cmd === 'delegate') {
     ...(filePath ? { filePath } : {}),
     ...(stdinText ? { stdinText } : {}),
     ...(review ? { review: true } : {}),
+    ...(plan ? { plan: true } : {}),
   });
   const t = r.task;
   process.stdout.write(
-    `${review ? '已派出只读评审' : '已派发'}给 ${t.agent}：「${t.title}」(句柄 ${t.handle})。它每完成一轮，结果会自动送回当前会话。不要等待或轮询：继续处理其他工作，没有其他工作就结束本轮。`
-    + `验收后用 \`shoal done ${t.handle}\` 关闭，或 \`shoal rework ${t.handle} --stdin\` 打回。\n`,
+    `${review ? '已派出只读评审' : plan ? '已派出只读方案顾问' : '已派发'}给 ${t.agent}：「${t.title}」(句柄 ${t.handle})。它每完成一轮，结果会自动送回当前会话。不要等待或轮询：继续处理其他工作，没有其他工作就结束本轮。`
+    + (review
+      ? `裁决完用 \`shoal done ${t.handle}\` 关闭；改完需要它复核用 \`shoal rework ${t.handle} --stdin\`。\n`
+      : plan
+        ? `和你的方案合并后用 \`shoal done ${t.handle}\` 关闭；需要追问用 \`shoal rework ${t.handle} --stdin\`。\n`
+        : `验收后用 \`shoal done ${t.handle}\` 关闭，或 \`shoal rework ${t.handle} --stdin\` 打回。\n`),
   );
   process.exit(0);
 }
@@ -195,7 +207,7 @@ if (cmd === 'rework') {
   });
   const t = r.task;
   process.stdout.write(
-    `已打回「${t.title}」(句柄 ${t.handle})，进入第 ${t.round} 轮${r.queued ? '（对方还在处理上一轮，意见已排队）' : ''}。`
+    `${t.mode === 'review' ? '已请评审者复核' : t.mode === 'plan' ? '已请方案顾问补充' : '已打回'}「${t.title}」(句柄 ${t.handle})，进入第 ${t.round} 轮${r.queued ? '（对方还在处理上一轮，意见已排队）' : ''}。`
     + '对方完成后结果会自动送回当前会话。不要等待或轮询：继续处理其他工作，没有其他工作就结束本轮。\n',
   );
   process.exit(0);

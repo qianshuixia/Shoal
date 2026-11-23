@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { DelegationState, SessionActivity, SessionInfo, Task } from '../../shared/protocol.ts';
-import { DELEGATION_LABEL, delegationDisplayTitle } from '../../shared/protocol.ts';
+import { DELEGATION_LABEL, DELEGATION_MODE_LABEL, delegationDisplayTitle } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
 import { usePrivacy } from './privacy.ts';
 import { fmtClock } from './util.ts';
@@ -163,7 +163,7 @@ export function DelegationHud({ delegates, now, onOpen, onRestoreFocus, onVacate
                 <span className="delegation-item-head">
                   <AgentIcon agent={task.agent ?? session?.agent ?? 'fake'} />
                   <span className="delegation-item-title" data-private="">{delegationDisplayTitle(task.title)}</span>
-                  {task.delegation?.mode === 'review' && <span className="delegation-mode" data-testid="delegation-mode">评审</span>}
+                  {task.delegation?.mode && <span className="delegation-mode" data-testid="delegation-mode">{DELEGATION_MODE_LABEL[task.delegation.mode]}</span>}
                   <span className={`delegation-chip st-${state}`}>{DELEGATION_LABEL[state]}</span>
                   {round > 1 && <span className="delegation-item-round">第 {round} 轮</span>}
                 </span>

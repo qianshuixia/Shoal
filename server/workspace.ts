@@ -2,9 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import type {
-  ChangedFile, ChangeStatus, DiffPayload, FileListResult, FilePayload, FsCreateBody, FsCreateResult, FsDeleteBody, FsDeleteResult, FsPasteBody, FsPasteResult, FsRenameBody, FsRenameResult, GitInfo, ProjectChanges, TreeEntry, TreeListing, WriteFileBody, WriteFileResult,
+  ChangedFile, ChangeStatus, DiffPayload, FileListResult, FilePayload, FsCreateBody, FsCreateResult, FsDeleteBody, FsDeleteResult, FsPasteBody, FsPasteResult, FsRenameBody, FsRenameResult, GitInfo, IgnoredFileSearch, ProjectChanges, TreeEntry, TreeListing, WriteFileBody, WriteFileResult,
 } from '../shared/protocol.ts';
-import { rawPreviewOf, type RawPreviewKind } from '../shared/protocol.ts';
+import { FINDER_QUERY_MAX, rawPreviewOf, scoreFinderPath, type RawPreviewKind } from '../shared/protocol.ts';
 
 export const MAX_TEXT_BYTES = 2 * 1024 * 1024; // 2 MB guard for editor & diff
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024; // 25 MB guard for inline image preview
@@ -900,6 +900,90 @@ export async function listTree(projectDir: string, rawRelDir = ''): Promise<Tree
   return { path: relPosix, entries };
 }
 
+// Dependency stores and build caches are never walked for Ctrl+P: they would flood results with files nobody opens by name.
+const FINDER_SKIP_DIRS = new Set([
+  '.git', 'node_modules', 'target', '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', '.parcel-cache',
+  '.worktrees', '__pycache__', '.venv', 'venv',
+]);
+const WALK_CONCURRENCY = 16; // parallel readdir: 225k files in 80k folders take ~0.5 s instead of ~3 s one at a time
+
+/**
+ * Walks `dirs` (POSIX paths relative to the root) roughly breadth-first, appending files to `out` until it holds `cap`
+ * entries or `deadline` passes; `truncated` is true when either cut the walk short, and `unreadable` counts folders
+ * that failed to read for any reason but having been removed meanwhile. At the deadline it returns even if a
+ * folder read is stuck (a hung network share); reads finishing later add nothing. Symlinks and junctions are skipped (they
+ * can leave the project), as are nested repos and worktrees: a folder holding its own `.git` is a separate project,
+ * and a worktree would duplicate every result.
+ */
+async function walkFinderDirs(
+  realRoot: string, dirs: string[], out: string[], cap: number, deadline = Infinity,
+): Promise<{ truncated: boolean; unreadable: number }> {
+  const queue = dirs.filter((d) => !FINDER_SKIP_DIRS.has(d.slice(d.lastIndexOf('/') + 1)));
+  const given = queue.length; // folders found by readdir below are already known not to be links
+  let truncated = false;
+  let unreadable = 0;
+  const visit = async (rel: string, i: number) => {
+    let dirents: fs.Dirent[];
+    try {
+      if (i < given && rel && (await fs.promises.lstat(path.join(realRoot, rel))).isSymbolicLink()) return;
+      dirents = await fs.promises.readdir(path.join(realRoot, rel), { withFileTypes: true });
+    } catch (err) {
+      // A folder deleted since it was listed holds nothing; any other failure (EACCES, EIO) leaves its files unsearched.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (!truncated && code !== 'ENOENT' && code !== 'ENOTDIR') unreadable++;
+      return;
+    }
+    if (truncated) return;
+    if (Date.now() > deadline) {
+      truncated = true;
+      return;
+    }
+    if (rel && dirents.some((d) => d.name === '.git')) return;
+    for (const d of dirents) {
+      if (d.isSymbolicLink()) continue;
+      const child = rel ? `${rel}/${d.name}` : d.name;
+      if (d.isDirectory()) {
+        if (!FINDER_SKIP_DIRS.has(d.name)) queue.push(child);
+      } else if (d.isFile()) {
+        if (out.length >= cap) {
+          truncated = true;
+          return;
+        }
+        out.push(child);
+      }
+    }
+  };
+  let next = 0;
+  let active = 0;
+  await new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    if (Number.isFinite(deadline)) {
+      timer = setTimeout(() => {
+        truncated = true;
+        finish();
+      }, Math.max(0, deadline - Date.now()));
+      timer.unref?.();
+    }
+    const pump = () => {
+      while (!truncated && active < WALK_CONCURRENCY && next < queue.length) {
+        active++;
+        const i = next++;
+        void visit(queue[i], i).finally(() => {
+          active--;
+          pump();
+        });
+      }
+      if (active === 0) finish();
+    };
+    pump();
+  });
+  return { truncated, unreadable };
+}
+
 export async function listAllFiles(projectDir: string): Promise<FileListResult> {
   const { realRoot } = resolveProjectPath(projectDir, '', { allowRoot: true });
   const [ls, del] = await Promise.all([
@@ -907,54 +991,134 @@ export async function listAllFiles(projectDir: string): Promise<FileListResult> 
     runGitBuf(realRoot, ['ls-files', '--deleted', '-z']),
   ]);
   if (ls.ok) {
-    const deletedSet = new Set(del.ok ? del.stdout.toString('utf8').split('\0').filter(Boolean) : []);
-    const raw = ls.stdout.toString('utf8').split('\0').filter((p) => p && !deletedSet.has(p));
-    // Also surface root .env* files that are commonly gitignored so Ctrl+P can find .env!
-    const seen = new Set(raw);
-    try {
-      for (const d of await fs.promises.readdir(realRoot, { withFileTypes: true })) {
-        if (d.isFile() && d.name.startsWith('.env') && !seen.has(d.name)) {
-          raw.push(d.name);
-          seen.add(d.name);
-        }
-      }
-    } catch { /* ignore */ }
-    const truncated = raw.length > MAX_FILE_SEARCH;
-    const existing = truncated ? raw.slice(0, MAX_FILE_SEARCH) : raw;
-    existing.sort((a, b) => NAME_COLLATOR.compare(a, b));
-    return { files: existing, truncated };
+    const split = (buf: Buffer) => buf.toString('utf8').split('\0').filter(Boolean);
+    const deletedSet = new Set(del.ok ? split(del.stdout) : []);
+    // Entries ending in '/' are untracked nested repos, which git does not descend into.
+    const files = split(ls.stdout).filter((p) => !p.endsWith('/') && !deletedSet.has(p));
+    const truncated = files.length > MAX_FILE_SEARCH;
+    if (truncated) files.length = MAX_FILE_SEARCH;
+    files.sort((a, b) => NAME_COLLATOR.compare(a, b));
+    return { files, truncated };
   }
 
-  // Fallback walk for non-Git project folders
+  // Fallback walk for non-Git project folders: nothing is "ignored" without git.
   const files: string[] = [];
-  let truncated = false;
-  const walk = (dir: string, prefix: string) => {
-    if (truncated) return;
-    let dirents: fs.Dirent[];
-    try {
-      dirents = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const d of dirents) {
-      if (d.name === '.git' || HEAVY_DIRS.has(d.name)) continue;
-      if (d.isSymbolicLink()) continue;
-      const rel = prefix ? `${prefix}/${d.name}` : d.name;
-      const full = path.join(dir, d.name);
-      if (d.isDirectory()) {
-        walk(full, rel);
-      } else if (d.isFile()) {
-        files.push(rel);
-        if (files.length >= MAX_FILE_SEARCH) {
-          truncated = true;
-          return;
-        }
-      }
-    }
-  };
-  walk(realRoot, '');
+  const { truncated } = await walkFinderDirs(realRoot, [''], files, MAX_FILE_SEARCH);
   files.sort((a, b) => NAME_COLLATOR.compare(a, b));
   return { files, truncated };
+}
+
+// Gitignored files (.env, .tmp/ outputs, dist/) are searched here instead of being shipped to the browser: one ignored
+// folder can hold hundreds of thousands of files. Each project keeps an in-memory index of them, rebuilt in the
+// background whenever the finder opens and dropped after a few idle minutes.
+const IGNORED_INDEX_MAX = 500_000;
+const IGNORED_INDEX_BUDGET_MS = 15_000; // a cold disk cache can make the walk slow; search what was found by then
+const IGNORED_INDEX_IDLE_MS = 3 * 60_000;
+const IGNORED_SEARCH_LIMIT = 60;
+
+interface IgnoredIndex { files: string[]; truncated: boolean; unreadable: number }
+interface IgnoredIndexSlot { index?: IgnoredIndex; building?: Promise<IgnoredIndex>; idle?: ReturnType<typeof setTimeout> }
+const ignoredIndexes = new Map<string, IgnoredIndexSlot>();
+
+function insideGitRepo(dir: string): boolean {
+  for (let d = dir; ; ) {
+    if (fs.existsSync(path.join(d, '.git'))) return true;
+    const up = path.dirname(d);
+    if (up === d) return false;
+    d = up;
+  }
+}
+
+async function buildIgnoredIndex(realRoot: string): Promise<IgnoredIndex> {
+  const deadline = Date.now() + IGNORED_INDEX_BUDGET_MS;
+  // --directory stops at wholly ignored folders (`.tmp/`, `node_modules/`) so git never crawls them; we walk the useful ones.
+  const ign = await runGitBuf(realRoot, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], IGNORED_INDEX_BUDGET_MS);
+  // Outside any repository nothing is ignored (listAllFiles walks every file instead). Inside one, a failure (timeout,
+  // git missing, broken index) must not pass for an empty index: the caller keeps the last good one.
+  if (!ign.ok && (ign.timedOut || insideGitRepo(realRoot))) {
+    throw new Error(`git ls-files --ignored failed: ${ign.stderr.trim() || ign.code}`);
+  }
+  const files: string[] = [];
+  const dirs: string[] = [];
+  let truncated = false;
+  if (ign.ok) {
+    for (const p of ign.stdout.toString('utf8').split('\0')) {
+      if (!p) continue;
+      if (p.endsWith('/')) dirs.push(p.slice(0, -1));
+      else if (files.length < IGNORED_INDEX_MAX) files.push(p);
+      else truncated = true;
+    }
+  }
+  // An unreadable folder does not fail the build: it may stay unreadable (no permission), and keeping the last index
+  // forever would hide every file written since. The search reports it instead.
+  const walk = await walkFinderDirs(realRoot, dirs, files, IGNORED_INDEX_MAX, deadline);
+  return { files, truncated: truncated || walk.truncated, unreadable: walk.unreadable };
+}
+
+function ignoredIndexSlot(realRoot: string): IgnoredIndexSlot {
+  const slot = ignoredIndexes.get(realRoot) ?? {};
+  ignoredIndexes.set(realRoot, slot);
+  clearTimeout(slot.idle);
+  slot.idle = setTimeout(() => {
+    if (ignoredIndexes.get(realRoot) === slot) ignoredIndexes.delete(realRoot);
+  }, IGNORED_INDEX_IDLE_MS);
+  slot.idle.unref?.();
+  return slot;
+}
+
+function rebuildIgnoredIndex(slot: IgnoredIndexSlot, realRoot: string): Promise<IgnoredIndex> {
+  const building: Promise<IgnoredIndex> = buildIgnoredIndex(realRoot).then(
+    (index) => {
+      if (slot.building === building) {
+        slot.index = index;
+        slot.building = undefined;
+      }
+      return index;
+    },
+    (err: unknown) => {
+      if (slot.building === building) slot.building = undefined;
+      throw err;
+    },
+  );
+  slot.building = building;
+  return building;
+}
+
+/** Called when the Ctrl+P finder opens, so searches typed a moment later see files written since the last open. */
+export function refreshIgnoredIndex(projectDir: string): void {
+  const { realRoot } = resolveProjectPath(projectDir, '', { allowRoot: true });
+  const slot = ignoredIndexSlot(realRoot);
+  if (slot.building) return;
+  rebuildIgnoredIndex(slot, realRoot).catch(() => {});
+}
+
+export async function searchIgnoredFiles(projectDir: string, query: string): Promise<IgnoredFileSearch> {
+  const { realRoot } = resolveProjectPath(projectDir, '', { allowRoot: true });
+  const slot = ignoredIndexSlot(realRoot);
+  // An in-flight rebuild is awaited rather than answered from the previous index, which may miss new files; if the
+  // rebuild fails, the previous index is still the best answer.
+  let index: IgnoredIndex;
+  try {
+    index = await (slot.building ?? slot.index ?? rebuildIgnoredIndex(slot, realRoot));
+  } catch (err) {
+    if (!slot.index) throw err;
+    index = slot.index;
+  }
+  const q = query.trim().slice(0, FINDER_QUERY_MAX);
+  const top: { f: string; s: number }[] = [];
+  if (q) {
+    // Keeps the best few in order instead of sorting every match: a one-letter query matches almost every path.
+    for (const f of index.files) {
+      const s = scoreFinderPath(f, q);
+      if (s < 0) continue;
+      let i = top.length;
+      while (i > 0 && (top[i - 1].s < s || (top[i - 1].s === s && top[i - 1].f > f))) i--;
+      if (i >= IGNORED_SEARCH_LIMIT) continue;
+      top.splice(i, 0, { f, s });
+      if (top.length > IGNORED_SEARCH_LIMIT) top.pop();
+    }
+  }
+  return { files: top.map((x) => x.f), indexed: index.files.length, truncated: index.truncated, unreadable: index.unreadable };
 }
 
 const MAX_EXTERNAL_PASTE = 50;

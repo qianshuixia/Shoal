@@ -2,12 +2,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
-  AgentKind, Card, DelegationSummary, PeerDelegateBody, PeerDelegateResult, PeerDelegationActionBody, PeerDelegationActionResult,
+  AgentKind, Card, DelegationMode, DelegationSummary, PeerDelegateBody, PeerDelegateResult, PeerDelegationActionBody, PeerDelegationActionResult,
   PeerDelegationList, PeerListResult, PeerSendBody, PeerSendResult, PeerTaskSummary, PermissionMode, Project, SessionInfo, Task, TaskDelegation,
 } from '../shared/protocol.ts';
 import {
   agentLabel, DELEGATION_LABEL, delegationBlockedText, delegationHandle, delegationPrompt, delegationReworkText,
-  delegationResultText, delegationState, forwardText, isDeepAgent,
+  delegationResultText, delegationState, forwardText, isDeepAgent, MAX_DELEGATION_ROUNDS,
 } from '../shared/protocol.ts';
 import { capBody } from './cards.ts';
 import { delegationTitle } from './titles.ts';
@@ -18,7 +18,7 @@ export const MAX_AUTO_HOPS = 4;
 export const MAX_SENDS_PER_TURN = 2;
 // Delegation has its own limits: a result/rework round trip is not a runaway agent-to-agent chat.
 export const MAX_DELEGATION_HOPS = 12;
-export const MAX_DELEGATION_ROUNDS = 4;
+export { MAX_DELEGATION_ROUNDS }; // defined in shared/protocol.ts so the relayed next steps can tell the last round
 export const MAX_OPEN_DELEGATIONS = 6;
 const MAX_PEER_FILE_BYTES = 512 * 1024;
 const VALID_AGENTS = new Set<AgentKind>(['claude', 'codex', 'agy', 'fake']);
@@ -736,7 +736,8 @@ export function createCollabManager(deps: CollabDeps) {
       throw new CollabError(409, `未关闭的委派任务已有 ${open} 个（上限 ${MAX_OPEN_DELEGATIONS}），请先用 shoal done / shoal cancel 处理已有的`);
     }
     const brief = composeText(project, body);
-    const review = body.review === true;
+    if (body.review === true && body.plan === true) throw new CollabError(400, '--review 和 --plan 只能选一个');
+    const mode: DelegationMode | undefined = body.review === true ? 'review' : body.plan === true ? 'plan' : undefined;
     const rawTitle = typeof body.title === 'string' ? body.title.trim() : '';
     const title = [...(rawTitle || delegationTitle(brief) || firstLinePreview(brief, 40))].slice(0, 80).join('');
     const parentMode = sessionOf(caller)?.permissionMode ?? caller.permissionMode;
@@ -744,8 +745,8 @@ export function createCollabManager(deps: CollabDeps) {
       projectId: project.id,
       agent,
       title,
-      prompt: delegationPrompt({ title: caller.title, agent: caller.agent }, brief, { review }),
-      delegation: { parentTaskId: caller.id, brief: firstLinePreview(brief, 140), round: 1, createdAt: Date.now(), ...(review ? { mode: 'review' as const } : {}) },
+      prompt: delegationPrompt({ title: caller.title, agent: caller.agent }, brief, { mode }),
+      delegation: { parentTaskId: caller.id, brief: firstLinePreview(brief, 140), round: 1, createdAt: Date.now(), ...(mode ? { mode } : {}) },
       ...(parentMode ? { permissionMode: parentMode } : {}),
     });
     seedSessionHop(session.id, hop);
@@ -795,7 +796,10 @@ export function createCollabManager(deps: CollabDeps) {
     const d = child.delegation!;
     const nextRound = d.round + 1;
     if (nextRound > MAX_DELEGATION_ROUNDS) {
-      throw new CollabError(409, `这个委派任务已经返工 ${d.round - 1} 轮（上限 ${MAX_DELEGATION_ROUNDS - 1} 轮），请自己接手修改，或请用户决定下一步`);
+      const next = d.mode === 'review' ? '仍有 BLOCKING 的交给用户决定'
+        : d.mode === 'plan' ? '还有疑问的自己核实或问用户'
+          : '请自己接手修改，或请用户决定下一步';
+      throw new CollabError(409, `这个委派任务已经到第 ${d.round} 轮（上限 ${MAX_DELEGATION_ROUNDS} 轮），不能再返工；${next}`);
     }
     const hop = checkDelegationHop(callerSessionId);
     if (!deps.availableAgents().includes(child.agent)) {
@@ -823,7 +827,7 @@ export function createCollabManager(deps: CollabDeps) {
       result = deps.deliverToTask({
         targetTask: updated,
         project,
-        text: delegationReworkText({ title: caller.title }, nextRound, feedback),
+        text: delegationReworkText({ title: caller.title }, nextRound, feedback, d.mode),
         system: true,
         onDelivered: () => {
           const sid = store.getTask(child.id)?.sessionId ?? boundSessionId;

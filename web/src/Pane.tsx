@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
 import type { ActivityPhase, Card, CliToolInfo, Project, QuotaInfo, SessionActivity, SessionContext, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
-import { agentLabel, DELEGATION_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
+import { agentLabel, DELEGATION_LABEL, DELEGATION_MODE_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
 import { attach, detach, fitEntry, focusOnly, isReplayEmpty, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty } from './terms.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { ContextMiniBar } from './QuotaPanel.tsx';
@@ -596,7 +596,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           )}
           {delegState && (
             <span className={`pane-delegation st-deleg-${delegState}`} data-testid="pane-delegation" data-state={delegState}>
-              {task?.delegation?.mode === 'review' ? '评审' : '委派'} · {DELEGATION_LABEL[delegState]}
+              {task?.delegation?.mode ? DELEGATION_MODE_LABEL[task.delegation.mode] : '委派'} · {DELEGATION_LABEL[delegState]}
             </span>
           )}
           {parentTask?.sessionId && onOpenParent && (

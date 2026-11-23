@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import pty from 'node-pty';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DELEGATION_INSTRUCTIONS, DELEGATION_RULES_MAX, composeDelegationInstructions, delegationState } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_INSTRUCTIONS, DELEGATION_RULES_MAX, composeDelegationInstructions, delegationState } from '../shared/protocol.ts';
 import { writeHookFiles } from './agents.ts';
 import { MAX_DELEGATION_ROUNDS, MAX_OPEN_DELEGATIONS } from './collab.ts';
 import { createApp } from './http.ts';
@@ -871,6 +871,13 @@ describe('cross-CLI delegation', () => {
       expect(relayed).toContain('给出了评审结论');
       expect(relayed).toContain(`shoal done ${r.json.task.handle}`);
       expect(relayed).not.toContain('请验收');
+      // Sending a reviewer back asks it to re-check; it must not be told to make the changes (it once edited files on rework).
+      const rw = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: r.json.task.handle, note: 'RECHECK-MARKER' } });
+      expect(rw.status).toBe(200);
+      await waitDelivered(rc.rec, 'RECHECK-MARKER');
+      const recheck = rc.rec.written.join('');
+      expect(recheck).toContain('只读评审者');
+      expect(recheck).not.toContain('请按下面的意见修改');
       const e = await delegate(h, main, { title: 'Exec', note: 'do it' });
       expect(e.json.task.mode).toBeUndefined();
       const ec = childOf(h, e.json.task.id);
@@ -881,11 +888,87 @@ describe('cross-CLI delegation', () => {
     }
   });
 
+  it('shoal delegate --plan makes a read-only advisor child whose plan comes back to merge, never as work to accept', { timeout: 120_000 }, async () => {
+    process.env.WORKBENCH_FAKE_AGENT = '1';
+    const h = await setupHarness();
+    try {
+      const p = (await h.api('POST', '/api/projects', { name: 'Deleg', path: h.projDir })).json;
+      const main = await startMain(h, p.id, 'Main P');
+      const cli = path.join(h.stateDir, 'bin', 'shoal-cli.mjs');
+      // Both read-only modes at once is ambiguous: the CLI and the server each refuse it.
+      const both = await runCli(process.execPath, [cli, 'delegate', 'fake', '--review', '--plan', '-m', 'x'], { cwd: h.projDir, env: main.rec.env });
+      expect(both.code).toBe(2);
+      expect(both.stderr).toContain('只能选一个');
+      expect((await delegate(h, main, { note: 'x', review: true, plan: true })).status).toBe(400);
+
+      const out = await runCli(process.execPath, [cli, 'delegate', 'fake', '--plan', '--title', 'Plan', '-m', 'design the storage'], { cwd: h.projDir, env: main.rec.env });
+      expect(out.code).toBe(0);
+      expect(out.stdout).toContain('只读方案顾问');
+      expect(out.stdout).toContain('和你的方案合并后');
+      expect(out.stdout).not.toContain('验收后');
+      const list = await h.peer('GET', '/api/peer/delegations', main.rec.peerToken);
+      const summary = list.json.tasks.find((t: { title: string }) => t.title === 'Plan');
+      expect(summary.mode).toBe('plan');
+      const pc = childOf(h, summary.id);
+      expect(pc.task.delegation?.mode).toBe('plan');
+      const first = pc.rec.args.find(a => a.includes('design the storage')) ?? '';
+      expect(first).toContain('方案顾问');
+      expect(first).toContain('只读');
+      expect(first).not.toContain('子任务执行者');
+      expect(first).not.toContain('结论：PASS');
+
+      await h.hook(pc.sid, 'fake', 'UserPromptSubmit', { prompt: 'turn' });
+      await h.hook(pc.sid, 'fake', 'Stop', { last_assistant_message: 'PLAN-MARKER' });
+      await waitDelivered(main.rec, 'PLAN-MARKER');
+      const relayed = main.rec.written.join('');
+      expect(relayed).toContain('独立方案');
+      expect(relayed).toContain('合并');
+      expect(relayed).not.toContain('请验收');
+
+      const st = await runCli(process.execPath, [cli, 'status'], { cwd: h.projDir, env: main.rec.env });
+      expect(st.stdout).toContain(`${summary.handle} [fake · 方案] Plan`);
+      const rw = await runCli(process.execPath, [cli, 'rework', summary.handle, '-m', 'FOLLOWUP-MARKER'], { cwd: h.projDir, env: main.rec.env });
+      expect(rw.code).toBe(0);
+      expect(rw.stdout).toContain('已请方案顾问补充');
+      await waitDelivered(pc.rec, 'FOLLOWUP-MARKER');
+      const followup = pc.rec.written.join('');
+      expect(followup).toContain('只读的方案顾问');
+      expect(followup).not.toContain('请按下面的意见修改');
+      expect(followup).not.toContain('结论：PASS');
+
+      // Up to the shared round cap: the last relay offers no rework, and a rework past it is refused with advisor wording.
+      for (let round = 2; round <= MAX_DELEGATION_ROUNDS; round++) {
+        await h.hook(pc.sid, 'fake', 'UserPromptSubmit', { prompt: 'turn' });
+        await h.hook(pc.sid, 'fake', 'Stop', { last_assistant_message: `PLAN-R${round}` });
+        await waitDelivered(main.rec, `PLAN-R${round}`);
+        // Each relay starts a new main-task turn; the per-turn send cap counts within one turn.
+        await h.hook(main.sid, 'fake', 'UserPromptSubmit', { prompt: 'plan pasted' });
+        await h.hook(main.sid, 'fake', 'Stop', { last_assistant_message: `main merge ${round}` });
+        if (round < MAX_DELEGATION_ROUNDS) {
+          const more = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: summary.handle, note: `ASK-R${round + 1}` } });
+          expect(more.status).toBe(200);
+          await waitDelivered(pc.rec, `ASK-R${round + 1}`);
+        }
+      }
+      const lastRelay = main.rec.written.join('').split(`PLAN-R${MAX_DELEGATION_ROUNDS}`).pop() ?? '';
+      expect(lastRelay).toContain('不能再追问');
+      expect(lastRelay).not.toContain(`shoal rework ${summary.handle}`);
+      const capped = await h.peer('POST', '/api/peer/rework', main.rec.peerToken, { body: { target: summary.handle, note: 'too many' } });
+      expect(capped.status).toBe(409);
+      expect(JSON.stringify(capped.json)).toContain('问用户');
+      expect(JSON.stringify(capped.json)).not.toContain('自己接手修改');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('settings validate, store and reset delegationRules', async () => {
     process.env.WORKBENCH_FAKE_AGENT = '1';
     const h = await setupHarness();
     try {
       expect(h.store.settings().delegationRules).toBeUndefined();
+      // Settings opens with the default text; over the cap the user could not save even a small edit of it.
+      expect([...DEFAULT_DELEGATION_RULES].length).toBeLessThanOrEqual(DELEGATION_RULES_MAX);
       expect((await h.api('POST', '/api/settings', { delegationRules: 5 })).status).toBe(400);
       expect((await h.api('POST', '/api/settings', { delegationRules: 'x'.repeat(DELEGATION_RULES_MAX + 1) })).status).toBe(400);
       expect(h.store.settings().delegationRules).toBeUndefined();

@@ -34,7 +34,7 @@ import type { Usage } from './usage.ts';
 import { titleFromPrompt, titleFromReply, titlePrompt, promptPreview } from './titles.ts';
 import { gitInfo } from './git.ts';
 import {
-  WorkspaceError, createFsEntry, deleteFsEntry, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, openRawPreview, resolveProjectPath, writeFileEntry,
+  WorkspaceError, createFsEntry, deleteFsEntry, discardFile, invalidateProjectGitCache, listAllFiles, listChanges, refreshIgnoredIndex, searchIgnoredFiles, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, openRawPreview, resolveProjectPath, writeFileEntry,
 } from './workspace.ts';
 import { createMobileController } from './mobile.ts';
 import { AgyOptimizeError, applyAgyOptimization, getAgyOptimizeStatus } from './agyOptimize.ts';
@@ -1188,7 +1188,7 @@ export function createApp(cfg: AppConfig) {
       broadcast({ t: 'task-removed', id: task.id });
       return send(res, 200, { ok: true });
     }
-    const pw = pathname.match(/^\/api\/projects\/([^/]+)\/(changes|diff|tree|files|file|raw|discard)$/);
+    const pw = pathname.match(/^\/api\/projects\/([^/]+)\/(changes|diff|tree|files|ignored-files|file|raw|discard)$/);
     if (pw) {
       const project = store.getProject(decodeURIComponent(pw[1]));
       if (!project) throw new HttpError(404, '项目不存在');
@@ -1204,7 +1204,11 @@ export function createApp(cfg: AppConfig) {
       }
       if (method === 'GET' && sub === 'diff') return send(res, 200, await readDiff(project.path, q.get('path') ?? ''));
       if (method === 'GET' && sub === 'tree') return send(res, 200, await listTree(project.path, q.get('path') ?? ''));
-      if (method === 'GET' && sub === 'files') return send(res, 200, await listAllFiles(project.path));
+      if (method === 'GET' && sub === 'files') {
+        refreshIgnoredIndex(project.path); // the finder just opened: re-index gitignored files while the user types
+        return send(res, 200, await listAllFiles(project.path));
+      }
+      if (method === 'GET' && sub === 'ignored-files') return send(res, 200, await searchIgnoredFiles(project.path, q.get('q') ?? ''));
       if (method === 'GET' && sub === 'file') return send(res, 200, readFileEntry(project.path, q.get('path') ?? '', q.get('stat') === '1'));
       if (method === 'GET' && sub === 'raw') {
         sendRawPreview(req, res, openRawPreview(project.path, q.get('path') ?? ''), '[raw]');

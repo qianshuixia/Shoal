@@ -271,9 +271,10 @@ kbd {
 .quick { position: relative; }
 .group-head .remove-project { opacity: 0; }
 .group-head:hover .remove-project, .group-head:focus-within .remove-project { opacity: 1; }
+/* Portaled to <body> and placed by QuickMenu (fixed, right-aligned under the + button). */
 .menu {
-  position: absolute; z-index: 30; top: calc(100% + 0.25rem); right: 0; min-width: 13.125rem;
-  padding: 0.25rem; display: flex; flex-direction: column;
+  position: fixed; z-index: 90; min-width: min(13.125rem, calc(100vw - 1rem)); width: max-content; max-width: calc(100vw - 1rem);
+  padding: 0.25rem; display: flex; flex-direction: column; white-space: nowrap;
   background: var(--raised); border: 1px solid var(--line-2); border-radius: 0.5rem;
   box-shadow: 0 0.75rem 2rem rgba(0, 0, 0, .45);
 }
@@ -283,7 +284,8 @@ kbd {
   background: transparent; border: 0; border-radius: 0.3125rem; text-align: left;
 }
 .menu button:hover:not(:disabled), .menu button:focus-visible { background: var(--active); outline: none; }
-.menu-hint { margin-left: auto; display: flex; align-items: center; gap: 0.375rem; color: var(--text-3); font-size: 0.7188rem; }
+.menu-hint { margin-left: auto; padding-left: 1rem; display: flex; align-items: center; gap: 0.375rem; color: var(--text-3); font-size: 0.7188rem; }
+.menu-hint > span { display: flex; gap: 0.125rem; }
 .menu-hint kbd { margin: 0; }
 
 /* Task rows */
@@ -916,6 +918,13 @@ kbd {
   background: transparent; border: 0; border-radius: 0.3125rem; text-align: left; color: var(--text-2); font-size: 0.7813rem;
 }
 .finder-item.on, .finder-item:hover:not(:disabled) { background: var(--active); color: var(--text); }
+.finder-item .change-dir { margin-left: auto; }
+.finder-item.ignored:not(.on) .change-base { color: var(--text-3); }
+.finder-tag {
+  flex: none; align-self: center; padding: 0 0.3125rem; border: 1px solid var(--line-2); border-radius: 0.25rem;
+  color: var(--text-3); font-size: 0.625rem; line-height: 1.5;
+}
+.insp-finder-foot { padding: 0.3125rem 0.75rem; border-top: 1px solid var(--line); color: var(--text-3); font-size: 0.6875rem; }
 
 /* Model selector hint & sidebar live activity line */
 .field-hint { color: var(--text-3); font-size: 0.75rem; line-height: 1.45; }

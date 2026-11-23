@@ -2,7 +2,7 @@
 // 3-mode layout, sidebar git-chip linkage, unified diff & quick edit, file tree & Ctrl+P,
 // external disk-modification hot-reload & optimistic-lock conflict banner, Markdown XSS safety,
 // terminal in-project file:line link routing, and the zero-terminal-resize invariant.
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type Route } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -60,7 +60,12 @@ test('3-mode layout, branch chip linkage, diff/edit/save/discard, tree & Ctrl+P,
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.mkdirSync(path.join(dir, 'node_modules', 'demo'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'node_modules', 'demo', 'index.js'), 'module.exports = 1;\n');
-  fs.writeFileSync(path.join(dir, '.gitignore'), 'node_modules/\n.env\n');
+  fs.writeFileSync(path.join(dir, '.gitignore'), 'node_modules/\n.env\n.tmp/\ndist/\n');
+  // Gitignored build / scratch output that Ctrl+P must still find (the reported case sits under .tmp/…/out/).
+  fs.mkdirSync(path.join(dir, '.tmp', 'promo', 'out'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.tmp', 'promo', 'out', 'flow-demo-short.mp4'), Buffer.alloc(64, 1));
+  fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'dist', 'app.ts'), 'export const built = 1;\n');
   fs.writeFileSync(path.join(dir, 'src', 'app.ts'), 'export const a = 1;\nexport const b = 2;\n');
   fs.writeFileSync(path.join(dir, 'src', 'discard.ts'), 'export const keep = true;\n');
   execFileSync('git', ['add', '.'], { cwd: dir });
@@ -134,11 +139,96 @@ test('3-mode layout, branch chip linkage, diff/edit/save/discard, tree & Ctrl+P,
   await page.keyboard.press('Control+p');
   const finder = insp.getByTestId('file-finder');
   await expect(finder).toBeVisible();
+  const finderInput = finder.getByTestId('file-finder-input');
+  const finderItems = finder.getByTestId('file-finder-item');
+  // Same name in a tracked and a gitignored folder: the tracked one ranks first, the ignored one is tagged.
+  await finderInput.fill('app.ts');
+  await expect(finderItems.first()).toHaveAttribute('data-path', 'src/app.ts');
+  const builtItem = finder.locator('[data-testid="file-finder-item"][data-path="dist/app.ts"]');
+  await expect(builtItem).toHaveAttribute('data-ignored', 'true');
+  await expect(builtItem).toContainText('已忽略');
+  await expect(finder.locator('[data-path^="node_modules/"]')).toHaveCount(0);
+  // A file deep inside a gitignored folder is searchable and opens from the finder.
+  await finderInput.fill('demo-short.mp4');
+  await expect(finderItems).toHaveCount(1);
+  await expect(finderItems.first()).toHaveAttribute('data-path', '.tmp/promo/out/flow-demo-short.mp4');
+  await page.screenshot({ path: path.join(OUT, '02b-finder-ignored.png') });
+  await finderInput.press('Enter');
+  await expect(finder).toHaveCount(0);
+  await expect(insp.getByTestId('insp-filepath')).toHaveText('.tmp/promo/out/flow-demo-short.mp4');
+
+  await insp.focus();
+  await page.keyboard.press('Control+p');
+  await expect(finder).toBeVisible();
   await finder.getByTestId('file-finder-input').fill('.env');
   await finder.getByTestId('file-finder-input').press('Enter');
   await expect(finder).toHaveCount(0);
   await expect(insp.getByTestId('insp-filepath')).toHaveText('.env');
   await expect(insp.locator('.cm-content')).toContainText('API_TOKEN=local-dev');
+
+  // Gitignored matches come from a server index rebuilt on every open: a render written after the first open is found,
+  // and Enter pressed while that search is slow waits for it instead of opening the weak tracked match shown meanwhile.
+  fs.writeFileSync(path.join(dir, '.tmp', 'promo', 'out', 'sapp-render.mp4'), Buffer.alloc(64, 2));
+  const slowIgnored = async (route: Route) => {
+    await new Promise((r) => setTimeout(r, 800));
+    await route.continue();
+  };
+  const isIgnoredSearch = (url: URL) => url.pathname.endsWith('/ignored-files');
+  await page.route(isIgnoredSearch, slowIgnored);
+  await insp.focus();
+  await page.keyboard.press('Control+p');
+  await expect(finder).toBeVisible();
+  await finderInput.fill('sapp');
+  await expect(finderItems.first()).toHaveAttribute('data-path', 'src/app.ts');
+  await expect(finder.getByTestId('file-finder-searching')).toBeVisible();
+  await finderInput.press('Enter');
+  await expect(finder).toHaveCount(0);
+  await expect(insp.getByTestId('insp-filepath')).toHaveText('.tmp/promo/out/sapp-render.mp4');
+  // A tracked file named exactly as typed can't be outranked by any gitignored match, so Enter opens it at once.
+  await insp.focus();
+  await page.keyboard.press('Control+p');
+  await expect(finder).toBeVisible();
+  await finderInput.fill('app.ts');
+  await expect(finder.getByTestId('file-finder-searching')).toBeVisible();
+  await finderInput.press('Enter');
+  await expect(finder).toHaveCount(0, { timeout: 400 });
+  await expect(insp.getByTestId('insp-filepath')).toHaveText('src/app.ts');
+  // Typing after an Enter that is still waiting takes the Enter back: the new query's best hit does not open by itself.
+  await insp.focus();
+  await page.keyboard.press('Control+p');
+  await expect(finder).toBeVisible();
+  await finderInput.fill('sapp');
+  await finderInput.press('Enter');
+  await finderInput.press('-');
+  await expect(finderItems.first()).toHaveAttribute('data-path', '.tmp/promo/out/sapp-render.mp4');
+  await expect(finder).toBeVisible();
+  await expect(insp.getByTestId('insp-filepath')).toHaveText('src/app.ts');
+  await finderInput.press('Escape');
+  await expect(finder).toHaveCount(0);
+  await page.unroute(isIgnoredSearch, slowIgnored);
+
+  // A failed /files refresh keeps the last list but says it may be out of date; the next opening clears that.
+  const isFileList = (url: URL) => url.pathname.endsWith('/files');
+  const failFileList = (route: Route) => route.fulfill({ status: 500, body: 'boom' });
+  await page.route(isFileList, failFileList);
+  await insp.focus();
+  await page.keyboard.press('Control+p');
+  await expect(finder.getByTestId('file-finder-list-stale')).toBeVisible();
+  await finderInput.fill('app.ts');
+  await expect(finderItems.first()).toHaveAttribute('data-path', 'src/app.ts');
+  await finderInput.press('Escape');
+  await page.unroute(isFileList, failFileList);
+  // A file only the fresh list can hold proves the successful response was applied before the notice is checked.
+  const freshFile = path.join(dir, 'fresh-listing.md');
+  fs.writeFileSync(freshFile, '');
+  await insp.focus();
+  await page.keyboard.press('Control+p');
+  await finderInput.fill('fresh-listing');
+  await expect(finderItems.first()).toHaveAttribute('data-path', 'fresh-listing.md');
+  await expect(finder.getByTestId('file-finder-list-stale')).toHaveCount(0);
+  await finderInput.press('Escape');
+  await expect(finder).toHaveCount(0);
+  fs.rmSync(freshFile);
 
   // ZERO TERMINAL FLICKER INVARIANT: every action inside Inspector caused 0 px geometry change and 0 PTY resize!
   const bodyAfter = (await pane(page, 0).locator('.pane-body').boundingBox())!;

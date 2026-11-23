@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { CSSProperties } from 'react';
+import type { CSSProperties, RefObject } from 'react';
+import { createPortal } from 'react-dom';
 import type {
   AgentKind, ArchiveStoppedResult, Card, CliToolInfo, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, FsPasteResult, GitInfo, OpenMode, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
-import { agentLabel, cleanPreviewText, DEFAULT_SETTINGS, DELEGATION_LABEL, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
+import { agentLabel, cleanPreviewText, DEFAULT_SETTINGS, DELEGATION_LABEL, DELEGATION_MODE_LABEL, DELEGATION_MODE_SHORT, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
 import { connect, send } from './ws.ts';
 import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, pasteToTerminal, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
 import type { TermGlDebug } from './terms.ts';
@@ -1650,6 +1651,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<'before' | 'after' | null>(null); // insertion line while another project is dragged over
   const [menu, setMenu] = useState(false);
+  const quickRef = useRef<HTMLDivElement>(null);
   const [expandedKids, setExpandedKids] = useState<ReadonlySet<string>>(() => new Set()); // main tasks listing every closed delegation
   const [collapsedTrees, setCollapsedTrees] = useState<ReadonlySet<string>>(() => new Set()); // main tasks whose active delegation subtree is folded
   const waiting = tasks.filter((t) => t.phase === 'active' && t.sessionId && sessionsById.get(t.sessionId)?.status === 'needs_you').length;
@@ -1801,7 +1803,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
         <button className="icon-btn remove-project" data-testid="project-remove" title="从工作台移除项目" onClick={onRemoveProject}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.5 8h6l.5-8M7 7v3.5M9 7v3.5" /></svg>
         </button>
-        <div className="quick">
+        <div className="quick" ref={quickRef}>
           <button
             className="icon-btn"
             data-testid="project-add-task"
@@ -1814,6 +1816,7 @@ function ProjectGroup({ project, tasks, sessionsById, activityById, visibleIds, 
           </button>
           {menu && (
             <QuickMenu
+              anchor={quickRef}
               agents={agents}
               cliTools={cliTools}
               defaultAgent={defaultAgent}
@@ -1909,7 +1912,8 @@ function ArchiveSection({ projects, tasks, sessionsById, visibleIds, focusedId, 
   );
 }
 
-function QuickMenu({ agents, cliTools, defaultAgent, onPick, onClose }: {
+function QuickMenu({ anchor, agents, cliTools, defaultAgent, onPick, onClose }: {
+  anchor: RefObject<HTMLElement | null>; // the + button's wrapper: the menu hangs below it and a click on it toggles
   agents: AgentKind[];
   cliTools?: CliToolInfo[];
   defaultAgent: AgentKind;
@@ -1918,20 +1922,55 @@ function QuickMenu({ agents, cliTools, defaultAgent, onPick, onClose }: {
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const ordered = [defaultAgent, ...agents.filter((a) => a !== defaultAgent)].filter((a) => agents.includes(a));
-  useEffect(() => {
-    ref.current?.querySelector<HTMLButtonElement>('button')?.focus();
-    const away = (e: MouseEvent) => {
-      if (!ref.current?.parentElement?.contains(e.target as Node)) onClose();
+  // Portaled and fixed so the scrolling sidebar can't clip it or squeeze it to the + button's width
+  // (which wrapped "Claude Code"); right-aligned under the button and kept inside the window.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const place = () => {
+      const a = anchor.current?.getBoundingClientRect();
+      if (!a) return;
+      const pad = 8;
+      const gap = 4;
+      const { offsetWidth: w, offsetHeight: h } = el;
+      const left = Math.max(pad, Math.min(a.right - w, window.innerWidth - w - pad));
+      const top = a.bottom + gap + h + pad > window.innerHeight ? Math.max(pad, a.top - gap - h) : a.bottom + gap;
+      el.style.left = `${left}px`;
+      el.style.top = `${top}px`;
     };
+    place();
+    el.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true });
+    // Ctrl+wheel zoom changes the root font size, not the window: the menu resizes, so place it again.
+    const ro = new ResizeObserver(place);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  useEffect(() => {
+    const away = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (!ref.current?.contains(t) && !anchor.current?.contains(t)) onClose();
+    };
+    // A fixed menu would drift off its button when the sidebar scrolls; terminals scrolling elsewhere don't matter.
+    const scrolled = (e: Event) => {
+      const t = e.target;
+      if (t instanceof Node && anchor.current && t.contains(anchor.current)) onClose();
+    };
+    const resized = () => onClose();
     document.addEventListener('mousedown', away);
-    return () => document.removeEventListener('mousedown', away);
+    document.addEventListener('scroll', scrolled, true);
+    window.addEventListener('resize', resized);
+    return () => {
+      document.removeEventListener('mousedown', away);
+      document.removeEventListener('scroll', scrolled, true);
+      window.removeEventListener('resize', resized);
+    };
   }, []);
   const move = (dir: number) => {
     const items = [...(ref.current?.querySelectorAll<HTMLButtonElement>('button') ?? [])];
     const i = items.indexOf(document.activeElement as HTMLButtonElement);
     items[(i + dir + items.length) % items.length]?.focus();
   };
-  return (
+  return createPortal(
     <div
       className="menu"
       role="menu"
@@ -1940,7 +1979,10 @@ function QuickMenu({ agents, cliTools, defaultAgent, onPick, onClose }: {
       onKeyDown={(e) => {
         if (e.key === 'ArrowDown') { e.preventDefault(); move(1); }
         else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
-        else if (e.key === 'Escape') onClose();
+        else if (e.key === 'Escape') {
+          anchor.current?.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true });
+          onClose();
+        }
       }}
     >
       <div className="menu-label">用哪个 agent</div>
@@ -1955,7 +1997,8 @@ function QuickMenu({ agents, cliTools, defaultAgent, onPick, onClose }: {
           </button>
         ))
       )}
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -1984,11 +2027,11 @@ function TaskRow({ task, nested, session, activity, inPane, paneFocused, paneMar
   const delegState = delegationState(task, session);
   const round = task.delegation?.round ?? 1;
   const delegFullLabel = delegState
-    ? `${task.delegation?.mode === 'review' ? '评审 · ' : ''}${DELEGATION_LABEL[delegState]}${round > 1 ? ` · 第${round}轮` : ''}`
+    ? `${task.delegation?.mode ? `${DELEGATION_MODE_LABEL[task.delegation.mode]} · ` : ''}${DELEGATION_LABEL[delegState]}${round > 1 ? ` · 第${round}轮` : ''}`
     : undefined;
   const delegStatus = delegState && (
     <span className={`status st-deleg st-deleg-${delegState}`} data-testid="task-delegation-status" title={delegFullLabel}>
-      {task.delegation?.mode === 'review' ? '审 · ' : ''}{DELEGATION_LABEL[delegState]}{round > 1 ? ` · R${round}` : ''}
+      {task.delegation?.mode ? `${DELEGATION_MODE_SHORT[task.delegation.mode]} · ` : ''}{DELEGATION_LABEL[delegState]}{round > 1 ? ` · R${round}` : ''}
     </span>
   );
   const [editing, setEditing] = useState(false);

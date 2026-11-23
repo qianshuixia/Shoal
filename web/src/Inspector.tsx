@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
-  AgentKind, ChangedFile, ChangeStatus, CliToolInfo, DiffPayload, FileListResult, FilePayload, FsCreateResult, FsDeleteResult, FsPasteResult, FsRenameResult, GitInfo, OpenMode, Project, ProjectChanges, QuotaInfo, SessionContext, SessionInfo, Task, TaskMetrics, TreeEntry, TreeListing, WriteFileResult,
+  AgentKind, ChangedFile, ChangeStatus, CliToolInfo, DiffPayload, FileListResult, FilePayload, FsCreateResult, FsDeleteResult, FsPasteResult, FsRenameResult, GitInfo, IgnoredFileSearch, OpenMode, Project, ProjectChanges, QuotaInfo, SessionContext, SessionInfo, Task, TaskMetrics, TreeEntry, TreeListing, WriteFileResult,
 } from '../../shared/protocol.ts';
 import { CodeEditor, type JumpTarget } from './Editor.tsx';
 import { MarkdownPreview } from './MarkdownPreview.tsx';
 import { RawPreview, formatBytes } from './RawPreview.tsx';
 import { InspectorOverview } from './QuotaPanel.tsx';
 import type { QuotaDisplayMode } from './quota.ts';
-import { rawPreviewOf } from '../../shared/protocol.ts';
+import { FINDER_QUERY_MAX, rawPreviewOf, scoreFinderPath } from '../../shared/protocol.ts';
 import {
   ContextMenu, NamePromptDialog, contextMenuPointForElement, copyText, isContextMenuKey, isMacClient, joinProjectPath,
   type ContextMenuEntry, type ContextMenuState, type FsClipboardItem, type FsMutationEvent, type NamePromptConfig,
@@ -86,24 +86,35 @@ function ancestorDirs(posixPath: string): string[] {
   return out;
 }
 
-// Lightweight fuzzy match score for Ctrl+P file search (higher is better, -1 = no match).
-function scorePath(candidate: string, query: string): number {
-  if (!query) return 1;
-  const lowC = candidate.toLowerCase();
-  const lowQ = query.toLowerCase();
-  const base = splitDirBase(lowC).base;
-  if (base === lowQ) return 1000;
-  if (base.startsWith(lowQ)) return 800 - base.length;
-  const baseIdx = base.indexOf(lowQ);
-  if (baseIdx !== -1) return 600 - baseIdx * 5 - base.length;
-  const fullIdx = lowC.indexOf(lowQ);
-  if (fullIdx !== -1) return 400 - fullIdx * 2;
-  // Subsequence match
-  let qi = 0;
-  for (let ci = 0; ci < lowC.length && qi < lowQ.length; ci++) {
-    if (lowC[ci] === lowQ[qi]) qi++;
+const EMPTY_FINDER_LIST: FileListResult = { files: [], truncated: false };
+// The server's best gitignored matches for `query`; kept while the next query is in flight and re-scored against it.
+interface IgnoredHits extends IgnoredFileSearch { query: string; failed: boolean }
+const FINDER_LIMIT = 60;
+const IGNORED_SEARCH_DEBOUNCE_MS = 120;
+// The server answers within its 15 s index budget; past this a stuck request gives up so a waiting Enter still opens.
+const FINDER_REQUEST_TIMEOUT_MS = 20_000;
+// Gitignored files lose ties to tracked ones (src/App.tsx before dist/App.tsx) but still win on a clearly better name match.
+const IGNORED_RANK_PENALTY = 50;
+const IGNORED_BEST_SCORE = scoreFinderPath('x', 'x') - IGNORED_RANK_PENALTY; // the top score (an exact full path), minus the penalty
+
+interface FinderHit { path: string; ignored: boolean }
+
+function rankFinderFiles(tracked: readonly string[], ignored: readonly string[], query: string): FinderHit[] {
+  const q = query.trim();
+  if (!q) return tracked.slice(0, FINDER_LIMIT).map((path) => ({ path, ignored: false }));
+  const scored: { hit: FinderHit; s: number }[] = [];
+  for (const path of tracked) {
+    const s = scoreFinderPath(path, q);
+    if (s >= 0) scored.push({ hit: { path, ignored: false }, s });
   }
-  return qi === lowQ.length ? 100 - lowC.length : -1;
+  for (const path of ignored) {
+    const s = scoreFinderPath(path, q);
+    if (s >= 0) scored.push({ hit: { path, ignored: true }, s: s - IGNORED_RANK_PENALTY });
+  }
+  return scored
+    .sort((a, b) => b.s - a.s || a.hit.path.localeCompare(b.hit.path))
+    .slice(0, FINDER_LIMIT)
+    .map((x) => x.hit);
 }
 
 const CHANGE_VIRTUAL_THRESHOLD = 100;
@@ -212,13 +223,14 @@ export function Inspector({
 
   // Ctrl+P quick file finder
   const [finderOpen, setFinderOpen] = useState(false);
-  const [allFiles, setAllFiles] = useState<string[]>([]);
+  const [finderList, setFinderList] = useState<FileListResult>(EMPTY_FINDER_LIST);
   const [finderLoading, setFinderLoading] = useState(false);
+  const [finderListStale, setFinderListStale] = useState(false); // the last /files request failed: the list is from before
+  const [ignoredHits, setIgnoredHits] = useState<IgnoredHits | null>(null);
   const [finderQuery, setFinderQuery] = useState('');
   const [finderIdx, setFinderIdx] = useState(0);
-  const pendingEnterRef = useRef(false);
-  const finderQueryRef = useRef('');
-  finderQueryRef.current = finderQuery;
+  const [pendingEnter, setPendingEnter] = useState(false); // Enter pressed on the top row before it was final
+  const finderReqRef = useRef<AbortController | null>(null); // the /files request of the current finder opening
 
   const projectId = project?.id ?? '';
   const activePath = tab === 'changes' ? changePath : tab === 'files' ? filePath : null;
@@ -457,7 +469,12 @@ export function Inspector({
     setConflict(false);
     setTreeMap({});
     setFinderOpen(false);
-    setAllFiles([]);
+    finderReqRef.current?.abort();
+    finderReqRef.current = null;
+    setFinderLoading(false);
+    setFinderList(EMPTY_FINDER_LIST);
+    setFinderListStale(false);
+    setIgnoredHits(null);
     if (changeListRef.current) changeListRef.current.scrollTop = 0;
     if (treeScrollRef.current) treeScrollRef.current.scrollTop = 0;
 
@@ -1037,46 +1054,75 @@ export function Inspector({
     setFinderQuery('');
     setFinderIdx(0);
     setFinderLoading(true);
-    pendingEnterRef.current = false;
+    setIgnoredHits(null);
+    setPendingEnter(false);
+    // Only the latest opening may touch finder state: an earlier response (reopened, or another project) is dropped.
+    finderReqRef.current?.abort();
+    const ctrl = new AbortController();
+    finderReqRef.current = ctrl;
+    const limit = setTimeout(() => ctrl.abort(), FINDER_REQUEST_TIMEOUT_MS);
     try {
-      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`);
-      if (!res.ok) return;
+      // Also makes the server re-index gitignored files, which the effect below searches as the user types.
+      const res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`, { signal: ctrl.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = (await res.json()) as FileListResult;
-      if (liveRef.current.projectId !== projectId) return;
-      setAllFiles(json.files);
-      if (pendingEnterRef.current) {
-        pendingEnterRef.current = false;
-        const q = finderQueryRef.current.trim();
-        const best = !q
-          ? json.files[0]
-          : json.files
-              .map((f) => ({ f, s: scorePath(f, q) }))
-              .filter((x) => x.s >= 0)
-              .sort((a, b) => b.s - a.s || a.f.localeCompare(b.f))[0]?.f;
-        if (best) {
-          setFinderOpen(false);
-          setTab('files');
-          setFilePath(best);
-          if (isMarkdownPath(best)) setMdMode('preview');
-        }
+      if (finderReqRef.current === ctrl) {
+        setFinderList(json);
+        setFinderListStale(false);
       }
     } catch {
-      // ignore
+      // Timed out or failed: the finder keeps the list it had and says so. An abort by a newer opening changes nothing.
+      if (finderReqRef.current === ctrl) setFinderListStale(true);
     } finally {
-      setFinderLoading(false);
+      clearTimeout(limit);
+      if (finderReqRef.current === ctrl) {
+        finderReqRef.current = null;
+        setFinderLoading(false);
+      }
     }
   }, [projectId]);
 
-  const filteredFiles = useMemo(() => {
-    const q = finderQuery.trim();
-    if (!q) return allFiles.slice(0, 60);
-    return allFiles
-      .map((f) => ({ f, s: scorePath(f, q) }))
-      .filter((x) => x.s >= 0)
-      .sort((a, b) => b.s - a.s || a.f.localeCompare(b.f))
-      .slice(0, 60)
-      .map((x) => x.f);
-  }, [allFiles, finderQuery]);
+  // Gitignored files live in a server-side index (an ignored .tmp/ can hold hundreds of thousands of files).
+  const finderQ = finderQuery.trim().slice(0, FINDER_QUERY_MAX);
+  useEffect(() => {
+    if (!finderOpen || !projectId || !finderQ) return;
+    const ctrl = new AbortController();
+    let stale = false; // superseded by a newer query, or the finder closed
+    const timer = setTimeout(() => {
+      void (async () => {
+        let hits: IgnoredHits = { query: finderQ, files: [], indexed: 0, truncated: false, unreadable: 0, failed: true };
+        const limit = setTimeout(() => ctrl.abort(), FINDER_REQUEST_TIMEOUT_MS);
+        try {
+          const res = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/ignored-files?q=${encodeURIComponent(finderQ)}`,
+            { signal: ctrl.signal },
+          );
+          if (res.ok) hits = { query: finderQ, ...((await res.json()) as IgnoredFileSearch), failed: false };
+        } catch {
+          // aborted, timed out or failed: show tracked matches only
+        } finally {
+          clearTimeout(limit);
+        }
+        if (!stale) setIgnoredHits(hits);
+      })();
+    }, IGNORED_SEARCH_DEBOUNCE_MS);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+      ctrl.abort();
+    };
+  }, [finderOpen, projectId, finderQ]);
+  const ignoredSearching = finderOpen && !!finderQ && ignoredHits?.query !== finderQ;
+
+  const filteredFiles = useMemo(
+    () => rankFinderFiles(finderList.files, ignoredHits?.files ?? [], finderQ),
+    [finderList, ignoredHits, finderQ],
+  );
+  // The top row is final once the file list is in and either the ignored search answered or the row is a tracked file
+  // named exactly as typed (no gitignored match can outrank that).
+  const finderTop = filteredFiles[0];
+  const finderSettled = !finderLoading
+    && (!ignoredSearching || (!!finderTop && !finderTop.ignored && scoreFinderPath(finderTop.path, finderQ) > IGNORED_BEST_SCORE));
 
   const pickFileFromTreeOrFinder = useCallback((relPosix: string, line?: number, scrollIntoView = false) => {
     if (relPosix !== filePath && !confirmDiscardDraft()) return;
@@ -1098,6 +1144,16 @@ export function Inspector({
     }
     if (line) setJump({ line, seq: Date.now() });
   }, [filePath, confirmDiscardDraft, projectId, fetchTreeDir]);
+
+  // Enter pressed on the top row before it was final opens the best hit as soon as it is.
+  useEffect(() => {
+    if (!pendingEnter) return;
+    if (!finderOpen) setPendingEnter(false);
+    else if (finderSettled) {
+      setPendingEnter(false);
+      if (finderTop) pickFileFromTreeOrFinder(finderTop.path);
+    }
+  }, [pendingEnter, finderOpen, finderSettled, finderTop, pickFileFromTreeOrFinder]);
 
   // Ctrl+P shortcut inside Inspector (or global when Inspector is open and focus is not inside terminal? Spec: when focused inside Inspector, plus button)
   const onPanelKeyDown = (e: React.KeyboardEvent) => {
@@ -2004,6 +2060,7 @@ export function Inspector({
                   onChange={(e) => {
                     setFinderQuery(e.target.value);
                     setFinderIdx(0);
+                    setPendingEnter(false); // an Enter still waiting was meant for the previous query
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Escape') {
@@ -2011,41 +2068,71 @@ export function Inspector({
                       setFinderOpen(false);
                     } else if (e.key === 'ArrowDown') {
                       e.preventDefault();
+                      setPendingEnter(false); // moving the selection takes back an Enter still waiting on the top row
                       setFinderIdx((i) => (filteredFiles.length ? (i + 1) % filteredFiles.length : 0));
                     } else if (e.key === 'ArrowUp') {
                       e.preventDefault();
+                      setPendingEnter(false);
                       setFinderIdx((i) => (filteredFiles.length ? (i - 1 + filteredFiles.length) % filteredFiles.length : 0));
                     } else if (e.key === 'Enter') {
                       e.preventDefault();
                       const chosen = filteredFiles[finderIdx];
-                      if (chosen) pickFileFromTreeOrFinder(chosen);
-                      else if (finderLoading) pendingEnterRef.current = true;
+                      // A row the user moved to opens at once; the top row may still be outranked by a gitignored match
+                      // in flight, so it waits until it is final.
+                      if (chosen && (finderIdx !== 0 || finderSettled)) pickFileFromTreeOrFinder(chosen.path);
+                      else if (finderLoading || ignoredSearching) setPendingEnter(true);
                     }
                   }}
                 />
                 <div className="insp-finder-list">
                   {filteredFiles.length === 0 ? (
-                    <div className="insp-empty-hint">没有匹配的文件</div>
+                    <div className="insp-empty-hint">
+                      {finderLoading ? '正在读取文件列表…' : ignoredSearching ? '正在搜索被忽略的文件…' : '没有匹配的文件'}
+                    </div>
                   ) : (
-                    filteredFiles.map((f, idx) => {
+                    filteredFiles.map(({ path: f, ignored }, idx) => {
                       const { dir, base } = splitDirBase(f);
                       return (
                         <button
                           key={f}
                           type="button"
-                          className={`finder-item ${idx === finderIdx ? 'on' : ''}`}
+                          className={`finder-item ${idx === finderIdx ? 'on' : ''} ${ignored ? 'ignored' : ''}`}
                           data-testid="file-finder-item"
                           data-path={f}
+                          data-ignored={ignored || undefined}
                           onMouseEnter={() => setFinderIdx(idx)}
                           onClick={() => pickFileFromTreeOrFinder(f)}
                         >
                           <span className="change-base" data-private="">{base}</span>
                           {dir && <span className="change-dir" data-private="">{dir}</span>}
+                          {ignored && <span className="finder-tag" title="这个文件被 .gitignore 忽略">已忽略</span>}
                         </button>
                       );
                     })
                   )}
                 </div>
+                {ignoredSearching && filteredFiles.length > 0 && (
+                  <div className="insp-finder-foot" data-testid="file-finder-searching">正在搜索被忽略的文件…</div>
+                )}
+                {finderListStale && !finderLoading && (
+                  <div className="insp-finder-foot" data-testid="file-finder-list-stale">加载文件列表失败，未被忽略的文件可能不是最新的；关闭后重新按 Ctrl+P 重试</div>
+                )}
+                {finderList.truncated && (
+                  <div className="insp-finder-foot" data-testid="file-finder-truncated">文件太多，只索引了前 20,000 个</div>
+                )}
+                {!ignoredSearching && finderQ && ignoredHits?.failed && (
+                  <div className="insp-finder-foot" data-testid="file-finder-ignored-failed">搜索被忽略的文件失败，这里只有未被忽略的文件</div>
+                )}
+                {!ignoredSearching && finderQ && ignoredHits?.truncated && (
+                  <div className="insp-finder-foot" data-testid="file-finder-ignored-truncated">
+                    被忽略的文件太多，只搜索了其中 {ignoredHits.indexed.toLocaleString('en-US')} 个
+                  </div>
+                )}
+                {!ignoredSearching && finderQ && !!ignoredHits?.unreadable && (
+                  <div className="insp-finder-foot" data-testid="file-finder-ignored-unreadable">
+                    有 {ignoredHits.unreadable} 个被忽略的文件夹读取失败，里面的文件没有搜索
+                  </div>
+                )}
               </div>
             </div>
           )}

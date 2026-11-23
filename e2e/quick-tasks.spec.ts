@@ -12,6 +12,9 @@
 //    fold state survives reload.
 // 6. Alt+N picks the wrong project / agent or leaks into the CLI
 //    -> new task in the focused session's project with its last agent; previous CLI gets nothing.
+// 7. The "+" agent menu wraps names ("Claude / Code") or is clipped by the scrolling sidebar at its minimum width
+//    -> every row is one line, the menu is fully on screen and hit-testable, a sidebar scroll closes it (a scroll
+//       elsewhere does not), and Esc hands focus back to the "+" button.
 import { test, expect, type Page } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -143,6 +146,66 @@ async function quickFake(page: Page, projectId: string, waitForFocus = true) {
 async function waitTitle(page: Page, taskId: string, title: string) {
   await expect.poll(async () => (await state(page.request)).tasks.find((t) => t.id === taskId)?.title).toBe(title);
 }
+
+test('快捷新建菜单：最窄侧栏下 agent 名不换行、不被侧栏裁切，侧栏滚动才收起', async ({ page }) => {
+  const project = await createProject(page.request, token('quick-menu'));
+  await page.addInitScript(() => localStorage.setItem('wb.sideWidth', '13'));
+  await page.goto('/');
+  const add = group(page, project.id).getByTestId('project-add-task');
+  const menu = page.getByTestId('quick-menu');
+  const items = page.getByTestId('quick-agent');
+  await add.click();
+  await expect(menu).toBeVisible();
+  expect(await items.count()).toBeGreaterThan(1);
+
+  const rows = await items.evaluateAll((els) => els.map((e) => {
+    const label = e.querySelector('span')!;
+    return { text: label.textContent, h: e.getBoundingClientRect().height, labelH: label.offsetHeight, font: parseFloat(getComputedStyle(label).fontSize) };
+  }));
+  for (const r of rows) expect(r.labelH, JSON.stringify(r)).toBeLessThan(r.font * 2);
+  expect(Math.max(...rows.map((r) => r.h)) - Math.min(...rows.map((r) => r.h)), JSON.stringify(rows)).toBeLessThan(1);
+
+  const box = (await menu.boundingBox())!;
+  const vw = page.viewportSize()!.width;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(vw);
+  // Both edges are really painted on top (not clipped by .side-list's overflow).
+  const hits = await menu.evaluate((m, b) => [b.x + 3, b.x + b.width - 3].map((x) => m.contains(document.elementFromPoint(x, b.y + b.height / 2))), box);
+  expect(hits).toEqual([true, true]);
+  await page.screenshot({ path: path.join(OUT, 'quick-menu-narrow.png') });
+
+  // Ctrl+wheel zoom resizes the sidebar and the menu (both in rem) without a window resize: the menu follows its button.
+  const main = (await page.locator('main').first().boundingBox())!;
+  await page.mouse.move(main.x + main.width / 2, main.y + main.height / 2);
+  await page.keyboard.down('Control');
+  for (let i = 0; i < 4; i++) await page.mouse.wheel(0, -100);
+  await page.keyboard.up('Control');
+  await expect(page.getByTestId('zoom-value')).toHaveText('120%');
+  await expect(menu).toBeVisible();
+  await expect.poll(async () => {
+    const m = (await menu.boundingBox())!;
+    const a = (await add.locator('xpath=..').boundingBox())!; // the .quick wrapper the menu hangs from
+    return Math.abs(m.y - (a.y + a.height + 4)) < 1 && m.x <= a.x + 0.5 && m.x + m.width >= a.x + a.width - 0.5
+      && m.x >= 0 && m.x + m.width <= vw;
+  }).toBe(true);
+  for (const h of await items.evaluateAll((els) => els.map((e) => {
+    const label = e.querySelector('span')!;
+    return label.offsetHeight / parseFloat(getComputedStyle(label).fontSize);
+  }))) expect(h).toBeLessThan(2);
+  await page.screenshot({ path: path.join(OUT, 'quick-menu-narrow-zoom.png') });
+
+  // Terminal / main-area scrolls leave it open; scrolling the sidebar under it closes it.
+  await page.locator('main').first().evaluate((el) => el.dispatchEvent(new Event('scroll')));
+  await expect(menu).toBeVisible();
+  await page.locator('.side-list').evaluate((el) => el.dispatchEvent(new Event('scroll')));
+  await expect(menu).toHaveCount(0);
+
+  await add.click();
+  await expect(items.first()).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
+  await expect(add).toBeFocused();
+});
 
 test('项目旁 + 快捷新建：不弹窗、标题自动取第一句、可双击改名', async ({ page }) => {
   const project = await createProject(page.request, token('quick'));

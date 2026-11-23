@@ -113,8 +113,16 @@ export interface TaskDelegation {
   // Written when the delegation is closed. Read only while the task's phase is 'archived'.
   outcome?: 'accepted' | 'canceled';
   settledAt?: number; // ms epoch of the close
-  mode?: 'review'; // read-only reviewer dispatched with `shoal delegate --review`; missing = executor
+  mode?: DelegationMode; // read-only child dispatched with `shoal delegate --review` / `--plan`; missing = executor
 }
+
+// review: read-only reviewer returning PASS/FAIL. plan: read-only advisor drafting an independent plan.
+export type DelegationMode = 'review' | 'plan';
+// Hard cap on rounds of one delegated task (round 1 plus reworks), for every mode. Enforced by `shoal rework`.
+export const MAX_DELEGATION_ROUNDS = 4;
+export const DELEGATION_MODE_LABEL: Record<DelegationMode, string> = { review: '评审', plan: '方案' };
+// One-character form for the narrow sidebar status column.
+export const DELEGATION_MODE_SHORT: Record<DelegationMode, string> = { review: '审', plan: '方' };
 
 // working: running its first round. rework: running round 2 or later.
 // needs_you: stopped where only the user can continue (permission or startup dialog, Ctrl+C, out of quota).
@@ -203,8 +211,41 @@ export interface TreeListing {
 }
 
 export interface FileListResult {
-  files: string[]; // POSIX paths relative to project root
-  truncated: boolean;
+  files: string[]; // POSIX paths relative to project root: tracked plus untracked files that are not gitignored
+  truncated: boolean; // hit the 20,000 cap
+}
+
+// Gitignored files are searched on the server: folders such as .tmp/ can hold hundreds of thousands of files.
+export interface IgnoredFileSearch {
+  files: string[]; // best gitignored matches for the query, best first (at most 60)
+  indexed: number; // gitignored files searched; dependency stores (node_modules/ etc.), nested repos and worktrees are skipped
+  truncated: boolean; // the index stopped at its 500,000-file cap or 15 s budget, so some gitignored files were not searched
+  unreadable: number; // ignored folders that could not be read (permission denied, I/O error): their files were not searched
+}
+
+// Both sides cut the trimmed Ctrl+P query to this length, so the server's top matches are the ones the client re-ranks.
+export const FINDER_QUERY_MAX = 1024;
+
+/** Ctrl+P fuzzy score, shared by the client (tracked files) and the server (gitignored index). -1 means no match. */
+export function scoreFinderPath(candidate: string, query: string): number {
+  if (!query) return 1;
+  const lowC = candidate.toLowerCase();
+  const lowQ = query.toLowerCase();
+  // A pasted full path beats every partial match, and its exact spelling beats a copy differing only in case.
+  if (lowC === lowQ) return candidate === query ? 1002 : 1001;
+  const base = lowC.slice(lowC.lastIndexOf('/') + 1);
+  if (base === lowQ) return 1000;
+  if (base.startsWith(lowQ)) return 800 - base.length;
+  const baseIdx = base.indexOf(lowQ);
+  if (baseIdx !== -1) return 600 - baseIdx * 5 - base.length;
+  const fullIdx = lowC.indexOf(lowQ);
+  if (fullIdx !== -1) return 400 - fullIdx * 2;
+  // Subsequence match
+  let qi = 0;
+  for (let ci = 0; ci < lowC.length && qi < lowQ.length; ci++) {
+    if (lowC[ci] === lowQ[qi]) qi++;
+  }
+  return qi === lowQ.length ? 100 - lowC.length : -1;
 }
 
 export type FileKind = 'text' | 'image' | 'video' | 'audio' | 'pdf' | 'binary' | 'too_large' | 'missing';
@@ -506,36 +547,47 @@ export interface Settings {
   customClis?: CustomCliConfig[];
 }
 export const DELEGATION_RULES_MAX = 4000;
-// Built-in division of labor, from each vendor's own docs (Nov 2026). Names capabilities, not model versions, so it
-// ages slowly; users replace it in Settings.
+// Built-in division of labor, from each vendor's own docs plus hands-on experience (Nov 2026; sources in
+// docs/collab-spec.md §4.5). Names capabilities, not model versions, so it ages slowly; users replace it in Settings.
 export const DEFAULT_DELEGATION_RULES = [
-  '三个 CLI 各用各的订阅额度，按长处分工，互相补位、互相把关。下面只列各家官方资料里明确写到的长处；具体模型以各 CLI 当前设置为准。',
+  '三个 CLI 各用各的订阅额度，按长处分工，互相补位、互相把关。本会话是主会话：听懂用户要什么，拆开，该自己做的自己做，该派的派出去；交回来的结果都由你验收，再用用户听得懂的话汇报，不原样转贴子任务的长报告。下面的长处和弱项来自各家官方资料和实际使用经验，「最」字是实际使用中的倾向，不是定论，以手头任务的实际结果为准；具体模型以各 CLI 当前设置为准。',
   '',
   '### 谁擅长什么',
-  '- Claude Code：长时间、多步骤的编码和重构，终端操作，需求澄清和方案设计，代码评审，中英文写作。弱项：不能生成图片，网络安全类任务常被拦截。',
-  '- Codex：复杂工程实现、数据库迁移，数学、科学计算和算法推导，大批量重复改动（选低档模型更省额度）。自带 `/review` 评审改动的能力，适合当第二评审。弱项：渗透测试、漏洞利用这类安全任务会被拒绝；默认沙箱关闭网络访问。',
-  '- Antigravity：前端和 UI 实现，看懂截图、设计稿、PDF、图表和视频，超长上下文的全库通读，用内置浏览器点击、截图、验收页面，以及速度要求高的小改动。弱项：复杂终端任务和大型工程改动不如前两家稳，容易编造细节，需要有人复核。',
+  '- Claude Code：需求澄清、拆解和方案设计，长时间、多步骤的编码和重构，前端视觉和动效（三家里审美最好），终端操作，代码评审，中英文写作。弱项：容易改不全、漏掉同类位置、没看到结果就说做完；不能生成图片；网络安全类任务常被拦截。',
+  '- Codex：三家里最严谨。适合接口已定的成块实现（后端、算法、数据处理、性能、数据库迁移），查 bug 修 bug，数学和科学计算，大批量同类改动（选低档模型更省额度），代码评审（自带 `/review`）。弱项：照字面执行，任务里的事实写错也照做、很少反问；汇报信息密、难读；审美弱，不派视觉设计；渗透测试、漏洞利用这类安全任务会被拒绝；默认沙箱关闭网络访问。',
+  '- Antigravity：思路活，思考角度和另两家不同，适合头脑风暴、独立出方案、当界面文案和交互的顾问；看懂截图、设计稿、PDF、图表和视频；超长上下文的全库通读；用内置浏览器点击、截图、验收页面。弱项：三家里最粗心，容易编造文件、行号、结论和对用户的承诺，它的判断要对照代码和实际数据核实后再用；复杂终端任务和大型工程改动不如前两家稳。',
   '',
   '### 什么时候委派',
-  '- 当前 CLI 明显不擅长、而另一家擅长时委派。例如 Claude 会话遇到设计稿还原或要在浏览器里验收页面，交给 Antigravity；任何会话遇到算法证明、数值计算或大批量同类改动，交给 Codex；Antigravity 会话遇到复杂重构或终端排障，交给 Claude Code 或 Codex。',
-  '- 想要一份独立实现或换个思路时委派，比如修了两轮还没修好的 bug。',
-  '- 几次工具调用就能做完的小事自己做，委派的开销比收益大。',
-  '- 只能委派给上面列出的已安装 CLI；没装的就自己做，并在汇报里说明原因。',
-  '- 委派只交出执行；需求理解、最终验收和向用户汇报留在本会话。同一批文件不要同时交给两个执行者改。',
+  '- 只能派给上面列出的、已安装且与本会话不同家的 CLI。下面说「派 X」「请 X」而本会话就是 X 时，自己做；没装的也自己做，并在汇报里说明原因。',
+  '- 委派有成本：你要写清任务，对方要读懂，交回后你还要读 diff、再跑一遍检查。几十行以内的修改、修评审意见、要和页面来回对接口的功能、几次工具调用能做完的事，自己做。',
+  '- 值得派的：接口和验收标准已定、能独立完成的成块工作，优先派 Codex；本会话明显不擅长而另一家擅长的，例如 Codex 会话遇到视觉设计交给 Claude Code，要看视频或在浏览器里验收页面交给 Antigravity，Antigravity 会话遇到复杂重构或终端排障交给 Claude Code 或 Codex；想要独立实现或换个思路时，比如修了两轮还没修好的 bug。',
+  '- brief 里的事实先核实再写，写明接口、验收标准、必须保持不变的行为和要一起改的同类位置；执行者只看得到 brief 和工作目录。提交、推送和发版留在本会话。',
+  '- 子任务说做完不算完：读 diff，自己跑检查，对照验收标准。评审者和方案顾问交回后对照派出前的 `git status` 和 `git diff`，确认它们没有改文件。',
+  '- 同一批文件不要同时交给两个执行者改。',
+  '',
+  '### 大方案和界面文案',
+  '- 大方案（架构怎么定、数据怎么存、要不要长期依赖某个服务、系统下一步整体怎么改）自己出一份，同时派另一家独立出一份，本会话不是 Antigravity 时优先派它。用 `shoal delegate <agent> --plan`，brief 只给用户的原话和必要背景，不给你的草稿和倾向。小事自己想清楚就做。',
+  '- 两份由你合并：有分歧以代码和实际数据为准，对方没核实的先核实。交给用户一份方案，写明两边一致的、采纳对方的、不采纳的和理由；两边都有道理、定不下来的原样摆给用户拍板。',
+  '- 界面文案和交互自己先做一版，再用 `--plan` 请 Antigravity（本会话就是它时请 Claude Code）当顾问改一遍：告诉它这一页给谁用、要让人做成什么、现在的文案和交互，它在回复里给替代稿。它的修改对照功能实际怎么用核实后再采纳，专业说法和对用户的承诺尤其要核实。只改几个字的不用。',
   '',
   '### 什么时候评审',
   '用 `shoal delegate <agent> --review` 派出只读评审者。以下情况主动发起，不必等用户开口：',
   '- 动手前，需求或方案涉及跨模块设计、数据迁移、安全、计费、权限或公开接口。',
   '- 交付前，改动较大（例如超过约 300 行或跨多个模块），或修改的是很难回滚的东西。',
   '- 用户说「评审一下」「三方评审」「大家一起看看」。',
-  '一般改动请一位评审者，挑与本会话不同家的 CLI。上面列出的高风险情况，或用户明确要求时，做三方评审。',
+  '一般改动请一位评审者，挑与本会话不同家的 CLI，代码评审优先 Codex（本会话就是 Codex 时请 Claude Code）。上面列出的高风险情况，或用户明确要求时，做三方评审。',
+  '',
+  '### 评审意见怎么裁决',
+  '- 只有后果严重、并且说得出怎么发生的才挡交付：算错钱、丢数据、越权或泄露、发错消息、发布出事故、达不到验收标准。其余都是建议：顺手能改的改掉，没改的在汇报里列出，不挡交付。',
+  '- 同一个评审对象最多两轮：首评加一次复核（`shoal rework`）。复核后还有 BLOCKING，不再打回，把剩下的分歧、双方理由和你的建议交给用户，由用户决定继续改还是放行。',
+  '- 同一类问题被用户纠正或被评审退回后，能写成检查（类型检查、守卫测试）的，就在同一次修改里写成检查，比再加一条文字规则可靠。',
   '',
   '### 三方评审怎么做',
   '1. 写一份自包含的评审 brief 并存成项目内文件。内容包括：评审对象（需求、方案或 diff 范围）、背景、验收标准、要重点检查的角度、已知风险。评审者看不到本对话。',
-  '2. 同时运行 `shoal delegate <另外两个 CLI> --review --file <brief>`。',
+  '2. 对另外两个 CLI 各运行一次 `shoal delegate <agent> --review --file <brief>`。另一家没装时只派一位，在汇报里说明这次是两方评审。',
   '3. 等待期间自己先独立评审，写下自己的结论，再看对方的结论，避免被带偏。',
-  '4. 对每条意见逐条裁决：认可就修改；有异议就写明依据；信息不够就补充后再请评审者确认。BLOCKING 全部解决后才能继续。',
-  '5. 对评审者执行 `shoal done <id>`，然后向用户汇报三方结论、各自的分歧和最终裁决。',
+  '4. 按上一节逐条裁决：认可就修改；有异议就写明依据；信息不够就补充后再请评审者确认。',
+  '5. 对评审者执行 `shoal done <id>`，然后向用户汇报实际参与各方的结论、各自的分歧和最终裁决。',
   '',
   '### 额度',
   '三家都按 5 小时窗口加每周上限计量。别让一家的额度耗尽：同类工作在空闲的 CLI 之间轮换，大批量的机械改动用便宜的模型，评审 brief 写清范围，不要让评审者通读整个仓库。',
@@ -621,7 +673,8 @@ export const TASK_COLORS = [
 // GET    /api/projects/:id/changes       -> ProjectChanges   (git branch + uncommitted files with +/- line counts)
 // GET    /api/projects/:id/diff?path=p   -> DiffPayload      (HEAD vs working tree text for one file; >2MB or binary flagged)
 // GET    /api/projects/:id/tree?path=dir -> TreeListing      (single-level lazy directory listing with git dirty badges)
-// GET    /api/projects/:id/files         -> FileListResult   (relative file paths for Ctrl+P quick search, capped at 20,000)
+// GET    /api/projects/:id/files         -> FileListResult   (relative file paths for Ctrl+P quick search, gitignored files excluded, capped at 20,000)
+// GET    /api/projects/:id/ignored-files?q=text -> IgnoredFileSearch (Ctrl+P matches among gitignored files, from a per-project index rebuilt when /files is fetched)
 // GET    /api/projects/:id/file?path=p[&stat=1] -> FilePayload (text content or metadata; stat=1 omits content for fast mtime check)
 // GET    /api/projects/:id/raw?path=p    -> binary stream    (rawPreviewOf types only, single-range Range support, strict CSP: default-src 'none')
 // PUT    /api/projects/:id/file WriteFileBody -> WriteFileResult (saves UTF-8 text; 409 { code: 'conflict', mtimeMs } on mtime mismatch)
@@ -868,6 +921,7 @@ export interface PeerDelegateBody {
   stdinText?: string;
   filePath?: string;
   review?: boolean; // dispatch a read-only reviewer instead of an executor
+  plan?: boolean; // dispatch a read-only advisor that drafts an independent plan; exclusive with review
 }
 
 export interface DelegationSummary {
@@ -880,7 +934,7 @@ export interface DelegationSummary {
   brief: string;
   status: SessionStatus | 'none';
   createdAt: number;
-  mode?: 'review';
+  mode?: DelegationMode;
   latestReplyFile?: string;
 }
 
@@ -918,6 +972,7 @@ export const DELEGATION_INSTRUCTIONS = [
   '- Delegate to another vendor\'s CLI with `shoal delegate <claude|codex|agy>` when the user asks for it, when the user\'s instruction files route that kind of work to that agent, or when an independent implementation or review by a different model is worth a separate session. Do not switch to a different agent than the one asked for.',
   '- The child sees only your brief, not this conversation. Write it self-contained: goal, files to read, behavior that must not change, checks to run. Pass it with `--stdin` or `--file <path inside the project>`; `-m` is for a single line.',
   '- `shoal delegate <agent> --review` dispatches a read-only reviewer: it changes no files and only returns a PASS/FAIL verdict with BLOCKING / NON-BLOCKING findings. Use it for an independent review of a requirement, plan or change. A three-way review means dispatching it to both other CLIs, reviewing independently yourself, then ruling on every finding and summarizing.',
+  '- `shoal delegate <agent> --plan` dispatches a read-only advisor: it changes no files and returns its own independent plan (recommendation, alternatives and trade-offs, risks). For an independent plan, give it the user\'s request and the facts it needs, not your draft, and merge its plan with yours. To improve something that exists (UI copy, for example), give it the current version; it replies with replacements and does not edit files.',
   '- After delegating, do not wait or poll. Continue other work or end your turn: the child\'s result is pasted into this session when its round finishes.',
   '- Review each result yourself. Then `shoal done <id>` accepts and closes the child, `shoal rework <id> --stdin` sends it back with specific findings, and `shoal cancel <id>` drops it. Fix small findings yourself instead of sending them back.',
   '- `shoal status` lists your delegated tasks; `shoal help` lists every command.',
@@ -935,14 +990,29 @@ export function composeDelegationInstructions(opts: { host: AgentKind; available
   ].join('\n');
 }
 
-// First prompt of a delegated task; `review` makes it a read-only reviewer.
-export function delegationPrompt(parent: { title: string; agent: AgentKind }, brief: string, opts?: { review?: boolean }): string {
-  if (opts?.review) {
+// First prompt of a delegated task; `review` makes it a read-only reviewer, `plan` a read-only advisor.
+export function delegationPrompt(parent: { title: string; agent: AgentKind }, brief: string, opts?: { mode?: DelegationMode }): string {
+  if (opts?.mode === 'plan') {
+    return [
+      `你是任务「${parent.title}」（${agentLabel(parent.agent)}）请来的独立方案顾问。只按下面「任务」里给的问题和背景出方案。`,
+      '',
+      '- 只读：不修改、创建或删除项目文件，不提交，不安装依赖，不运行会改动工作区或外部状态的命令；可以读文件、搜索、运行只读检查。',
+      '- 独立出方案：不要猜主任务倾向哪种做法；需要时自己读代码和资料核实现状。任务给了现有版本请你改进的（例如界面文案），在回复里给出替代版本和理由，不直接改文件。',
+      '- 用一条回复交付：先写推荐方案和理由，再写考虑过的其他做法和取舍、主要风险和还没定的问题。关键判断写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
+      '- 需要更多信息就在回复里提问并结束本轮，主任务会补充。',
+      '- 不要再把任务委派或转发给其他 agent。',
+      '',
+      '## 任务',
+      brief.trim(),
+    ].join('\n');
+  }
+  if (opts?.mode === 'review') {
     return [
       `你是任务「${parent.title}」（${agentLabel(parent.agent)}）请来的独立评审者。只按下面「任务」里给的评审对象和角度评审。`,
       '',
       '- 只读：不修改、创建或删除项目文件，不提交，不安装依赖，不运行会改动工作区或外部状态的命令；可以读文件、搜索、运行只读检查。',
-      '- 用一条回复交付：第一行写「结论：PASS」或「结论：FAIL」，然后列 BLOCKING（必须改才能继续的问题）和 NON-BLOCKING（建议）。每条写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
+      '- 用一条回复交付：第一行写「结论：PASS」或「结论：FAIL」，然后列 BLOCKING 和 NON-BLOCKING。有 BLOCKING 就是 FAIL。每条写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
+      '- BLOCKING 只放后果严重、并且说得出怎么发生的问题，例如算错钱、丢数据、越权或泄露、发错消息、发布出事故、达不到任务里的验收标准；任务另给了标准的按任务。其余都放 NON-BLOCKING（建议）。',
       '- 需要更多信息就在回复里提问并结束本轮，主任务会补充。',
       '- 不要再把任务委派或转发给其他 agent。',
       '',
@@ -964,8 +1034,24 @@ export function delegationPrompt(parent: { title: string; agent: AgentKind }, br
 }
 
 // Pasted into the main task when a delegated task finishes a round.
-export function delegationResultText(child: { id: string; title: string; agent: AgentKind; round: number; mode?: 'review' }, reply: string): string {
+export function delegationResultText(child: { id: string; title: string; agent: AgentKind; round: number; mode?: DelegationMode }, reply: string): string {
   const h = delegationHandle(child.id);
+  const last = child.round >= MAX_DELEGATION_ROUNDS;
+  if (child.mode === 'plan') {
+    return [
+      `方案顾问「${child.title}」（${agentLabel(child.agent)}，第 ${child.round} 轮）交来了独立方案。它是只读的，不改文件。`,
+      '',
+      '## 方案',
+      reply.trim() || '（没有拿到这一轮的回复，请打开子任务的终端查看）',
+      '',
+      '## 下一步',
+      '- 和你自己的方案对照合并：分歧以代码、数据和实测为准，标「未验证」的先核实再采用；向用户汇报时说明两份方案的主要分歧和你的取舍。',
+      last
+        ? `- 已到第 ${MAX_DELEGATION_ROUNDS} 轮上限，不能再追问；还有疑问的自己核实或问用户`
+        : `- 需要它回答追问或按补充背景修订：\`shoal rework ${h} --stdin\``,
+      `- 结束：\`shoal done ${h}\``,
+    ].join('\n');
+  }
   if (child.mode === 'review') {
     return [
       `评审者「${child.title}」（${agentLabel(child.agent)}，第 ${child.round} 轮）给出了评审结论。它是只读的，修改由你来做。`,
@@ -974,8 +1060,10 @@ export function delegationResultText(child: { id: string; title: string; agent: 
       reply.trim() || '（没有拿到这一轮的回复，请打开子任务的终端查看）',
       '',
       '## 下一步',
-      '- 逐条裁决：认可的自己修改；有异议的写明依据；BLOCKING 全部解决后再继续。',
-      `- 需要它复核修改或补充意见：\`shoal rework ${h} --stdin\`，写清改了什么、请它看什么`,
+      '- 逐条裁决：认可的自己修改；有异议的写明依据。BLOCKING 全部解决后再继续；复核次数按分工与评审规则，不再复核时仍有 BLOCKING 的，把分歧交给用户决定。',
+      last
+        ? `- 已到第 ${MAX_DELEGATION_ROUNDS} 轮上限，不能再复核；仍有 BLOCKING 的交给用户决定`
+        : `- 需要它复核修改或补充意见：\`shoal rework ${h} --stdin\`，写清改了什么、请它看什么`,
       `- 评审结束：\`shoal done ${h}\``,
     ].join('\n');
   }
@@ -987,14 +1075,35 @@ export function delegationResultText(child: { id: string; title: string; agent: 
     '',
     '## 下一步',
     `- 通过并关闭：\`shoal done ${h}\``,
-    `- 打回返工：\`shoal rework ${h} --stdin\`，写清具体问题；小问题直接自己改`,
+    last
+      ? `- 已到第 ${MAX_DELEGATION_ROUNDS} 轮上限，不能再打回；没解决的自己接手修改，或请用户决定`
+      : `- 打回返工：\`shoal rework ${h} --stdin\`，写清具体问题；小问题直接自己改`,
     `- 放弃：\`shoal cancel ${h}\``,
     '改动在同一个工作目录里，可以用 git status / git diff 查看。',
   ].join('\n');
 }
 
-// Pasted into a delegated task by `shoal rework`.
-export function delegationReworkText(parent: { title: string }, round: number, feedback: string): string {
+// Pasted into a delegated task by `shoal rework`. A reviewer is asked to re-check and an advisor to revise its plan;
+// neither is ever asked to make the changes itself.
+export function delegationReworkText(parent: { title: string }, round: number, feedback: string, mode?: DelegationMode): string {
+  if (mode === 'plan') {
+    return [
+      `主任务「${parent.title}」请你补充方案，这是第 ${round} 轮。你仍是只读的方案顾问：不修改、创建或删除项目文件。`,
+      '根据下面的追问或补充背景修订方案，按同样的格式用一条回复交付；没有变化的部分不用重复。',
+      '',
+      '## 补充说明',
+      feedback.trim(),
+    ].join('\n');
+  }
+  if (mode === 'review') {
+    return [
+      `主任务「${parent.title}」请你复核，这是第 ${round} 轮。你仍是只读评审者：不修改、创建或删除项目文件，修改由主任务来做。`,
+      '上一轮你只提了问题的，根据下面补充的信息完成评审。否则核对上一轮的意见是否解决、这次的改动有没有带来新问题：仍没解决的 BLOCKING 保留，上一轮已经提过的问题不要换个说法再提。按同样的格式用一条回复交付：第一行写「结论：PASS」或「结论：FAIL」，再列 BLOCKING 和 NON-BLOCKING。',
+      '',
+      '## 复核说明',
+      feedback.trim(),
+    ].join('\n');
+  }
   return [
     `主任务「${parent.title}」验收没有通过，这是第 ${round} 轮。请按下面的意见修改，完成后同样用一条回复说明改动和检查结果。`,
     '',

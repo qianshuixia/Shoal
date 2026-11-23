@@ -89,7 +89,7 @@
 
 | 命令 | 作用 |
 |---|---|
-| `shoal delegate <claude\|codex\|agy> [--review] [--title] [-m\|--file\|--stdin]` | 新建子任务并启动对应 CLI，首条提示词是 `delegationPrompt`（只含任务说明，不带主对话历史）。立即返回，输出里写明「不要等待或轮询」。`--review` 派出只读评审者（`delegation.mode = 'review'`）：提示词要求不改文件，第一行给「结论：PASS/FAIL」，再列 BLOCKING / NON-BLOCKING；结果按评审结论送回主任务，界面标为「评审」 |
+| `shoal delegate <claude\|codex\|agy> [--review\|--plan] [--title] [-m\|--file\|--stdin]` | 新建子任务并启动对应 CLI，首条提示词是 `delegationPrompt`（只含任务说明，不带主对话历史）。立即返回，输出里写明「不要等待或轮询」。`--review` 派出只读评审者（`delegation.mode = 'review'`）：提示词要求不改文件，第一行给「结论：PASS/FAIL」，再列 BLOCKING / NON-BLOCKING，BLOCKING 只放后果严重、说得出怎么发生的问题；结果按评审结论送回主任务，界面标为「评审」。对评审者 `shoal rework` 时发的是复核说明：重申只读；上轮只提了问题的按补充信息完成评审，否则核对上轮意见和新改动，未解决的 BLOCKING 保留。`--plan` 派出只读方案顾问（`delegation.mode = 'plan'`），与 `--review` 互斥：提示词要求不改文件、不猜主任务倾向，交推荐方案和理由、其他做法和取舍、风险和未定问题，没核实的标「未验证」；brief 给了现有版本（例如界面文案）请它改进时，它在回复里给替代稿；结果按「独立方案」送回，下一步提示与主任务自己的方案对照合并，界面标为「方案」。对它 `shoal rework` 时发的是补充说明，重申只读，请它按追问修订方案。评审者和方案顾问的只读都只靠提示词约束：子任务继承主会话的权限模式、共用工作目录，Shoal 不在系统层面拦截写入；主任务在派出前后对照 `git status` / `git diff` 核对，同时有别的写入者时这样核对分不清是谁改的 |
 | `shoal status [--json]` | 列出自己派出的子任务：句柄、状态、轮次 |
 | `shoal rework <句柄> [-m\|--file\|--stdin]` | 把验收意见发回同一个子会话，`round + 1` |
 | `shoal done <句柄>` | 验收通过：结束子 CLI 进程并归档，`outcome = accepted`。只在 `review` 状态可用 |
@@ -127,11 +127,12 @@ Antigravity 子任务和其他 agy 会话一样，用交互模式 `agy --dangero
 
 关闭后 `shoal` 命令照常可用，只是 agent 不会主动想到它。
 
-实际注入的是 `composeDelegationInstructions()` 的结果：`DELEGATION_INSTRUCTIONS`，加一行“本会话是哪个 CLI、本机装了哪些 CLI（只能委派给这些）”，再加设置项「分工与评审规则」（`Settings.delegationRules`）。规则字段没有设置时用内置的 `DEFAULT_DELEGATION_RULES`；设为 `''` 时不注入规则；上限 `DELEGATION_RULES_MAX`（4000 字）；改动只对之后新启动的会话生效。默认规则按三家官方资料写明各 CLI 的长处与弱项、什么时候委派、什么时候主动发起评审和三方评审的步骤；只写能力，不写模型版本号，避免很快过时。资料来源（2026-11 查阅）：
+实际注入的是 `composeDelegationInstructions()` 的结果：`DELEGATION_INSTRUCTIONS`，加一行“本会话是哪个 CLI、本机装了哪些 CLI（只能委派给这些）”，再加设置项「分工与评审规则」（`Settings.delegationRules`）。规则字段没有设置时用内置的 `DEFAULT_DELEGATION_RULES`；设为 `''` 时不注入规则；上限 `DELEGATION_RULES_MAX`（4000 字）；改动只对之后新启动的会话生效。默认规则写明：主会话负责拆解、验收和转述；各 CLI 的长处与弱项；委派的成本和值得派的活；大方案用 `--plan` 让另一家只拿用户原话独立出一份再合并，界面文案也用 `--plan` 请顾问改一遍；什么时候主动评审；只有后果严重、说得出怎么发生的意见才挡交付，同一评审对象最多首评加一次复核，之后交给用户决定；三方评审的步骤，另一家没装时降为两方。只派给与本会话不同家的 CLI，规则点名的那家就是本会话时自己做。服务端的 `MAX_DELEGATION_ROUNDS`（4 轮，定义在 `shared/protocol.ts`）是执行者、评审者和方案顾问共用的硬上限，规则里的两轮是评审的默认做法；到第 4 轮时回传的下一步不再给 `shoal rework`，再 rework 返回 409。只写能力，不写模型版本号，避免很快过时。资料来源：
 
-- Claude：[Models overview](https://platform.claude.com/docs/en/about-claude/models/overview)、[Claude Code model config](https://code.claude.com/docs/en/model-config)
-- Codex：[Codex models](https://learn.chatgpt.com/docs/models)、[Code review](https://learn.chatgpt.com/docs/code-review)、[Approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security)、[Pricing](https://learn.chatgpt.com/docs/pricing)
-- Antigravity：[Models](https://antigravity.google/docs/models)、[FAQ](https://antigravity.google/docs/faq)
+- Claude：[Models overview](https://platform.claude.com/docs/en/about-claude/models/overview)、[Claude Code model config](https://code.claude.com/docs/en/model-config)（2026-11 查阅）
+- Codex：[Codex models](https://learn.chatgpt.com/docs/models)、[Code review](https://learn.chatgpt.com/docs/code-review)、[Approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security)、[Pricing](https://learn.chatgpt.com/docs/pricing)（2026-11 查阅）
+- Antigravity：[Models](https://antigravity.google/docs/models)、[FAQ](https://antigravity.google/docs/faq)（2026-11 查阅）
+- 实际使用经验：数字生命卡兹克《[毫无保留地分享一下，我是如何让Claude、GPT和Gemini完美协同的](https://mp.weixin.qq.com/s/gwj0xLNHPfToQnQJN7IkMA)》（2026-11-23 查阅）。取了其中三家的性格差异（Claude 审美最好但容易改不全，GPT 最严谨但照字面执行、汇报难读，Gemini 思路活但最容易编造）、委派的沟通成本、大方案独立双写、文案顾问、评审分两级和两轮上限；没有采用其中只适用于作者自己环境的脚本和流程。
 
 ### 4.6 界面
 

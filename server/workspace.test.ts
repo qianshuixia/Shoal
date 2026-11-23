@@ -1,12 +1,13 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, createFsEntry, deleteFsEntry, discardFile, listAllFiles, listChanges, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, openRawPreview, resolveProjectPath, writeFileEntry,
+  MAX_TEXT_BYTES, MAX_UNTRACKED_LINE_STAT, WorkspaceError, createFsEntry, deleteFsEntry, discardFile, listAllFiles, listChanges, refreshIgnoredIndex, searchIgnoredFiles, listTree, pasteFsEntries, readDiff, readFileEntry, renameFsEntry, openRawPreview, resolveProjectPath, writeFileEntry,
 } from './workspace.ts';
 import { gitInfo } from './git.ts';
+import { scoreFinderPath } from '../shared/protocol.ts';
 import { matchProjectFileLink, parseLocalFileLink } from '../web/src/linkParse.ts';
 
 const tempDirs: string[] = [];
@@ -245,6 +246,100 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     expect(fs.readFileSync(file, 'utf8')).toBe('user-forced\n');
   });
 
+  it('Ctrl+P searches gitignored files on the server, skipping caches, nested repos, worktrees and links out of the project', async () => {
+    const repo = initRepo('finder');
+    const put = (rel: string, body = '') => {
+      fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+      fs.writeFileSync(path.join(repo, rel), body);
+    };
+    put('.gitignore', '.tmp/\ndist/\nnode_modules/\n*.log\n');
+    put('src/app.ts');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'init']);
+    put('notes.md'); // untracked, not ignored
+    put('debug.log'); // ignored file outside any ignored folder
+    put('.tmp/promo/out/flow/demo-short.mp4'); // the reported case: deep inside an ignored folder, under an `out/` dir
+    put('dist/app.js');
+    put('node_modules/pkg/index.js');
+    put('.tmp/promo/node_modules/dep/index.js');
+    put('.tmp/clone/.git/HEAD', 'ref: refs/heads/main\n'); // nested repo
+    put('.tmp/clone/readme.md');
+    put('.tmp/wt/.git', 'gitdir: elsewhere\n'); // worktree
+    put('.tmp/wt/src/app.ts');
+    for (let i = 0; i < 70; i++) put(`.tmp/frames/frame-${String(i).padStart(2, '0')}.png`);
+    const outside = makeTempDir('finder-outside');
+    fs.writeFileSync(path.join(outside, 'outside-secret.txt'), '');
+    fs.symlinkSync(outside, path.join(repo, '.tmp', 'linked'), 'junction');
+
+    // The list the browser ranks locally holds only files git does not ignore.
+    const all = await listAllFiles(repo);
+    expect(all).toEqual({ files: ['.gitignore', 'notes.md', 'src/app.ts'], truncated: false });
+
+    const hit = await searchIgnoredFiles(repo, 'demo-short.mp4');
+    expect(hit.files).toEqual(['.tmp/promo/out/flow/demo-short.mp4']);
+    expect(hit.truncated).toBe(false);
+    expect(hit.indexed).toBe(73); // 70 frames, the mp4, debug.log, dist/app.js
+    expect((await searchIgnoredFiles(repo, 'app')).files).toEqual(['dist/app.js']); // worktree and node_modules copies skipped
+    expect((await searchIgnoredFiles(repo, 'readme')).files).toEqual([]); // nested repo skipped
+    expect((await searchIgnoredFiles(repo, 'outside-secret')).files).toEqual([]); // junction skipped
+    // At most 60 matches come back, best first: the exact basename outranks the other 69 frames.
+    const frames = await searchIgnoredFiles(repo, 'frame-07.png');
+    expect(frames.files[0]).toBe('.tmp/frames/frame-07.png');
+    expect((await searchIgnoredFiles(repo, 'frame')).files).toHaveLength(60);
+    expect((await searchIgnoredFiles(repo, '  ')).files).toEqual([]);
+
+    // A file written after the last index is found once the finder reopens (GET /files calls refreshIgnoredIndex).
+    put('.tmp/promo/out/flow/demo-long.mp4');
+    expect((await searchIgnoredFiles(repo, 'demo-long')).files).toEqual([]);
+    refreshIgnoredIndex(repo);
+    expect((await searchIgnoredFiles(repo, 'demo-long')).files).toEqual(['.tmp/promo/out/flow/demo-long.mp4']);
+
+    // Without git there is nothing to mark as ignored: the walk returns every file but the same skipped folders.
+    const plain = makeTempDir('finder-plain');
+    fs.mkdirSync(path.join(plain, 'out'), { recursive: true });
+    fs.writeFileSync(path.join(plain, 'out', 'a.txt'), '');
+    fs.mkdirSync(path.join(plain, 'node_modules', 'x'), { recursive: true });
+    fs.writeFileSync(path.join(plain, 'node_modules', 'x', 'i.js'), '');
+    expect(await listAllFiles(plain)).toEqual({ files: ['out/a.txt'], truncated: false });
+    expect(await searchIgnoredFiles(plain, 'a.txt')).toEqual({ files: [], indexed: 0, truncated: false, unreadable: 0 });
+  });
+
+  it('Ctrl+P keeps a pasted full path first among more than 60 matches, and reports gitignored folders it could not read', async () => {
+    const repo = initRepo('finder-edge');
+    const put = (rel: string) => {
+      fs.mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+      fs.writeFileSync(path.join(repo, rel), '');
+    };
+    fs.writeFileSync(path.join(repo, '.gitignore'), '.tmp/\n');
+    // 61 longer names start with the pasted path in another case; by name alone they all sort before it.
+    const exact = '.tmp/out/clip.mp4';
+    put(exact);
+    for (let i = 0; i < 61; i++) put(`.tmp/out/CLIP.mp4.${i}`);
+    expect((await searchIgnoredFiles(repo, exact)).files[0]).toBe(exact);
+    expect(scoreFinderPath(exact, exact)).toBeGreaterThan(scoreFinderPath('.tmp/OUT/clip.mp4', exact)); // case-sensitive disks
+
+    // A folder that fails to read (EIO, no permission) is reported, not passed off as empty; one deleted meanwhile is not.
+    put('.tmp/scratch/render.mp4');
+    put('.tmp/gone/old.txt');
+    const readdir = fs.promises.readdir;
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      const name = path.basename(String(p));
+      if (name === 'scratch' || name === 'gone') {
+        return Promise.reject(Object.assign(new Error(name), { code: name === 'scratch' ? 'EIO' : 'ENOENT' }));
+      }
+      return (readdir as (...a: unknown[]) => Promise<unknown>)(p, ...rest);
+    }) as typeof readdir);
+    try {
+      refreshIgnoredIndex(repo);
+      const res = await searchIgnoredFiles(repo, 'render');
+      expect(res).toMatchObject({ files: [], truncated: false, unreadable: 1 });
+    } finally {
+      spy.mockRestore();
+    }
+    refreshIgnoredIndex(repo);
+    expect(await searchIgnoredFiles(repo, 'render')).toMatchObject({ files: ['.tmp/scratch/render.mp4'], unreadable: 0 });
+  });
+
   it('guards binary and >2MB files, serves image metadata, and exposes .env while dimming node_modules', async () => {
     const repo = initRepo('tree');
     fs.writeFileSync(path.join(repo, '.gitignore'), '.env\nnode_modules/\n');
@@ -273,11 +368,12 @@ describe('file read/write, optimistic lock, tree visibility, and guards', () => 
     expect(tree.entries.find((e) => e.name === 'node_modules')?.ignored).toBe(true);
     expect(tree.entries.find((e) => e.name === 'src')?.gitStatus).toBe('?');
 
-    // Ctrl+P listAllFiles includes gitignored .env and src/main.ts, excludes node_modules
+    // Ctrl+P lists src/main.ts, finds the gitignored .env through the ignored-file search, and never offers node_modules
     const all = await listAllFiles(repo);
-    expect(all.files).toContain('.env');
+    expect(all.files).not.toContain('.env');
     expect(all.files).toContain('src/main.ts');
-    expect(all.files.some((f) => f.startsWith('node_modules/'))).toBe(false);
+    expect((await searchIgnoredFiles(repo, '.env')).files).toEqual(['.env']);
+    expect([...all.files, ...(await searchIgnoredFiles(repo, 'index.js')).files].some((f) => f.startsWith('node_modules/'))).toBe(false);
 
     expect(readFileEntry(repo, 'logo.png').kind).toBe('image');
     expect(openRaw(repo, 'logo.png').mime).toBe('image/png');

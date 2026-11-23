@@ -240,4 +240,44 @@ test.describe('cross-CLI delegation e2e', () => {
       'utf8',
     );
   });
+
+  test('read-only children are labeled by mode in the row, the HUD and the pane header', async ({ page, request }) => {
+    const project = await createProject(request, token('delegation-modes'));
+    const main = await createFakeTask(request, project.id, 'Main', '');
+
+    await page.goto('/');
+    await row(page, main.session.id).click();
+    await expectStatus(page, main.session.id, 'idle', 10_000);
+    await expect.poll(() => termText(page, main.session.id)).toContain('FAKE AGENT');
+
+    await typeLine(page, 0, 'shoal delegate fake --plan --title "Planner" -m "[[sleep 30]] design storage"');
+    const planner = await waitChild(request, main.task.id, 1);
+    expect(planner.delegation?.mode).toBe('plan');
+    await typeLine(page, 0, 'shoal delegate fake --review --title "Checker" -m "[[sleep 30]] check it"');
+    const checker = await waitChild(request, main.task.id, 2);
+    expect(checker.delegation?.mode).toBe('review');
+
+    await expect(taskRow(page, planner.id).getByTestId('task-delegation-status')).toHaveText(/^方 · /);
+    await expect(taskRow(page, checker.id).getByTestId('task-delegation-status')).toHaveText(/^审 · /);
+    await pane(page, 0).getByTestId('delegation-toggle').click();
+    const hudItem = (id: string) => pane(page, 0).locator(`[data-testid="delegation-item"][data-task-id="${id}"]`);
+    await expect(hudItem(planner.id).getByTestId('delegation-mode')).toHaveText('方案');
+    await expect(hudItem(checker.id).getByTestId('delegation-mode')).toHaveText('评审');
+    await hudItem(planner.id).click();
+    await expect(pane(page, 1)).toHaveAttribute('data-session-id', planner.sessionId!);
+    await expect(pane(page, 1).getByTestId('pane-delegation')).toHaveText(/^方案 · /);
+    await page.screenshot({ path: path.join(ARTIFACT_DIR, 'modes.png') });
+
+    // Joined into the summary the previous scenario wrote (or a fresh one when this test runs alone).
+    const summaryFile = path.join(ARTIFACT_DIR, 'verification-summary.json');
+    const summary = fs.existsSync(summaryFile)
+      ? JSON.parse(fs.readFileSync(summaryFile, 'utf8')) as { scenarios: string[]; artifacts: string[] }
+      : { command: 'npx playwright test e2e/delegation.spec.ts', scenarios: [], artifacts: [] };
+    fs.writeFileSync(summaryFile, JSON.stringify({
+      ...summary,
+      verifiedAt: new Date().toISOString(),
+      scenarios: [...summary.scenarios.filter(s => !s.startsWith('mode labels')), 'mode labels: --plan / --review in row, HUD and pane header'],
+      artifacts: [...summary.artifacts.filter(a => a !== 'modes.png'), 'modes.png'],
+    }, null, 2), 'utf8');
+  });
 });

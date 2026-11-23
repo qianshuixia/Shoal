@@ -272,6 +272,8 @@ describe('mobile gateway & security integration', () => {
       ['POST', '/api/shutdown'],
       ['POST', '/api/open'],
       ['POST', '/api/clipboard/files'],
+      ['GET', `/api/projects/${project.id}/files`],
+      ['GET', `/api/projects/${project.id}/ignored-files?q=env`],
       ['PUT', `/api/projects/${project.id}/file`],
       ['POST', `/api/projects/${project.id}/discard`],
       ['POST', `/api/projects/${project.id}/fs/create`],
