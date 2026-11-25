@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import pty from 'node-pty';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_DELEGATION_RULES, DELEGATION_INSTRUCTIONS, DELEGATION_RULES_MAX, composeDelegationInstructions, delegationState } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_INSTRUCTIONS, DELEGATION_RULES_MAX, RICH_OUTPUT_INSTRUCTIONS, composeDelegationInstructions, composeSessionInstructions, delegationState } from '../shared/protocol.ts';
 import { writeHookFiles } from './agents.ts';
 import { MAX_DELEGATION_ROUNDS, MAX_OPEN_DELEGATIONS } from './collab.ts';
 import { createApp } from './http.ts';
@@ -996,16 +996,28 @@ describe('cross-CLI delegation', () => {
     expect(none).not.toContain('分工与评审规则');
   });
 
-  it('settings accept a boolean autoDelegate and keep it on by default', async () => {
+  it('settings accept a boolean autoDelegate and richOutputHints and keep both on by default', async () => {
     process.env.WORKBENCH_FAKE_AGENT = '1';
     const h = await setupHarness();
     try {
       expect(h.store.settings().autoDelegate).toBe(true);
+      expect(h.store.settings().richOutputHints).toBe(true);
       expect((await h.api('POST', '/api/settings', { autoDelegate: 'no' })).status).toBe(400);
-      const off = await h.api('POST', '/api/settings', { autoDelegate: false });
+      expect((await h.api('POST', '/api/settings', { richOutputHints: 'no' })).status).toBe(400);
+      const off = await h.api('POST', '/api/settings', { autoDelegate: false, richOutputHints: false });
       expect(off.status).toBe(200);
       expect(off.json.autoDelegate).toBe(false);
+      expect(off.json.richOutputHints).toBe(false);
       expect(h.store.settings().autoDelegate).toBe(false);
+      expect(h.store.settings().richOutputHints).toBe(false);
+
+      const onlyRich = composeSessionInstructions({ host: 'agy', available: ['agy'], autoDelegate: false, rules: '', richOutputHints: true });
+      expect(onlyRich).toBe(RICH_OUTPUT_INSTRUCTIONS);
+      const both = composeSessionInstructions({ host: 'agy', available: ['agy', 'codex'], autoDelegate: true, rules: '', richOutputHints: true });
+      expect(both).toContain(DELEGATION_INSTRUCTIONS);
+      expect(both).toContain(RICH_OUTPUT_INSTRUCTIONS);
+      const neither = composeSessionInstructions({ host: 'agy', available: ['agy'], autoDelegate: false, rules: '', richOutputHints: false });
+      expect(neither).toBeUndefined();
     } finally {
       await h.close();
     }

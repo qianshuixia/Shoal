@@ -99,6 +99,136 @@ describe('Windows executable resolution & BatBadBut protection', () => {
     expect(launch.args).toEqual([jsPath, '--yolo', 'fix & test "quoted"']);
   });
 
+  it('unwraps custom-prefix codex.cmd (ignoring node.exe guard) and native .exe claude.cmd shims under spaced directories', () => {
+    const root = makeTmpDir();
+    const nodejsDir = path.join(root, 'Program Files', 'nodejs');
+    const codexBin = path.join(nodejsDir, 'node_modules', '@openai', 'codex', 'bin');
+    const claudeBin = path.join(nodejsDir, 'node_modules', '@anthropic-ai', 'claude-code', 'bin');
+    fs.mkdirSync(codexBin, { recursive: true });
+    fs.mkdirSync(claudeBin, { recursive: true });
+
+    fs.writeFileSync(path.join(nodejsDir, 'node.exe'), 'MZ');
+    const codexJsPath = path.join(codexBin, 'codex.js');
+    fs.writeFileSync(codexJsPath, 'console.log("codex")');
+    const codexCmdPath = path.join(nodejsDir, 'codex.cmd');
+    fs.writeFileSync(codexCmdPath, [
+      '@ECHO off',
+      'GOTO start',
+      ':find_dp0',
+      'SET dp0=%~dp0',
+      'EXIT /b',
+      ':start',
+      'SETLOCAL',
+      'CALL :find_dp0',
+      'IF EXIST "%dp0%\\node.exe" (',
+      '  SET "_prog=%dp0%\\node.exe"',
+      ') ELSE (',
+      '  SET "_prog=node"',
+      ')',
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*',
+    ].join('\r\n'));
+
+    const claudeExePath = path.join(claudeBin, 'claude.exe');
+    fs.writeFileSync(claudeExePath, 'MZ');
+    const claudeCmdPath = path.join(nodejsDir, 'claude.cmd');
+    fs.writeFileSync(claudeCmdPath, [
+      '@ECHO off',
+      'SETLOCAL',
+      'SET dp0=%~dp0',
+      '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*',
+    ].join('\r\n'));
+
+    expect(unwrapNpmCmdShim(codexCmdPath)).toBe(codexJsPath);
+    expect(isCmdBatchPath(codexCmdPath, 'win32')).toBe(false);
+    expect(unwrapNpmCmdShim(claudeCmdPath)).toBe(claudeExePath);
+    expect(isCmdBatchPath(claudeCmdPath, 'win32')).toBe(false);
+
+    const claudeLaunch = buildSafeProcessLaunch(claudeCmdPath, ['--append-system-prompt', 'line1\n"quoted" & ok'], 'win32');
+    expect(claudeLaunch.file).toBe(claudeExePath);
+    expect(claudeLaunch.args).toEqual(['--append-system-prompt', 'line1\n"quoted" & ok']);
+
+    const codexBuilt = buildLaunch({
+      agent: 'codex',
+      sessionId: 's-custom-codex',
+      prompt: 'hi',
+      stateDir: root,
+      cliMeta: {
+        path: codexCmdPath,
+        command: 'codex',
+        normalArgs: [],
+        fullAccessArgs: [FULL_ACCESS.codex],
+        promptArg: 'positional',
+      },
+    });
+    expect(codexBuilt.file).toBe(process.execPath);
+    expect(codexBuilt.args[0]).toBe(codexJsPath);
+    expect(codexBuilt.args.at(-1)).toBe('hi');
+
+    // Native codex.exe in a spaced custom directory also launches directly without cmd.exe.
+    const nativeCodex = path.join(nodejsDir, 'codex.exe');
+    fs.writeFileSync(nativeCodex, 'MZ');
+    const nativeBuilt = buildLaunch({
+      agent: 'codex',
+      sessionId: 's-native-codex',
+      prompt: 'hello',
+      stateDir: root,
+      cliMeta: {
+        path: nativeCodex,
+        command: 'codex',
+        normalArgs: [],
+        fullAccessArgs: [FULL_ACCESS.codex],
+        promptArg: 'positional',
+      },
+    });
+    expect(nativeBuilt.file).toBe(nativeCodex);
+    expect(nativeBuilt.args[0]).toBe('-c');
+    expect(nativeBuilt.args.at(-1)).toBe('hello');
+
+    // pnpm %~dp0 shim and Scoop absolute-path pass-through shim both unwrap cleanly.
+    const pnpmCmd = path.join(nodejsDir, 'codex-pnpm.cmd');
+    fs.writeFileSync(pnpmCmd, '@ECHO off\r\n"%_prog%" "%~dp0node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n');
+    expect(unwrapNpmCmdShim(pnpmCmd)).toBe(codexJsPath);
+
+    const scoopCmd = path.join(nodejsDir, 'codex-scoop.cmd');
+    fs.writeFileSync(scoopCmd, `@"${nativeCodex}" %*\r\n`);
+    expect(unwrapNpmCmdShim(scoopCmd)).toBe(process.platform === 'win32' ? nativeCodex : null);
+
+    // Negative cases: interpreter wrappers, fixed-arg wrappers, and comments must NEVER unwrap (would drop fixed args!).
+    const fakePython = path.join(nodejsDir, 'python.exe');
+    fs.writeFileSync(fakePython, 'MZ');
+    const pythonWrap = path.join(nodejsDir, 'aider.cmd');
+    fs.writeFileSync(pythonWrap, `@"${fakePython}" -m aider %*\r\n`);
+    expect(unwrapNpmCmdShim(pythonWrap)).toBeNull();
+
+    const fixedArgExe = path.join(nodejsDir, 'codex-profile.cmd');
+    fs.writeFileSync(fixedArgExe, `@"%dp0%\\codex.exe" --profile work %*\r\n`);
+    expect(unwrapNpmCmdShim(fixedArgExe)).toBeNull();
+
+    const fixedArgJs = path.join(nodejsDir, 'codex-fixed-js.cmd');
+    fs.writeFileSync(fixedArgJs, '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" --profile work %*\r\n');
+    expect(unwrapNpmCmdShim(fixedArgJs)).toBeNull();
+
+    const commentOnly = path.join(nodejsDir, 'commented.cmd');
+    fs.writeFileSync(commentOnly, '@echo off\r\nREM "%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\necho custom %*\r\n');
+    expect(unwrapNpmCmdShim(commentOnly)).toBeNull();
+
+    if (process.platform === 'win32') {
+      expect(() => buildLaunch({
+        agent: 'codex',
+        sessionId: 's-bad-batch',
+        prompt: 'hi',
+        stateDir: root,
+        cliMeta: {
+          path: fixedArgExe,
+          command: 'codex',
+          normalArgs: [],
+          fullAccessArgs: [FULL_ACCESS.codex],
+          promptArg: 'positional',
+        },
+      })).toThrow(/无法直接解包的批处理脚本/);
+    }
+  });
+
   it('blocks shell metacharacters and uses verbatim cmd.exe quoting for non-npm .cmd scripts', () => {
     const dir = makeTmpDir();
     const cmdPath = path.join(dir, 'raw tool.cmd');
@@ -367,10 +497,36 @@ describe('HTTP integration: CLI scan, toggle, permission mode & parent-to-child 
       });
       expect(okDeleg.status).toBe(200);
       const snap = (await (await fetch(`${base}/api/state`)).json()) as Snapshot;
+      expect(snap.settings.closeAction).toBe('tray');
       const childTask = snap.tasks.find((t) => t.delegation?.parentTaskId === created.task.id)!;
       const childSession = snap.sessions.find((s) => s.id === childTask.sessionId)!;
       expect(childTask.permissionMode).toBe('normal');
       expect(childSession.permissionMode).toBe('normal');
+
+      // 6) closeAction setting validates enum values, persists, and reflects in GET /api/state.
+      const badClose = await fetch(`${base}/api/settings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ closeAction: 'hide' }),
+      });
+      expect(badClose.status).toBe(400);
+
+      const quitRes = await fetch(`${base}/api/settings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ closeAction: 'quit' }),
+      });
+      expect(quitRes.status).toBe(200);
+      expect(((await quitRes.json()) as Settings).closeAction).toBe('quit');
+      expect(((await (await fetch(`${base}/api/state`)).json()) as Snapshot).settings.closeAction).toBe('quit');
+
+      const trayRes = await fetch(`${base}/api/settings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ closeAction: 'tray' }),
+      });
+      expect(trayRes.status).toBe(200);
+      expect(((await trayRes.json()) as Settings).closeAction).toBe('tray');
     } finally {
       await Promise.allSettled([mobile.close(), sessions.killAll()]);
       server.close();

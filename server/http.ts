@@ -10,8 +10,10 @@ import type {
   AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
   GitInfo, QuotaInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionContext, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
-import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeDelegationInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel, rawPreviewOf } from '../shared/protocol.ts';
+import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeSessionInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel, rawPreviewOf } from '../shared/protocol.ts';
 import { createActivityTracker } from './activity.ts';
+import { readPrompt } from './prompt.ts';
+import { createStreamWatcher } from './stream.ts';
 import { clipboardFiles, writeClipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
@@ -283,9 +285,21 @@ export function createApp(cfg: AppConfig) {
     for (const c of clients) if (c.readyState === 1) c.send(raw);
     mobile?.onServerMsg(m);
   };
+  const streamWatcher = createStreamWatcher({
+    getSession: id => sessions.list().find(s => s.id === id),
+    getTask: id => store.getTask(id),
+    getCards: () => store.cards(),
+    getActivity: id => activity.get(id) ?? null,
+    getPromptWait: id => sessions.promptWait(id),
+  });
+  const desktopPromptLocks = new Map<string, Promise<void>>();
+
   const activity = createActivityTracker({
     sessions: () => sessions.list(),
-    onUpdate: (sessionId, act) => broadcast({ t: 'activity', sessionId, activity: act }),
+    onUpdate: (sessionId, act) => {
+      broadcast({ t: 'activity', sessionId, activity: act });
+      streamWatcher.onActivity(sessionId);
+    },
   });
   for (const s of sessions.list()) if (s.status === 'working') activity.onSessionChange(s);
 
@@ -321,6 +335,7 @@ export function createApp(cfg: AppConfig) {
       const saved = store.getSession(m.session.id);
       if (!sizeOnly(saved, m.session)) store.saveSession(m.session);
       activity.onSessionChange(m.session);
+      streamWatcher.onSessionChange(m.session);
       broadcast(m);
       // Typing a follow-up in the terminal takes the task out of 待验收 / 已通过 / 已归档.
       const task = store.getTask(m.session.taskId);
@@ -385,11 +400,17 @@ export function createApp(cfg: AppConfig) {
     return out;
   }
 
-  // Standing delegation instructions for a new session; a delegated task or generic CLI never gets them.
+  // Standing instructions for a new session (delegation rules + optional rich-output chart hints); delegated child tasks or generic CLIs never get them.
   function delegationInstructions(task: Pick<Task, 'delegation' | 'agent'>): string | undefined {
+    if (task.delegation || !isDeepAgent(task.agent)) return undefined;
     const settings = store.settings();
-    if (settings.autoDelegate === false || task.delegation || !isDeepAgent(task.agent)) return undefined;
-    return composeDelegationInstructions({ host: task.agent, available: currentDelegatableAgents(), rules: settings.delegationRules ?? DEFAULT_DELEGATION_RULES });
+    return composeSessionInstructions({
+      host: task.agent,
+      available: currentDelegatableAgents(),
+      autoDelegate: settings.autoDelegate !== false,
+      rules: settings.delegationRules ?? DEFAULT_DELEGATION_RULES,
+      richOutputHints: settings.richOutputHints !== false,
+    });
   }
 
   // Resolves the effective permission mode for a task spawn:
@@ -571,6 +592,7 @@ export function createApp(cfg: AppConfig) {
     if (prev) {
       collab.clearSessionState(prev.id);
       activity.onRemove(prev.id);
+      streamWatcher.onRemoveSession(prev.id);
       sessions.remove(prev.id);
       store.removeSession(prev.id);
     }
@@ -661,6 +683,7 @@ export function createApp(cfg: AppConfig) {
     const card: Card = { id: crypto.randomUUID(), taskId: task.id, sessionId, kind, body: capBody(text), createdAt: Date.now(), ...(meta && { meta }) };
     store.addCard(card);
     broadcast({ t: 'card', card });
+    streamWatcher.onTaskChange(task.id);
     return card;
   }
 
@@ -1070,7 +1093,9 @@ export function createApp(cfg: AppConfig) {
     }
     if (method === 'POST' && pathname === '/api/settings') {
       if (body.aiTitles !== undefined && typeof body.aiTitles !== 'boolean') throw new HttpError(400, '设置值无效');
+      if (body.closeAction !== undefined && body.closeAction !== 'tray' && body.closeAction !== 'quit') throw new HttpError(400, '设置值无效');
       if (body.autoDelegate !== undefined && typeof body.autoDelegate !== 'boolean') throw new HttpError(400, '设置值无效');
+      if (body.richOutputHints !== undefined && typeof body.richOutputHints !== 'boolean') throw new HttpError(400, '设置值无效');
       if (body.delegationRules !== undefined && body.delegationRules !== null) {
         if (typeof body.delegationRules !== 'string') throw new HttpError(400, '设置值无效');
         if ([...body.delegationRules].length > DELEGATION_RULES_MAX) throw new HttpError(400, `分工规则过长（上限 ${DELEGATION_RULES_MAX} 字）`);
@@ -1093,7 +1118,9 @@ export function createApp(cfg: AppConfig) {
       const settings: Settings = {
         ...store.settings(),
         ...(typeof body.aiTitles === 'boolean' ? { aiTitles: body.aiTitles } : {}),
+        ...(body.closeAction === 'tray' || body.closeAction === 'quit' ? { closeAction: body.closeAction } : {}),
         ...(typeof body.autoDelegate === 'boolean' ? { autoDelegate: body.autoDelegate } : {}),
+        ...(typeof body.richOutputHints === 'boolean' ? { richOutputHints: body.richOutputHints } : {}),
       };
       if (typeof body.delegationRules === 'string') settings.delegationRules = body.delegationRules;
       else if (body.delegationRules === null) delete settings.delegationRules;
@@ -1145,6 +1172,57 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/sessions/dismiss-interrupted') return send(res, 200, dismissInterrupted());
     const pas = pathname.match(/^\/api\/projects\/([^/]+)\/archive-stopped$/);
     if (method === 'POST' && pas) return send(res, 200, archiveStoppedTasks(decodeURIComponent(pas[1])));
+    const safeDecode = (seg: string) => {
+      try { return decodeURIComponent(seg); } catch { throw new HttpError(400, '路径参数编码无效'); }
+    };
+    const st = pathname.match(/^\/api\/tasks\/([^/]+)\/stream$/);
+    if (method === 'GET' && st) {
+      const task = store.getTask(safeDecode(st[1]));
+      if (!task) throw new HttpError(404, '任务不存在');
+      const session = task.sessionId ? sessions.list().find(s => s.id === task.sessionId) : undefined;
+      return send(res, 200, await streamWatcher.snapshotFor(task, session));
+    }
+    const pa = pathname.match(/^\/api\/tasks\/([^/]+)\/prompt-answer$/);
+    if (method === 'POST' && pa) {
+      const taskId = safeDecode(pa[1]);
+      const task = store.getTask(taskId);
+      if (!task) throw new HttpError(404, '任务不存在');
+      const sessionId = task.sessionId;
+      if (!sessionId) throw new HttpError(409, '已在别处处理', 'stale');
+      const { fingerprint, data, waitSeq } = body;
+      if (typeof fingerprint !== 'string' || typeof data !== 'string') throw new HttpError(400, '缺少 fingerprint 或 data');
+      const read = async () => {
+        const w = sessions.promptWait(sessionId);
+        if (!w) return null;
+        const view = await readPrompt(w.info, w.waitSeq, w.replay, t => t);
+        return view ? { view, waitSeq: w.waitSeq, outSeq: w.outSeq } : null;
+      };
+      const prev = desktopPromptLocks.get(sessionId) ?? Promise.resolve();
+      const run = prev.catch(() => {}).then(async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const r = await read();
+          if (!r || r.view.fingerprint !== fingerprint) {
+            if (r && r.waitSeq === waitSeq && sessions.promptWait(sessionId)?.waitSeq === waitSeq) {
+              throw new HttpError(409, '画面已变化，请看清后重新确认', 'changed');
+            }
+            throw new HttpError(409, '已在别处处理', 'stale');
+          }
+          if (!r.view.keys.some(k => k.data === data)) throw new HttpError(400, '这个按键不在当前提示的选项里');
+          if (store.getTask(taskId)?.sessionId !== sessionId) throw new HttpError(409, '已在别处处理', 'stale');
+          const answered = sessions.answerPrompt(sessionId, r.waitSeq, r.outSeq, data);
+          if (answered === 'ok') return;
+          if (answered === 'stale') throw new HttpError(409, '已在别处处理', 'stale');
+        }
+        throw new HttpError(409, '终端正在刷新，请稍后重试', 'redrawing');
+      });
+      desktopPromptLocks.set(sessionId, run);
+      try {
+        await run;
+      } finally {
+        if (desktopPromptLocks.get(sessionId) === run) desktopPromptLocks.delete(sessionId);
+      }
+      return send(res, 200, { ok: true });
+    }
     const r = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
     if (method === 'POST' && r) return send(res, 200, resumeTask(r[1], body));
     const sw = pathname.match(/^\/api\/tasks\/([^/]+)\/switch$/);
@@ -1181,6 +1259,7 @@ export function createApp(cfg: AppConfig) {
       if (task.sessionId) {
         collab.clearSessionState(task.sessionId);
         activity.onRemove(task.sessionId);
+        streamWatcher.onRemoveSession(task.sessionId);
         sessions.remove(task.sessionId);
       }
       store.removeTask(task.id);
@@ -1264,6 +1343,7 @@ export function createApp(cfg: AppConfig) {
         if (t.sessionId) {
           collab.clearSessionState(t.sessionId);
           activity.onRemove(t.sessionId);
+          streamWatcher.onRemoveSession(t.sessionId);
           sessions.remove(t.sessionId);
         }
       }
@@ -1330,6 +1410,7 @@ export function createApp(cfg: AppConfig) {
         activity.onHook(latest, hookBody.event, (hookBody.payload ?? {}) as Record<string, unknown>, {
           intermediateStop: hookRes.intermediateStop,
         });
+        streamWatcher.onHook(latest.id);
       }
       if (!hookRes.intermediateStop) {
         observeQuota(hookBody);
@@ -1469,6 +1550,7 @@ export function createApp(cfg: AppConfig) {
     clearInterval(gitTimer);
     clearInterval(usageTimer);
     clearInterval(activityTimer);
+    streamWatcher.close();
     void mobile?.close();
   });
   const wss = new WebSocketServer({ noServer: true });
@@ -1496,8 +1578,12 @@ export function createApp(cfg: AppConfig) {
     clients.add(ws);
     if (activity.hasActive()) activity.tick();
     void refreshAllGit(); // fill in (or freshen) git state for a client that just opened
-    ws.on('close', () => clients.delete(ws));
-    ws.on('error', () => clients.delete(ws));
+    const dropWs = () => {
+      clients.delete(ws);
+      streamWatcher.unwatchClient(ws);
+    };
+    ws.on('close', dropWs);
+    ws.on('error', dropWs);
     ws.send(JSON.stringify({ t: 'snapshot', state: snapshot() } satisfies ServerMsg));
     for (const r of sessions.replays()) ws.send(JSON.stringify({ t: 'replay', id: r.id, d: r.d } satisfies ServerMsg));
     ws.on('message', raw => {
@@ -1506,6 +1592,8 @@ export function createApp(cfg: AppConfig) {
       if (!m || typeof m !== 'object') return;
       if (m.t === 'in' && typeof m.id === 'string' && typeof m.d === 'string') sessions.input(m.id, m.d);
       else if (m.t === 'resize' && typeof m.id === 'string') sessions.resize(m.id, Number(m.cols), Number(m.rows));
+      else if (m.t === 'watch-stream' && typeof m.id === 'string') streamWatcher.watch(ws, m.id);
+      else if (m.t === 'unwatch-stream' && typeof m.id === 'string') streamWatcher.unwatch(ws, m.id);
       else if (m.t === 'want-replay' && typeof m.id === 'string' && !sessions.hasLiveBuffer(m.id)) {
         ws.send(JSON.stringify({ t: 'replay', id: m.id, d: sessions.replayOf(m.id) ?? '' } satisfies ServerMsg));
       }

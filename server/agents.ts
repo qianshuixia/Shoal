@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import type { AgentKind, CliToolInfo, PermissionMode } from '../shared/protocol.ts';
 import { isValidAgyModel } from '../shared/protocol.ts';
-import { buildSafeProcessLaunch, isCmdBatchPath } from './cliRegistry.ts';
+import { buildSafeProcessLaunch, findExecutableWin, isCmdBatchPath, unwrapNpmCmdShim } from './cliRegistry.ts';
 import { findExecutable } from './platform.ts';
 
 // Hook commands go through shells that quote badly (agy uses `cmd /c`), so a path with spaces falls back to its
@@ -44,17 +44,16 @@ export const NOTIFY = shortPath(path.join(ROOT, 'hooks', 'notify.mjs')).replaceA
 const STATUSLINE = shortPath(path.join(ROOT, 'hooks', 'statusline.mjs')).replaceAll('\\', '/');
 // The desktop app's hooks run on its bundled Node: the user's machine may have none on PATH. A checkout keeps `node`.
 export const NODE = process.env.WORKBENCH_BUNDLED === '1' ? shortPath(process.execPath).replaceAll('\\', '/') : 'node';
-const nodeCmd = NODE.includes(' ') ? `"${NODE}"` : NODE;
 const FAKE_AGENT = path.join(ROOT, 'test', 'fixtures', 'fake-agent.mjs');
 
-const appdata = () => process.env.APPDATA ?? '';
-const localAppdata = () => process.env.LOCALAPPDATA ?? '';
-const claudeExe = () => path.join(appdata(), 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
-const codexJs = () => path.join(appdata(), 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-const agyExe = () => path.join(localAppdata(), 'agy', 'bin', 'agy.exe');
+const appdata = (env: NodeJS.ProcessEnv = process.env) => env.APPDATA ?? '';
+const localAppdata = (env: NodeJS.ProcessEnv = process.env) => env.LOCALAPPDATA ?? '';
+const claudeExe = (env: NodeJS.ProcessEnv = process.env) => path.join(appdata(env), 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
+const codexJs = (env: NodeJS.ProcessEnv = process.env) => path.join(appdata(env), 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+const agyExe = (env: NodeJS.ProcessEnv = process.env) => path.join(localAppdata(env), 'agy', 'bin', 'agy.exe');
 
-// POSIX CLI lookup: PATH first, then the usual install locations (a GUI launch may not have the user's PATH).
-// win32 keeps the fixed npm / agy paths above and never goes through the lookups.
+// CLI lookup: on Windows check the default npm / agy install paths first, then fall back to PATH & common dirs;
+// on POSIX check PATH first, then usual install locations (a GUI launch may not have the user's PATH).
 export interface CliEnv {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
@@ -66,7 +65,11 @@ const ctx = (c: CliEnv) => ({ platform: c.platform ?? process.platform, env: c.e
 
 export function resolveClaude(c: CliEnv = {}): string | null {
   const { platform, env, home, delimiter } = ctx(c);
-  if (platform === 'win32') return claudeExe();
+  if (platform === 'win32') {
+    const def = claudeExe(env);
+    if (fs.existsSync(def)) return def;
+    return findExecutableWin('claude', env, home);
+  }
   return findExecutable('claude', env, platform, delimiter) ?? firstExisting([
     path.posix.join(home, '.local', 'bin', 'claude'),
     path.posix.join(home, '.claude', 'local', 'claude'),
@@ -77,14 +80,23 @@ export function resolveClaude(c: CliEnv = {}): string | null {
 
 export function resolveAgy(c: CliEnv = {}): string | null {
   const { platform, env, home, delimiter } = ctx(c);
-  if (platform === 'win32') return agyExe();
+  if (platform === 'win32') {
+    const def = agyExe(env);
+    if (fs.existsSync(def)) return def;
+    return findExecutableWin('agy', env, home);
+  }
   return findExecutable('agy', env, platform, delimiter) ?? firstExisting([path.posix.join(home, '.local', 'bin', 'agy')]);
 }
 
-// Where the codex entry point is: on win32 the npm-installed codex.js; on POSIX whatever `codex` resolves to.
+// Where the codex entry point is: on win32 the default npm codex.js if present, else PATH / common dirs;
+// on POSIX whatever `codex` resolves to.
 export function resolveCodex(c: CliEnv = {}): string | null {
   const { platform, env, home, delimiter } = ctx(c);
-  if (platform === 'win32') return codexJs();
+  if (platform === 'win32') {
+    const def = codexJs(env);
+    if (fs.existsSync(def)) return def;
+    return findExecutableWin('codex', env, home);
+  }
   return findExecutable('codex', env, platform, delimiter) ?? firstExisting([
     '/opt/homebrew/bin/codex',
     '/usr/local/bin/codex',
@@ -92,17 +104,35 @@ export function resolveCodex(c: CliEnv = {}): string | null {
   ]);
 }
 
-// An npm-installed codex is a symlink to @openai/codex/bin/codex.js: run that on the bundled Node like on Windows.
-// Anything else (e.g. Homebrew's native binary) is executed by the path found, not its target: version-manager shims
-// (Volta, mise, asdf) are links to one binary that tells the tools apart by argv[0].
+// An npm-installed codex is a symlink (POSIX) or .cmd shim (Windows) to @openai/codex/bin/codex.js: run that on the
+// bundled Node directly without cmd.exe. Native binaries and version-manager shims (Volta, mise, asdf) run by path.
 export function codexLaunchFor(resolved: string): { file: string; prefix: string[] } {
+  const lower = resolved.toLowerCase();
+  if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
+    const unwrapped = unwrapNpmCmdShim(resolved);
+    if (unwrapped) {
+      const uLower = unwrapped.toLowerCase();
+      if (uLower.endsWith('.js') || uLower.endsWith('.mjs') || uLower.endsWith('.cjs')) {
+        return { file: process.execPath, prefix: [unwrapped] };
+      }
+      return { file: unwrapped, prefix: [] };
+    }
+    return { file: resolved, prefix: [] };
+  }
   let real = resolved;
   try { real = fs.realpathSync(resolved); } catch { /* keep as is */ }
-  return real.toLowerCase().endsWith('.js') ? { file: process.execPath, prefix: [real] } : { file: resolved, prefix: [] };
+  const rLower = real.toLowerCase();
+  return (rLower.endsWith('.js') || rLower.endsWith('.mjs') || rLower.endsWith('.cjs'))
+    ? { file: process.execPath, prefix: [real] }
+    : { file: resolved, prefix: [] };
 }
 
 export function codexLaunch(c: CliEnv = {}): { file: string; prefix: string[] } {
-  if ((c.platform ?? process.platform) === 'win32') return { file: process.execPath, prefix: [codexJs()] };
+  const { platform, env } = ctx(c);
+  if (platform === 'win32') {
+    const found = resolveCodex(c);
+    return found ? codexLaunchFor(found) : { file: process.execPath, prefix: [codexJs(env)] };
+  }
   const found = resolveCodex(c);
   return found ? codexLaunchFor(found) : { file: 'codex', prefix: [] };
 }
@@ -111,9 +141,25 @@ const CLAUDE_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure'
 const CODEX_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PermissionRequest'];
 const AGY_EVENTS = ['SessionStart', 'PreInvocation', 'PostInvocation', 'Stop'];
 
-const hookCmd = (agent: string, ev: string) => `${nodeCmd} "${NOTIFY}" ${agent} ${ev}`;
-// agy runs hook and statusLine commands through `cmd /c`, which breaks quoted paths.
-export const agyUsable = () => !NOTIFY.includes(' ') && !STATUSLINE.includes(' ') && !NODE.includes(' ');
+const UNSAFE_HOOK_NODE_RE = /[\s'"`$%&|;<>()^!]/;
+const UNSAFE_HOOK_SCRIPT_RE = /['"`$%]/;
+
+// When NODE or the hook script path contains spaces or shell/TOML metacharacters (e.g. bundled desktop installed
+// under `D:\Program Files\Shoal` on a volume without 8.3 short paths, or a username like `O'Brien`), quoting
+// `"node.exe" "notify.mjs"` breaks Windows PowerShell (Codex hooks), TOML single-quoted strings, or `cmd /c`.
+// Fall back to the PATH-resolved `<stateDir>/bin/shoal-hook` wrapper which has zero paths, spaces, or quotes.
+export function formatHookCommand(agent: string, ev: string, node = NODE, notify = NOTIFY): string {
+  if (UNSAFE_HOOK_NODE_RE.test(node) || UNSAFE_HOOK_SCRIPT_RE.test(notify)) return `shoal-hook ${agent} ${ev}`;
+  return `${node} "${notify}" ${agent} ${ev}`;
+}
+export function formatStatusLineCommand(agent: string, node = NODE, statusline = STATUSLINE): string {
+  if (UNSAFE_HOOK_NODE_RE.test(node) || UNSAFE_HOOK_SCRIPT_RE.test(statusline)) return `shoal-statusline ${agent}`;
+  return `${node} "${statusline}" ${agent}`;
+}
+const hookCmd = (agent: string, ev: string) => formatHookCommand(agent, ev);
+// agy hooks and statusLine always invoke the PATH-resolved `shoal-hook` / `shoal-statusline` wrappers in `<stateDir>/bin`,
+// so spaces in the workbench install path or user directory never break `cmd /c` quoting.
+export const agyUsable = () => true;
 
 // Claude saves a conversation as <config>/projects/<cwd slug>/<uuid>.jsonl once a prompt is sent; read-only check.
 export function claudeConversationExists(id: string): boolean {
@@ -331,67 +377,80 @@ export function availableAgents(): AgentKind[] {
   return out;
 }
 
-// Writes the per-agent hook config files and shoal CLI shims into the state dir (idempotent).
+function writeNodeShim(binDir: string, name: string, scriptName: string): void {
+  const bundled = process.env.WORKBENCH_BUNDLED === '1';
+  const winFallback = bundled ? `"${process.execPath.replaceAll('%', '%%')}"` : 'node';
+  const posixFallback = bundled ? `'${process.execPath.replaceAll("'", "'\\''")}'` : 'node';
+
+  const cmd = [
+    '@echo off',
+    'if defined WORKBENCH_NODE (',
+    `  "%WORKBENCH_NODE%" "%~dp0${scriptName}" %*`,
+    ') else (',
+    `  ${winFallback} "%~dp0${scriptName}" %*`,
+    ')',
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(path.join(binDir, `${name}.cmd`), cmd, 'utf8');
+
+  // Strict LF line endings so Git Bash / POSIX shells execute without '\r' errors.
+  // Convert DIR via cygpath -w under Git Bash / MSYS2 when present so MSYS_NO_PATHCONV=1 still hands Windows Node a valid path.
+  const sh = [
+    '#!/bin/sh',
+    'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+    'if command -v cygpath >/dev/null 2>&1; then',
+    '  DIR=$(cygpath -w "$DIR")',
+    'fi',
+    'if [ -n "$WORKBENCH_NODE" ]; then',
+    `  exec "$WORKBENCH_NODE" "$DIR/${scriptName}" "$@"`,
+    'fi',
+    `exec ${posixFallback} "$DIR/${scriptName}" "$@"`,
+    '',
+  ].join('\n');
+  const shFile = path.join(binDir, name);
+  fs.writeFileSync(shFile, sh, 'utf8');
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(shFile, 0o755); } catch { /* ignore */ }
+  }
+}
+
+// Writes the per-agent hook config files and shoal CLI/hook shims into the state dir (idempotent).
 export function writeHookFiles(stateDir: string): void {
   const binDir = path.join(stateDir, 'bin');
   const collabDir = path.join(stateDir, 'collab');
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(collabDir, { recursive: true });
 
-  const cliSrc = path.join(ROOT, 'hooks', 'shoal-cli.mjs');
-  if (fs.existsSync(cliSrc)) {
-    fs.copyFileSync(cliSrc, path.join(binDir, 'shoal-cli.mjs'));
+  for (const script of ['shoal-cli.mjs', 'notify.mjs', 'statusline.mjs']) {
+    const src = path.join(ROOT, 'hooks', script);
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(binDir, script));
   }
-  const shoalCmd = [
-    '@echo off',
-    'if defined WORKBENCH_NODE (',
-    '  "%WORKBENCH_NODE%" "%~dp0shoal-cli.mjs" %*',
-    ') else (',
-    '  node "%~dp0shoal-cli.mjs" %*',
-    ')',
-    '',
-  ].join('\r\n');
-  fs.writeFileSync(path.join(binDir, 'shoal.cmd'), shoalCmd, 'utf8');
-
-  // Strict LF line endings so Git Bash / POSIX shells execute without '\r' errors.
-  const shoalSh = [
-    '#!/bin/sh',
-    'DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
-    'if [ -n "$WORKBENCH_NODE" ]; then',
-    '  exec "$WORKBENCH_NODE" "$DIR/shoal-cli.mjs" "$@"',
-    'fi',
-    'exec node "$DIR/shoal-cli.mjs" "$@"',
-    '',
-  ].join('\n');
-  const shFile = path.join(binDir, 'shoal');
-  fs.writeFileSync(shFile, shoalSh, 'utf8');
-  if (process.platform !== 'win32') {
-    try { fs.chmodSync(shFile, 0o755); } catch { /* ignore */ }
-  }
+  writeNodeShim(binDir, 'shoal', 'shoal-cli.mjs');
+  writeNodeShim(binDir, 'shoal-hook', 'notify.mjs');
+  writeNodeShim(binDir, 'shoal-statusline', 'statusline.mjs');
 
   const hooks: Record<string, unknown> = {};
   for (const ev of CLAUDE_EVENTS) hooks[ev] = [{ hooks: [{ type: 'command', command: hookCmd('claude', ev), timeout: 5 }] }];
   // Claude reports its subscription rate limits only to the status line command. This one replaces the user's own
   // (--settings wins), so it runs that for us: see userStatusLine and hooks/statusline.mjs.
-  const statusLine = { type: 'command', command: `${nodeCmd} "${STATUSLINE}" claude` };
+  const statusLine = { type: 'command', command: formatStatusLineCommand('claude') };
   fs.writeFileSync(path.join(stateDir, 'claude-hooks.json'), JSON.stringify({ hooks, statusLine }, null, 2));
 
   // Earlier versions synced a shoal-collab skill for agy; it now gets its instructions like the other CLIs (see buildLaunch).
   fs.rmSync(path.join(stateDir, 'agy-hooks', '.agents', 'skills', 'shoal-collab'), { recursive: true, force: true });
 
-  if (!agyUsable()) {
-    console.warn(`[agents] WARNING: hook command path contains a space (${NODE} ${NOTIFY} ${STATUSLINE}); agy hooks cannot be quoted, agy is disabled`);
-    return;
-  }
+  // agy executes hook and statusLine commands through `cmd /c` (Windows) or `sh -c` (POSIX), where quoted paths with
+  // spaces break `cmd /c` parsing. Running the PATH-resolved `shoal-hook` / `shoal-statusline` wrappers in `<stateDir>/bin`
+  // keeps the commands free of paths, spaces, and quotes on every install location.
   const agy: Record<string, unknown> = {};
-  for (const ev of AGY_EVENTS) agy[ev] = [{ type: 'command', command: `${NODE} ${NOTIFY} agy ${ev}`, timeout: 5 }];
+  for (const ev of AGY_EVENTS) agy[ev] = [{ type: 'command', command: `shoal-hook agy ${ev}`, timeout: 5 }];
   const dir = path.join(stateDir, 'agy-hooks', '.agents');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'hooks.json'), JSON.stringify({ workbench: agy }, null, 2));
   const agySl = agyUserStatusLine();
   const agyStatusLine = {
     type: 'command',
-    command: `${NODE} ${STATUSLINE} agy`,
+    command: 'shoal-statusline agy',
     enabled: true,
     stack_with_default: agySl.stackWithDefault,
     padding: agySl.padding,
@@ -467,17 +526,20 @@ export function buildLaunch(opts: {
         : { file: safe.file, args: safe.args, nativeSessionId: native };
     }
     case 'codex': {
-      const { file, prefix } = codexLaunch();
-      const args = [...prefix];
-      if (resume) args.push('resume', resume);
+      const codexArgs: string[] = [];
+      if (resume) codexArgs.push('resume', resume);
       // Byte-identical to spikes/probe.mjs: Codex stores trust hashes of these strings.
-      for (const ev of CODEX_EVENTS) args.push('-c', `hooks.${ev}=[{hooks=[{type="command",command='${hookCmd('codex', ev)}',timeout=5}]}]`);
+      for (const ev of CODEX_EVENTS) codexArgs.push('-c', `hooks.${ev}=[{hooks=[{type="command",command='${hookCmd('codex', ev)}',timeout=5}]}]`);
       // Not injected when the user's own Codex config defines developer_instructions: a -c override would replace it.
-      if (instructions && !codexHasUserDeveloperInstructions()) args.push('-c', `developer_instructions=${JSON.stringify(instructions)}`);
-      args.push('-c', 'check_for_update_on_startup=false');
-      if (fullAccess) args.push(FULL_ACCESS.codex);
-      if (prompt) args.push(prompt);
-      return { file, args, nativeSessionId: resume ?? null };
+      if (instructions && !codexHasUserDeveloperInstructions()) codexArgs.push('-c', `developer_instructions=${JSON.stringify(instructions)}`);
+      codexArgs.push('-c', 'check_for_update_on_startup=false');
+      if (fullAccess) codexArgs.push(FULL_ACCESS.codex);
+      if (prompt) codexArgs.push(prompt);
+      const { file, prefix } = cliMeta?.path ? codexLaunchFor(cliMeta.path) : codexLaunch();
+      if (process.platform === 'win32' && prefix.length === 0 && (file.toLowerCase().endsWith('.cmd') || file.toLowerCase().endsWith('.bat'))) {
+        throw new Error(`Codex 启动路径 ${file} 是无法直接解包的批处理脚本，请使用标准 npm 安装或原生 codex.exe`);
+      }
+      return { file, args: [...prefix, ...codexArgs], nativeSessionId: resume ?? null };
     }
     case 'agy': {
       const args = resume ? ['--conversation', resume] : [];
@@ -538,10 +600,18 @@ export interface GeneratorLaunch {
 // account policy and spawn extra language-server sidecars.
 export function buildGenerator(agent: AgentKind, prompt: string, outFile: string): GeneratorLaunch | null {
   switch (agent) {
-    case 'claude':
-      return { file: resolveClaude() ?? 'claude', args: ['-p', '--model', 'haiku', '--tools', '', '--no-session-persistence'], stdin: prompt, outFile: null };
+    case 'claude': {
+      const baseArgs = ['-p', '--model', 'haiku', '--tools', '', '--no-session-persistence'];
+      const resolved = resolveClaude() ?? 'claude';
+      const safe = buildSafeProcessLaunch(resolved, baseArgs);
+      if (typeof safe.args === 'string') return null;
+      return { file: safe.file, args: safe.args, stdin: prompt, outFile: null };
+    }
     case 'codex': {
       const { file, prefix } = codexLaunch();
+      if (process.platform === 'win32' && prefix.length === 0 && (file.toLowerCase().endsWith('.cmd') || file.toLowerCase().endsWith('.bat'))) {
+        return null;
+      }
       return {
         file,
         args: [...prefix, 'exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '-c', 'model_reasoning_effort="low"', '-o', outFile, '-'],

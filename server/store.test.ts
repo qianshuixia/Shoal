@@ -147,19 +147,21 @@ describe('file store', () => {
     expect(s.sessions()[0]).not.toHaveProperty('queued');
   });
 
-  it('settings default to aiTitles off, survive a reload, and fall back to the default for missing or invalid values', () => {
+  it('settings default to aiTitles off and closeAction tray, survive a reload, and fall back to the default for missing or invalid values', () => {
     const a = createFileStore(file);
-    expect(a.settings()).toEqual({ aiTitles: false, autoDelegate: true });
-    a.setSettings({ aiTitles: true });
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: true, autoDelegate: true });
+    expect(a.settings()).toEqual({ aiTitles: false, closeAction: 'tray', autoDelegate: true, richOutputHints: true });
+    a.setSettings({ aiTitles: true, closeAction: 'quit' });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: true, closeAction: 'quit', autoDelegate: true, richOutputHints: true });
     const base = { version: 1, projects: [], tasks: [], sessions: [] };
     fs.writeFileSync(file, JSON.stringify(base));
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, autoDelegate: true });
-    fs.writeFileSync(file, JSON.stringify({ ...base, settings: { aiTitles: 'yes' } }));
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, autoDelegate: true });
-    a.setSettings({ aiTitles: false, autoDelegate: false });
-    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, autoDelegate: false });
-    fs.writeFileSync(file, JSON.stringify({ ...base, settings: { autoDelegate: 'no' } }));
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, closeAction: 'tray', autoDelegate: true, richOutputHints: true });
+    fs.writeFileSync(file, JSON.stringify({ ...base, settings: { aiTitles: 'yes', closeAction: 'minimize' } }));
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, closeAction: 'tray', autoDelegate: true, richOutputHints: true });
+    a.setSettings({ aiTitles: false, closeAction: 'quit', autoDelegate: false, richOutputHints: false });
+    expect(createFileStore(file).settings()).toEqual({ aiTitles: false, closeAction: 'quit', autoDelegate: false, richOutputHints: false });
+    fs.writeFileSync(file, JSON.stringify({ ...base, settings: { autoDelegate: 'no', richOutputHints: 'no', closeAction: 123 } }));
     expect(createFileStore(file).settings().autoDelegate).toBe(true);
+    expect(createFileStore(file).settings().richOutputHints).toBe(true);
+    expect(createFileStore(file).settings().closeAction).toBe('tray');
   });
 });

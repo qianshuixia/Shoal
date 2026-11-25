@@ -2,11 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { CSSProperties, RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, CliToolInfo, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, FsPasteResult, GitInfo, OpenMode, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, Settings, Snapshot, SwitchResult, Task,
+  AgentKind, ArchiveStoppedResult, Card, CliToolInfo, CreateTaskBody, FeedbackBody, FeedbackResult, FilePayload, ForwardBody, ForwardResult, FsPasteResult, GitInfo, OpenMode, PaneViewMode, Project, ResumeInterruptedResult, ResumeResult, ServerMsg, SessionActivity, SessionInfo, SessionStreamState, Settings, Snapshot, SwitchResult, Task,
 } from '../../shared/protocol.ts';
-import { agentLabel, cleanPreviewText, DEFAULT_SETTINGS, DELEGATION_LABEL, DELEGATION_MODE_LABEL, DELEGATION_MODE_SHORT, canResume, delegationDisplayTitle, delegationState } from '../../shared/protocol.ts';
+import { agentLabel, cleanPreviewText, DEFAULT_SETTINGS, DELEGATION_LABEL, DELEGATION_MODE_LABEL, DELEGATION_MODE_SHORT, canResume, delegationDisplayTitle, delegationState, isDeepAgent } from '../../shared/protocol.ts';
 import { connect, send } from './ws.ts';
-import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isNewTaskKey, isPaneKey, isSearchKey, pasteToTerminal, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
+import { disposeExcept, dispose, fitEntry, focusOnly, forgetSentSizes, isInspectKey, isJumpKey, isModeKey, isNewTaskKey, isPaneKey, isSearchKey, pasteToTerminal, replay, resendWantedReplays, zoomKey, setTermFileLinkHandler, setTermNotice, setTermScale, sizeOf, termFontSize, termGlDebug, termText, writeOut } from './terms.ts';
 import type { TermGlDebug } from './terms.ts';
 import { ACTIVITY_STALL_MS, Pane, SESSION_DRAG_TYPE } from './Pane.tsx';
 import { Inspector, type InspectOpenRequest, type InspectorTab } from './Inspector.tsx';
@@ -53,6 +53,8 @@ const upsert = <T extends { id: string }>(list: T[], item: T): T[] =>
 const COLLAPSED_KEY = 'wb.collapsed';
 const ARCHIVE_OPEN_KEY = 'wb.archiveOpen';
 const FILTER_KEY = 'wb.sideFilter';
+const VIEW_MODE_KEY = 'wb.paneViewMode';
+const loadPaneViewMode = (): PaneViewMode => (localStorage.getItem(VIEW_MODE_KEY) === 'stream' ? 'stream' : 'term');
 // In 全部 mode each project keeps at most the N most recently active exited tasks visible; older ones fold locally.
 const RECENT_STOPPED_LIMIT = 2;
 // A closed delegated task stays in the main task's HUD this long, so the outcome can still be seen.
@@ -173,9 +175,12 @@ export function App() {
   const inspectorDirtyGuardRef = useRef<((pid: string, pathPrefix: string) => boolean) | null>(null);
   const [projectCtx, setProjectCtx] = useState<(ContextMenuState & { projectId: string }) | null>(null);
 
+  const [paneViewMode, setPaneViewMode] = useState<PaneViewMode>(loadPaneViewMode);
+  const [streamStates, setStreamStates] = useState<Record<string, SessionStreamState>>({});
+
   // Latest state for handlers registered once (WebSocket, window listeners).
-  const live = useRef({ data, panes, focusedPane, layout, dialog, pinnedInspectProjectId, order });
-  live.current = { data, panes, focusedPane, layout, dialog, pinnedInspectProjectId, order };
+  const live = useRef({ data, panes, focusedPane, layout, dialog, view, pinnedInspectProjectId, order, paneViewMode });
+  live.current = { data, panes, focusedPane, layout, dialog, view, pinnedInspectProjectId, order, paneViewMode };
 
   const sessionsById = new Map(data.sessions.map((s) => [s.id, s]));
   const tasksById = new Map(data.tasks.map((t) => [t.id, t]));
@@ -200,6 +205,10 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(ARCHIVE_OPEN_KEY, archiveOpen ? '1' : '0');
   }, [archiveOpen]);
+
+  useEffect(() => {
+    localStorage.setItem(VIEW_MODE_KEY, paneViewMode);
+  }, [paneViewMode]);
 
   useLayoutEffect(() => {
     document.documentElement.style.fontSize = `${(16 * scale) / 100}px`;
@@ -288,6 +297,12 @@ export function App() {
         activity: nextAct,
       };
     });
+    setStreamStates((prev) => {
+      if (!gone.some((sid) => sid in prev)) return prev;
+      const next = { ...prev };
+      for (const sid of gone) delete next[sid];
+      return next;
+    });
     setPanes((p) => [gone.includes(p[0] ?? '') ? null : p[0], gone.includes(p[1] ?? '') ? null : p[1]]);
   }, []);
 
@@ -316,6 +331,11 @@ export function App() {
       case 'snapshot': {
         const ids = new Set(msg.state.sessions.map((s) => s.id));
         disposeExcept(ids);
+        setStreamStates((prev) => {
+          const next: Record<string, SessionStreamState> = {};
+          for (const [sid, st] of Object.entries(prev)) if (ids.has(sid)) next[sid] = st;
+          return next;
+        });
         setData(msg.state);
         setPanes((p) => {
           const next: PaneSessions = [p[0] && ids.has(p[0]) ? p[0] : null, p[1] && ids.has(p[1]) ? p[1] : null];
@@ -397,6 +417,9 @@ export function App() {
           return { ...d, activity: nextAct };
         });
         break;
+      case 'stream':
+        setStreamStates((prev) => ({ ...prev, [msg.state.sessionId]: msg.state }));
+        break;
       case 'replay':
         replay(msg.id, msg.d);
         break;
@@ -450,13 +473,19 @@ export function App() {
     setInspectReq({ projectId, tab, filePath, line, col, seq });
   }, [switchLayout]);
 
+  const isSessionInStream = useCallback((sid: string) => {
+    const s = live.current;
+    if (s.paneViewMode !== 'stream') return false;
+    const ses = s.data.sessions.find((x) => x.id === sid);
+    return !!ses && isDeepAgent(ses.agent);
+  }, []);
+
   const interruptSession = useCallback((sid: string) => {
-    // Focus first: refocusing the terminal reports focus-in (\x1b[I, ConPTY turns focus reporting on); sent right after a
-    // lone Esc it reads as Alt+Esc and the interrupt is lost.
-    focusOnly(sid);
+    // Focus first only in Terminal mode: in StreamView, focusing the hidden xterm steals keystrokes and injects \x1b[I.
+    if (!isSessionInStream(sid)) focusOnly(sid);
     send({ t: 'in', id: sid, d: '\x1b' });
     setNotice('已向终端发送 Esc 中断信号');
-  }, []);
+  }, [isSessionInStream]);
 
   const refreshQuota = useCallback(async () => {
     if (refreshingQuota) return;
@@ -472,10 +501,10 @@ export function App() {
   }, [refreshingQuota]);
 
   const sendCompactToSession = useCallback((sid: string) => {
-    focusOnly(sid);
+    if (!isSessionInStream(sid)) focusOnly(sid);
     send({ t: 'in', id: sid, d: '/compact\r' });
     setNotice('已向终端发送 /compact 压缩指令');
-  }, []);
+  }, [isSessionInStream]);
 
   const inspectActivityFile = useCallback(async (rawPath: string, fallbackProject?: Project) => {
     // A POSIX project (path starts with /) also treats a leading / as absolute and joins with /.
@@ -539,10 +568,18 @@ export function App() {
       const isJump = isJumpKey(e);
       const isNew = isNewTaskKey(e);
       const isInspect = isInspectKey(e);
-      if (paneKey === null && !isSearch && !isJump && !isNew && !isInspect) return;
+      const isMode = isModeKey(e);
+      if (paneKey === null && !isSearch && !isJump && !isNew && !isInspect && !isMode) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.type !== 'keydown' || e.repeat) return;
+      if (isMode) {
+        const s = live.current;
+        if (s.view === 'work' && !s.dialog) {
+          setPaneViewMode((m) => (m === 'stream' ? 'term' : 'stream'));
+        }
+        return;
+      }
       if (isInspect) {
         const s = live.current;
         if (!s.dialog) {
@@ -600,11 +637,15 @@ export function App() {
   }, [jump, quickCreate, switchLayout, openInspectorAt]);
 
   // Focus after Pane attaches its terminal, before the browser paints the new session.
+  // Skip terminal focus while the focused pane is in StreamView so hidden xterm never steals keystrokes from the composer.
   useLayoutEffect(() => {
     if (dialog) return;
-    focusOnly(view === 'work' ? panes[layout === 2 ? focusedPane : 0] : null);
+    const activeSid = view === 'work' ? panes[layout === 2 ? focusedPane : 0] : null;
+    const activeSession = activeSid ? live.current.data.sessions.find((s) => s.id === activeSid) : undefined;
+    const inStream = paneViewMode === 'stream' && !!activeSession && isDeepAgent(activeSession.agent);
+    focusOnly(inStream ? null : activeSid);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [panes, focusedPane, dialog, focusTick, view]);
+  }, [panes, focusedPane, dialog, focusTick, view, paneViewMode]);
 
   // Hidden terminals skip fitting; refit once the workbench is shown again (the zoom may have changed meanwhile).
   useEffect(() => {
@@ -1385,6 +1426,35 @@ export function App() {
               focused={layout === 2 && focusedPane === i}
               dual={layout === 2}
               now={now}
+              connected={connected}
+              viewMode={paneViewMode}
+              onViewModeChange={setPaneViewMode}
+              streamState={id ? streamStates[id] ?? null : null}
+              onSendMessage={async (text, attachments) => {
+                if (!task) return;
+                const size = sizeOf(id) ?? { cols: 120, rows: 36 };
+                const res = await post<FeedbackResult>(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, {
+                  text,
+                  mode: 'same',
+                  ...(attachments?.length ? { attachments } : {}),
+                  ...size,
+                });
+                setData((d) => ({
+                  ...d,
+                  tasks: upsert(d.tasks, res.task),
+                  sessions: upsert(d.sessions, res.session),
+                  cards: upsert(d.cards, res.card),
+                }));
+                if (res.session.id !== id) showSession(res.session.id, i);
+              }}
+              onAnswerPrompt={async (fingerprint, waitSeq, answerData) => {
+                if (!task) return;
+                await post(`/api/tasks/${encodeURIComponent(task.id)}/prompt-answer`, {
+                  fingerprint,
+                  waitSeq,
+                  data: answerData,
+                });
+              }}
               quota={paneAgent ? data.quota[paneAgent] : undefined}
               quotaMode={quotaMode}
               onOpenQuotaPopover={() => setQuotaPopoverOpen((v) => !v)}

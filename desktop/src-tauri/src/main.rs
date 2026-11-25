@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -212,6 +212,8 @@ fn kill_pid_tree(pid: u32) {
 }
 
 static CONNECTING: AtomicBool = AtomicBool::new(false);
+static CLOSING: AtomicBool = AtomicBool::new(false);
+static CLOSE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 // PID of the server this shell started (0: none, or it was already running).
@@ -286,6 +288,11 @@ fn server_ready(port: u16) -> bool {
     matches!(request(port, "GET", "/api/state"), Some((200, _)))
 }
 
+fn parse_live_sessions(state: &serde_json::Value) -> Option<usize> {
+    let sessions = state.get("sessions")?.as_array()?;
+    Some(sessions.iter().filter(|s| s.get("status").and_then(|v| v.as_str()) != Some("exited")).count())
+}
+
 // Agent sessions still running; None when the server is not reachable.
 fn live_sessions(port: u16) -> Option<usize> {
     let (status, body) = request(port, "GET", "/api/state")?;
@@ -293,8 +300,58 @@ fn live_sessions(port: u16) -> Option<usize> {
         return None;
     }
     let state: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let sessions = state.get("sessions")?.as_array()?;
-    Some(sessions.iter().filter(|s| s.get("status").and_then(|v| v.as_str()) != Some("exited")).count())
+    parse_live_sessions(&state)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    Tray,
+    Quit,
+}
+
+fn parse_close_action_value(v: &serde_json::Value) -> Option<CloseAction> {
+    match v.get("settings")?.get("closeAction")?.as_str()? {
+        "quit" => Some(CloseAction::Quit),
+        "tray" => Some(CloseAction::Tray),
+        _ => None,
+    }
+}
+
+fn parse_close_action(raw: &str) -> Option<CloseAction> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    parse_close_action_value(&v)
+}
+
+fn parse_state_for_close(raw: &str) -> (Option<CloseAction>, Option<usize>) {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => (parse_close_action_value(&v), parse_live_sessions(&v)),
+        Err(_) => (None, None),
+    }
+}
+
+// Reads the user's preferred window close action and live session count in a single `/api/state` round-trip,
+// falling back to `state.json` on disk for closeAction and defaulting to Tray when unset or unreadable.
+fn read_close_snapshot(port: u16) -> (CloseAction, Option<usize>) {
+    if let Some((200, body)) = request(port, "GET", "/api/state") {
+        let (action, live) = parse_state_for_close(&body);
+        if let Some(action) = action {
+            return (action, live);
+        }
+        return (CloseAction::Tray, live);
+    }
+    if let Ok(raw) = std::fs::read_to_string(state_dir().join("state.json")) {
+        if let Some(action) = parse_close_action(&raw) {
+            return (action, None);
+        }
+    }
+    (CloseAction::Tray, None)
+}
+
+struct ClosingGuard;
+impl Drop for ClosingGuard {
+    fn drop(&mut self) {
+        CLOSING.store(false, Ordering::SeqCst);
+    }
 }
 
 fn port_taken(port: u16) -> bool {
@@ -421,15 +478,20 @@ fn stop_server(port: u16, has_live_sessions: bool) {
     }
 }
 
-// Window close and the tray's 退出 both end here: confirm if agents are running, stop the server, exit.
+// Window close (when configured to quit) and the tray's 退出 both end here: confirm if agents are running, stop the server, exit.
 fn quit(app: &AppHandle) {
+    quit_with_live(app, None);
+}
+
+fn quit_with_live(app: &AppHandle, prefetched_live: Option<Option<usize>>) {
+    CLOSE_EPOCH.fetch_add(1, Ordering::SeqCst);
     if QUITTING.swap(true, Ordering::SeqCst) {
         return;
     }
     let app = app.clone();
     std::thread::spawn(move || {
         let port = port();
-        let live = live_sessions(port);
+        let live = prefetched_live.unwrap_or_else(|| live_sessions(port));
         if let Some(n) = live.filter(|&n| n > 0) {
             show(&app);
             let mut dialog = app
@@ -443,6 +505,7 @@ fn quit(app: &AppHandle) {
             }
             let ok = dialog.blocking_show();
             if !ok {
+                CLOSE_EPOCH.fetch_add(1, Ordering::SeqCst);
                 QUITTING.store(false, Ordering::SeqCst);
                 return;
             }
@@ -486,9 +549,10 @@ fn connect(w: WebviewWindow) {
         };
         match result {
             Ok(()) => {
-                WATCHDOG_ARMED.store(true, Ordering::SeqCst);
                 if let Err(e) = w.navigate(server_url()) {
                     call(&w, "setError", &format!("打开工作台失败：{e}"));
+                } else {
+                    WATCHDOG_ARMED.store(true, Ordering::SeqCst);
                 }
             }
             Err(e) => call(&w, "setError", &e),
@@ -549,6 +613,7 @@ fn spawn_watchdog(app: AppHandle) {
 }
 
 fn show(app: &AppHandle) {
+    CLOSE_EPOCH.fetch_add(1, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
@@ -632,6 +697,12 @@ fn create_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
             let _ = w.set_title(&title);
             let n = waiting_count(&title);
             let before = WAITING.swap(n, Ordering::SeqCst);
+            if n != before {
+                if let Some(tray) = w.app_handle().tray_by_id("main") {
+                    let tip = if n > 0 { format!("Shoal（{n} 个待处理）") } else { "Shoal".to_string() };
+                    let _ = tray.set_tooltip(Some(tip));
+                }
+            }
             if n > before && !w.is_focused().unwrap_or(true) {
                 let _ = w.request_user_attention(Some(UserAttentionType::Informational));
             }
@@ -706,19 +777,43 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-// Windows: closing the window quits (the tray icon keeps the workbench reachable only while it runs).
-#[cfg(not(target_os = "macos"))]
+// Respects the user's `settings.closeAction` preference (default: hide to system tray; optional: quit).
+// If the app is still on the startup/error splash screen and never connected to a server, closing exits directly
+// so a failed startup screen cannot get trapped hidden in the tray.
 fn on_close_requested(app: &AppHandle) {
-    quit(app);
-}
-
-// macOS: closing the window only hides it, as Mac apps do; the Dock icon brings it back (RunEvent::Reopen) and
-// Cmd+Q, the menu bar icon's 退出 or the Dock's Quit end the app.
-#[cfg(target_os = "macos")]
-fn on_close_requested(app: &AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.hide();
+    if QUITTING.load(Ordering::SeqCst) {
+        return;
     }
+    if !WATCHDOG_ARMED.load(Ordering::SeqCst) {
+        quit(app);
+        return;
+    }
+    if CLOSING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let epoch = CLOSE_EPOCH.load(Ordering::SeqCst);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _guard = ClosingGuard;
+        let (action, live) = read_close_snapshot(port());
+        if QUITTING.load(Ordering::SeqCst) || CLOSE_EPOCH.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+        match action {
+            CloseAction::Tray => {
+                let app_main = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if QUITTING.load(Ordering::SeqCst) || CLOSE_EPOCH.load(Ordering::SeqCst) != epoch {
+                        return;
+                    }
+                    if let Some(w) = app_main.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                });
+            }
+            CloseAction::Quit => quit_with_live(&app, Some(live)),
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -821,4 +916,38 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while running Shoal")
         .run(on_run_event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_close_action_from_settings_json() {
+        assert_eq!(parse_close_action(r#"{"settings":{"closeAction":"tray"}}"#), Some(CloseAction::Tray));
+        assert_eq!(parse_close_action(r#"{"settings":{"closeAction":"quit"}}"#), Some(CloseAction::Quit));
+        assert_eq!(parse_close_action(r#"{"settings":{"closeAction":"invalid"}}"#), None);
+        assert_eq!(parse_close_action(r#"{"settings":{"aiTitles":false}}"#), None);
+        assert_eq!(parse_close_action(r#"not json"#), None);
+    }
+
+    #[test]
+    fn parses_state_for_close_in_single_pass() {
+        assert_eq!(
+            parse_state_for_close(r#"{"settings":{"closeAction":"quit"},"sessions":[{"status":"working"},{"status":"exited"}]}"#),
+            (Some(CloseAction::Quit), Some(1))
+        );
+        assert_eq!(
+            parse_state_for_close(r#"{"settings":{},"sessions":[{"status":"exited"}]}"#),
+            (None, Some(0))
+        );
+        assert_eq!(parse_state_for_close("broken"), (None, None));
+    }
+
+    #[test]
+    fn parses_waiting_count_from_title() {
+        assert_eq!(waiting_count("(3) Shoal"), 3);
+        assert_eq!(waiting_count("Shoal"), 0);
+        assert_eq!(waiting_count("(abc) Shoal"), 0);
+    }
 }

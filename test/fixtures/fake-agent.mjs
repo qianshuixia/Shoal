@@ -191,6 +191,173 @@ function submit() {
     out("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. Yes, and don't ask again\r\n  3. No, keep asking");
     mode = 'menu';
     askText = echo;
+  } else if (cmd === 'stream') {
+    // Simulates an agy-style multi-stage streaming turn: live thinking + todolist -> tool step -> live PTY answer -> lossless Markdown.
+    const fileArg = [arg, ...rest].filter(Boolean).join(' ').trim();
+    const t0 = Date.now();
+    out('\r\n⣷  1/3 steps · 正在核查系统环境与终端渲染链路...\r\n  ⎿  ✓ 初始化检查任务\r\n     ● 核查系统环境与终端渲染\r\n     ○ 输出结构化验证结论');
+    workTimer = setTimeout(() => {
+      fs.appendFileSync(transcript, JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(t0 + 1200).toISOString(),
+        model: 'gemini-4-carbon-medium',
+        thinking: 'Checking environment details and inspecting target file before summarizing.',
+        content: '好，我就跑一下，先确认一下当前环境和关键文件。',
+        tool_calls: [
+          {
+            name: 'default_api:update_steps',
+            args: {
+              steps: JSON.stringify([
+                { title: '初始化检查任务', status: 'done' },
+                { title: '核查系统环境与终端渲染', status: 'in_progress' },
+                { title: '输出结构化验证结论', status: 'pending' },
+              ]),
+            },
+          },
+          {
+            name: 'default_api:run_command',
+            args: { CommandLine: '"uname -a"', toolSummary: '"确认执行环境与架构"' },
+          },
+          ...(fileArg ? [{ name: 'default_api:read_file', args: { Path: JSON.stringify(fileArg) } }] : []),
+        ],
+      }) + '\n');
+      out('\r\n▸ Thought for 1s');
+      workTimer = setTimeout(() => {
+        fs.appendFileSync(transcript, JSON.stringify({
+          step_index: 2,
+          type: 'GENERIC',
+          status: 'DONE',
+          created_at: new Date(t0 + 2000).toISOString(),
+        }) + '\n');
+        out('\r\n  1. 检测到当前运行在原生交互式 PTY 模式\r\n⠼ Working...\r\n  Tip: Use /settings to configure your environment.');
+        workTimer = setTimeout(() => {
+          out('\r\n  2. 双源融合渲染器正在实时逐字承接流式输出\r\n⠴ Working...\r\n  Use /settings to configure your environment.');
+          workTimer = setTimeout(() => {
+            const finalMd = [
+              '### 验证结论',
+              '',
+              '1. 底层仍运行官方原生交互式 CLI，保持零额度差异与完整兼容。',
+              '2. 落盘后自动切换为无损高亮 Markdown：',
+              '',
+              '```ts',
+              'export const mode = "native-pty-dual-source";',
+              'console.log("smooth streaming ready:", mode);',
+              '```',
+            ].join('\n');
+            fs.appendFileSync(transcript, JSON.stringify({
+              step_index: 3,
+              type: 'PLANNER_RESPONSE',
+              status: 'DONE',
+              created_at: new Date(t0 + 3200).toISOString(),
+              model: 'gemini-4-carbon-medium',
+              thinking: 'All checks passed, emit final structured report.',
+              content: finalMd,
+              tool_calls: [
+                {
+                  name: 'default_api:update_steps',
+                  args: {
+                    steps: JSON.stringify([
+                      { title: '初始化检查任务', status: 'done' },
+                      { title: '核查系统环境与终端渲染', status: 'done' },
+                      { title: '输出结构化验证结论', status: 'done' },
+                    ]),
+                  },
+                },
+              ],
+            }) + '\n');
+            mode = 'idle';
+            out('\r\n  完成。');
+            hook('Stop', { last_assistant_message: finalMd });
+            out('\r\n> ');
+          }, 420);
+        }, 280);
+      }, 320);
+    }, 260);
+  } else if (cmd === 'rich') {
+    const t0 = Date.now();
+    const richMd = [
+      '## 交付总结与性能可视化报告',
+      '',
+      '已完成 `StreamMarkdown` 渲染引擎重构，采用 `Inter Variable` + `Noto Sans SC` 字体栈，并集成 `remend`、`shiki`、`beautiful-mermaid`、`echarts` 与 `katex`。',
+      '',
+      '> [!TIP]',
+      '> 所有重型可视化引擎均通过动态 `import()` 按需加载，普通文本会话零首屏开销；点击图表右上角可随时切换源码、放大缩放或导出高清 PNG。',
+      '',
+      '### 1. 端到端验证结果（无竖排挤压）',
+      '',
+      '| 检查项 | 结果 | 关键实测指标 |',
+      '| --- | --- | --- |',
+      '| TypeScript 类型检查 | 通过 | 全量 `tsc -p tsconfig.json` 零错误，覆盖服务端与前端 |',
+      '| 日志完整读取回归 | 通过 | 优先读取 `transcript_full.jsonl`，彻底消除长表格 `<truncated>` 截断 |',
+      '| 390px 移动端视口 | 警告 | 宽表格启用水平滚动保护，主内容无横向溢出 |',
+      '| 非法 JSON 图表兜底 | 失败 | 刻意构造的异常 JSON 已安全降级为代码卡片而非白屏 |',
+      '',
+      '### 2. 流式渲染管线架构',
+      '',
+      '```mermaid',
+      'flowchart LR',
+      '  A[原生 CLI PTY + Full Transcript] --> B[remend 断句自愈]',
+      '  B --> C[Marked AST 解析]',
+      '  C --> D[Shiki 代码高亮]',
+      '  C --> E[Mermaid / ECharts 图表]',
+      '  C --> F[智能表格与 Callout]',
+      '```',
+      '',
+      '### 3. 各模块首屏与渲染耗时对比',
+      '',
+      '```echarts',
+      '{',
+      '  "title": { "text": "渲染耗时对比 (ms)" },',
+      '  "legend": { "bottom": 0 },',
+      '  "xAxis": { "type": "category", "data": ["普通段落", "大表格", "代码高亮", "Mermaid 图", "ECharts 图"] },',
+      '  "yAxis": { "type": "value", "name": "ms" },',
+      '  "series": [',
+      '    { "name": "优化前", "type": "bar", "data": [18, 42, 65, 190, 240] },',
+      '    { "name": "优化后", "type": "bar", "data": [9, 16, 22, 54, 78] }',
+      '  ]',
+      '}',
+      '```',
+      '',
+      '### 4. 核心代码与平滑速率公式',
+      '',
+      '```ts',
+      'export interface RenderBudget {',
+      '  readonly targetFps: number;',
+      '  readonly lazyModules: ("shiki" | "mermaid" | "echarts" | "katex")[];',
+      '}',
+      'export const budget: RenderBudget = { targetFps: 60, lazyModules: ["shiki", "mermaid", "echarts", "katex"] };',
+      '```',
+      '',
+      '流式帧平滑吞吐公式（支持行内 $\\alpha = 0.25$ 与块级公式）：',
+      '',
+      '$$',
+      'v(t) = \\max\\left(2,\\; \\lceil \\alpha \\cdot (L_{\\text{target}} - L_{\\text{shown}}(t)) \\rceil\\right)',
+      '$$',
+      '',
+      '> [!WARNING]',
+      '> 下方为刻意构造的非法图表 JSON，用于验证优雅降级：',
+      '',
+      '```echarts',
+      '{ invalid json',
+      '```',
+    ].join('\n');
+    workTimer = setTimeout(() => {
+      fs.appendFileSync(transcript, JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(t0 + 200).toISOString(),
+        model: 'gemini-4-carbon-medium',
+        content: richMd,
+        tool_calls: [],
+      }) + '\n');
+      mode = 'idle';
+      out('\r\n  完成。');
+      hook('Stop', { last_assistant_message: richMd });
+      out('\r\n> ');
+    }, 180);
   } else if (cmd === 'shoal') {
     const cliArgs = splitShellArgs(text.trim().slice(5).trim());
     const p = process.platform === 'win32'

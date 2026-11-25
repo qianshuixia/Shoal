@@ -48,7 +48,9 @@ function createStore(onChange: (s: Store) => void, init?: Partial<StateFile>): S
   const cards = new Map<string, Card>((init?.cards ?? []).map(c => [c.id, c]));
   let settings: Settings = { ...DEFAULT_SETTINGS };
   if (typeof init?.settings?.aiTitles === 'boolean') settings.aiTitles = init.settings.aiTitles;
+  if (init?.settings?.closeAction === 'tray' || init?.settings?.closeAction === 'quit') settings.closeAction = init.settings.closeAction;
   if (typeof init?.settings?.autoDelegate === 'boolean') settings.autoDelegate = init.settings.autoDelegate;
+  if (typeof init?.settings?.richOutputHints === 'boolean') settings.richOutputHints = init.settings.richOutputHints;
   if (typeof init?.settings?.delegationRules === 'string') settings.delegationRules = init.settings.delegationRules;
   if (isValidAgyModel(init?.settings?.agyModel) && init.settings.agyModel) settings.agyModel = init.settings.agyModel;
   const restoredPrefs = sanitizeCliPrefs(init?.settings?.cliPrefs);

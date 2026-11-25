@@ -1,9 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { agyConversationState, agyResumeId, agyTranscriptFile, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, codexHasUserDeveloperInstructions, codexLaunch, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
+import { agyConversationState, agyResumeId, agyTranscriptFile, agyUsable, agyUserStatusLine, buildGenerator, buildLaunch, claudeResumeId, codexHasUserDeveloperInstructions, codexLaunch, formatHookCommand, formatStatusLineCommand, FULL_ACCESS, NODE, NOTIFY, shortPath, userStatusLine, writeHookFiles } from './agents.ts';
+import { prependEnvPath } from './sessions.ts';
 import { pickColor } from './store.ts';
 import { TASK_COLORS } from '../shared/protocol.ts';
 
@@ -128,7 +131,7 @@ describe('buildLaunch', () => {
 });
 
 describe('agy hook and settings files', () => {
-  it('commands contain no quotes and agy-settings.json stacks under the default status line', async () => {
+  it('commands use PATH-resolved wrappers with no paths or quotes, and agy-settings.json stacks under the default status line', async () => {
     const { writeHookFiles } = await import('./agents.ts');
     const prev = process.env.AGY_CONFIG_DIR;
     process.env.AGY_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-agy-cfg-'));
@@ -137,21 +140,134 @@ describe('agy hook and settings files', () => {
     } finally {
       if (prev === undefined) delete process.env.AGY_CONFIG_DIR; else process.env.AGY_CONFIG_DIR = prev;
     }
+    expect(agyUsable()).toBe(true);
     const file = path.join(stateDir, 'agy-hooks', '.agents', 'hooks.json');
-    if (!fs.existsSync(file)) return; // repo path contains a space: agy disabled
+    expect(fs.existsSync(file)).toBe(true);
     const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
     const cmds = Object.values(cfg.workbench).flatMap(v => (v as { command: string }[]).map(h => h.command));
-    expect(cmds).toHaveLength(4);
+    expect(cmds).toEqual([
+      'shoal-hook agy SessionStart',
+      'shoal-hook agy PreInvocation',
+      'shoal-hook agy PostInvocation',
+      'shoal-hook agy Stop',
+    ]);
     for (const c of cmds) expect(c).not.toMatch(/["']/);
     const settings = JSON.parse(fs.readFileSync(path.join(stateDir, 'agy-settings.json'), 'utf8'));
     expect(settings.statusLine).toEqual({
       type: 'command',
-      command: expect.stringMatching(/statusline\.mjs agy$/),
+      command: 'shoal-statusline agy',
       enabled: true,
       stack_with_default: true,
       padding: 0,
     });
     expect(settings.statusLine.command).not.toMatch(/["']/);
+  });
+
+  it('formatHookCommand and formatStatusLineCommand fall back to PATH wrappers when NODE or script path has spaces or shell/TOML metacharacters', () => {
+    expect(formatHookCommand('codex', 'Stop', 'node', 'G:/repo/hooks/notify.mjs')).toBe('node "G:/repo/hooks/notify.mjs" codex Stop');
+    expect(formatHookCommand('codex', 'Stop', 'D:/Program Files/Shoal/app/node.exe', 'D:/Program Files/Shoal/app/hooks/notify.mjs')).toBe('shoal-hook codex Stop');
+    expect(formatHookCommand('codex', 'Stop', "C:/Users/O'Brien/Shoal/node.exe", 'G:/repo/hooks/notify.mjs')).toBe('shoal-hook codex Stop');
+    expect(formatHookCommand('codex', 'Stop', 'D:/Apps(1)/Shoal/node.exe', 'G:/repo/hooks/notify.mjs')).toBe('shoal-hook codex Stop');
+    expect(formatHookCommand('codex', 'Stop', 'node', "C:/Users/O'Brien/hooks/notify.mjs")).toBe('shoal-hook codex Stop');
+    expect(formatHookCommand('codex', 'Stop', 'node', 'C:/Users/a$b/hooks/notify.mjs')).toBe('shoal-hook codex Stop');
+    expect(formatStatusLineCommand('claude', 'node', 'G:/repo/hooks/statusline.mjs')).toBe('node "G:/repo/hooks/statusline.mjs" claude');
+    expect(formatStatusLineCommand('claude', 'D:/Program Files/Shoal/app/node.exe', 'D:/Program Files/Shoal/app/hooks/statusline.mjs')).toBe('shoal-statusline claude');
+    expect(formatStatusLineCommand('claude', 'node', 'C:/Users/a%20b/hooks/statusline.mjs')).toBe('shoal-statusline claude');
+  });
+
+  it.runIf(process.platform === 'win32')('shoal-hook.cmd and shoal-statusline.cmd relay stdin JSON over HTTP through cmd /c and PowerShell under spaced paths', async () => {
+    const spaced = fs.mkdtempSync(path.join(os.tmpdir(), 'wb spaced state '));
+    const spacedNodeDir = path.join(spaced, 'Program Files (x86)', 'Shoal');
+    fs.mkdirSync(spacedNodeDir, { recursive: true });
+    const spacedNode = path.join(spacedNodeDir, 'node.exe');
+    fs.copyFileSync(process.execPath, spacedNode);
+    const stDir = path.join(spaced, 'state dir');
+    writeHookFiles(stDir);
+    const binDir = path.join(stDir, 'bin');
+
+    const received: Array<{ sessionId: string; agent: string; event: string; payload: unknown }> = [];
+    const srv = http.createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        if (req.url === '/hook' && req.headers.authorization === 'Bearer test-tok') {
+          received.push(JSON.parse(body));
+          res.writeHead(200).end('ok');
+        } else {
+          res.writeHead(403).end('denied');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+    const port = (srv.address() as AddressInfo).port;
+
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    );
+    prependEnvPath(env, binDir);
+    env.WORKBENCH_NODE = spacedNode;
+    env.WORKBENCH_SESSION_ID = 'sid-spaced-test';
+    env.WORKBENCH_PORT = String(port);
+    env.WORKBENCH_HOOK_TOKEN = 'test-tok';
+    env.WORKBENCH_USER_STATUSLINE = 'echo user-sl-ok';
+
+    const runCmd = (file: string, args: string[], stdinText: string) =>
+      new Promise<string>((resolve, reject) => {
+        const child = spawn(file, args, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+        let out = '';
+        let err = '';
+        child.stdout.setEncoding('utf8').on('data', (c) => { out += c; });
+        child.stderr.setEncoding('utf8').on('data', (c) => { err += c; });
+        child.on('error', reject);
+        child.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`${file} exited ${code}: ${err}`))));
+        child.stdin.end(stdinText);
+      });
+
+    try {
+      const cmdOut = await runCmd('cmd.exe', ['/d', '/c', 'shoal-hook agy SessionStart'], JSON.stringify({ conversationId: 'conv-cmd' }));
+      expect(cmdOut).toBe('{}');
+
+      await runCmd('powershell.exe', ['-NoProfile', '-Command', 'shoal-hook codex Stop'], JSON.stringify({ turn: 2 }));
+
+      const slOut = await runCmd(
+        'cmd.exe',
+        ['/d', '/c', 'shoal-statusline agy'],
+        JSON.stringify({ quota: { flash: { remaining_fraction: 0.75, reset_time: '2026-11-26T00:00:00Z' } } }),
+      );
+      expect(slOut.trim()).toBe('user-sl-ok');
+
+      expect(received).toHaveLength(3);
+      expect(received[0]).toMatchObject({ sessionId: 'sid-spaced-test', agent: 'agy', event: 'SessionStart', payload: { conversationId: 'conv-cmd' } });
+      expect(received[1]).toMatchObject({ sessionId: 'sid-spaced-test', agent: 'codex', event: 'Stop', payload: { turn: 2 } });
+      expect(received[2]).toMatchObject({
+        sessionId: 'sid-spaced-test',
+        agent: 'agy',
+        event: 'RateLimits',
+        payload: { quota: { flash: { remaining_fraction: 0.75, reset_time: '2026-11-26T00:00:00Z' } } },
+      });
+    } finally {
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+      fs.rmSync(spaced, { recursive: true, force: true });
+      fs.rmSync(path.join(os.tmpdir(), 'shoal-statusline-sid-spaced-test.json'), { force: true });
+    }
+  });
+
+  it('writeHookFiles writes bundled fallback node path in shims when WORKBENCH_BUNDLED=1 and includes cygpath guard', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-bundled-shim-'));
+    const prev = process.env.WORKBENCH_BUNDLED;
+    process.env.WORKBENCH_BUNDLED = '1';
+    try {
+      writeHookFiles(dir);
+      const cmdShim = fs.readFileSync(path.join(dir, 'bin', 'shoal-hook.cmd'), 'utf8');
+      expect(cmdShim).toContain(`"${process.execPath.replaceAll('%', '%%')}" "%~dp0notify.mjs" %*`);
+      const shShim = fs.readFileSync(path.join(dir, 'bin', 'shoal-hook'), 'utf8');
+      expect(shShim).toContain('cygpath -w');
+      expect(shShim).toContain(`'${process.execPath.replaceAll("'", "'\\''")}' "$DIR/notify.mjs" "$@"`);
+    } finally {
+      if (prev === undefined) delete process.env.WORKBENCH_BUNDLED; else process.env.WORKBENCH_BUNDLED = prev;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it.runIf(process.platform === 'win32')('shortPath keeps lowercase .mjs so Node ESM loader accepts paths under spaced dirs', () => {
@@ -233,6 +349,51 @@ describe('buildGenerator', () => {
     const g = gen('fake')!;
     expect(g.args[0]).toMatch(/fake-handoff\.mjs$/);
     expect(g.stdin).toBe('PROMPT');
+  });
+
+  it.runIf(process.platform === 'win32')('unwraps custom-prefix codex.cmd / claude.cmd and returns null for non-unwrappable batch scripts', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-gen-win-'));
+    const emptyAppData = path.join(root, 'empty-appdata');
+    const customDir = path.join(root, 'Program Files', 'nodejs');
+    const codexJs = path.join(customDir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    const claudeExe = path.join(customDir, 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe');
+    fs.mkdirSync(emptyAppData, { recursive: true });
+    fs.mkdirSync(path.dirname(codexJs), { recursive: true });
+    fs.mkdirSync(path.dirname(claudeExe), { recursive: true });
+    fs.writeFileSync(codexJs, '');
+    fs.writeFileSync(claudeExe, 'MZ');
+    fs.writeFileSync(path.join(customDir, 'codex.cmd'), '@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n');
+    fs.writeFileSync(path.join(customDir, 'claude.cmd'), '@ECHO off\r\n"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n');
+
+    const prevAppData = process.env.APPDATA;
+    const prevPathKeys = Object.keys(process.env).filter((k) => k.toLowerCase() === 'path');
+    const savedPaths = prevPathKeys.map((k) => [k, process.env[k]] as const);
+    try {
+      process.env.APPDATA = emptyAppData;
+      for (const k of prevPathKeys) delete process.env[k];
+      process.env.Path = customDir;
+
+      const gx = buildGenerator('codex', 'P', 'OUT.md')!;
+      expect(gx.file).toBe(process.execPath);
+      expect(gx.args[0]).toBe(codexJs);
+
+      const gc = buildGenerator('claude', 'P', 'OUT.md')!;
+      expect(gc.file).toBe(claudeExe);
+      expect(gc.args[0]).toBe('-p');
+
+      // Non-unwrappable batch script with fixed args returns null instead of spawning raw .cmd.
+      fs.writeFileSync(path.join(customDir, 'codex.cmd'), '@echo off\r\ncall custom-wrapper --flag %*\r\n');
+      fs.writeFileSync(path.join(customDir, 'claude.cmd'), '@echo off\r\ncall custom-wrapper --flag %*\r\n');
+      expect(buildGenerator('codex', 'P', 'OUT.md')).toBeNull();
+      expect(buildGenerator('claude', 'P', 'OUT.md')).toBeNull();
+    } finally {
+      if (prevAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = prevAppData;
+      delete process.env.Path;
+      for (const [k, v] of savedPaths) {
+        if (v !== undefined) process.env[k] = v;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -415,19 +576,22 @@ describe('claude status line', () => {
 });
 
 describe('shoal collab hooks and agy collabDir', () => {
-  it('writeHookFiles writes shoal-cli.mjs, shoal.cmd, LF-only shoal, collab/, and removes the agy skill older versions synced', () => {
+  it('writeHookFiles writes shoal-cli/notify/statusline scripts and shims, collab/, and removes the agy skill older versions synced', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-shoal-'));
     const dir = path.join(root, 'state');
     const staleSkill = path.join(dir, 'agy-hooks', '.agents', 'skills', 'shoal-collab', 'SKILL.md');
     fs.mkdirSync(path.dirname(staleSkill), { recursive: true });
     fs.writeFileSync(staleSkill, 'old');
     writeHookFiles(dir);
-    expect(fs.existsSync(path.join(dir, 'bin', 'shoal-cli.mjs'))).toBe(true);
-    expect(fs.existsSync(path.join(dir, 'bin', 'shoal.cmd'))).toBe(true);
+    for (const f of ['shoal-cli.mjs', 'notify.mjs', 'statusline.mjs', 'shoal.cmd', 'shoal-hook.cmd', 'shoal-statusline.cmd']) {
+      expect(fs.existsSync(path.join(dir, 'bin', f))).toBe(true);
+    }
     expect(fs.existsSync(path.join(dir, 'collab'))).toBe(true);
-    const shoalSh = fs.readFileSync(path.join(dir, 'bin', 'shoal'), 'utf8');
-    expect(shoalSh).not.toContain('\r\n');
-    expect(shoalSh).toContain('shoal-cli.mjs');
+    for (const [shim, target] of [['shoal', 'shoal-cli.mjs'], ['shoal-hook', 'notify.mjs'], ['shoal-statusline', 'statusline.mjs']]) {
+      const sh = fs.readFileSync(path.join(dir, 'bin', shim), 'utf8');
+      expect(sh).not.toContain('\r\n');
+      expect(sh).toContain(target);
+    }
     expect(fs.existsSync(staleSkill)).toBe(false);
   });
 

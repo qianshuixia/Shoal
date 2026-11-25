@@ -10,6 +10,7 @@ import type {
   MobileTunnelMode,
   PermissionMode,
   Settings,
+  WindowCloseAction,
 } from '../../shared/protocol.ts';
 import { AGY_MODELS, DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, isValidCustomCliId, parseCliArgs } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
@@ -31,6 +32,8 @@ async function delJson<T>(url: string): Promise<T> {
 }
 
 const AUTO_DELEGATE_TIP = '启动 Claude Code、Codex 和 Antigravity 会话时告诉它们可以用 shoal delegate 把任务派给其他 CLI。关闭后 shoal 命令仍然可用，但 agent 只在你明确要求时才会用。只对之后新启动的会话生效。';
+
+const RICH_OUTPUT_HINTS_TIP = '启动新会话时附带 4 行轻量排版提示，告诉 CLI 对话视图支持 Mermaid 流程图、ECharts 数据图表、GitHub 提示卡片与数学公式，让模型在适合对比、趋势或架构说明时主动出图。关闭后不影响前端渲染，仅不再主动引导。只对之后新启动的会话生效。';
 
 const AI_TITLES_TIP = [
   '开启后，任务的第一句需求发出时，工作台先用这句话的第一行当标题，同时在后台让支持 headless 的 CLI 做一次短调用，写一个更短、更概括的标题，通常十几秒内换上。',
@@ -1378,6 +1381,22 @@ export function SettingsView({
     notifyTone: 'off',
   });
 
+  const serverCloseAction: WindowCloseAction = settings.closeAction === 'quit' ? 'quit' : 'tray';
+  const [closeAction, setCloseAction] = useState<WindowCloseAction>(serverCloseAction);
+  const closeActionSeq = useRef(0);
+  useEffect(() => setCloseAction(serverCloseAction), [serverCloseAction]);
+  const setCloseActionNow = (value: WindowCloseAction) => {
+    if (value === closeAction) return;
+    const seq = ++closeActionSeq.current;
+    setCloseAction(value);
+    setError('');
+    post<Settings>('/api/settings', { closeAction: value }).catch((e) => {
+      if (closeActionSeq.current !== seq) return;
+      setError((e as Error).message);
+      setCloseAction(serverCloseAction);
+    });
+  };
+
   // Optimistic: a controlled checkbox that waits for the server's value snaps back on the click, so this one flips at once
   // and is re-synced from the settings that arrive over the WebSocket.
   const serverAutoDelegate = settings.autoDelegate !== false;
@@ -1389,6 +1408,18 @@ export function SettingsView({
     post<Settings>('/api/settings', { autoDelegate: value }).catch((e) => {
       setError((e as Error).message);
       setAutoDelegate(serverAutoDelegate);
+    });
+  };
+
+  const serverRichOutputHints = settings.richOutputHints !== false;
+  const [richOutputHints, setRichOutputHints] = useState(serverRichOutputHints);
+  useEffect(() => setRichOutputHints(serverRichOutputHints), [serverRichOutputHints]);
+  const setRichOutputHintsNow = (value: boolean) => {
+    setRichOutputHints(value);
+    setError('');
+    post<Settings>('/api/settings', { richOutputHints: value }).catch((e) => {
+      setError((e as Error).message);
+      setRichOutputHints(serverRichOutputHints);
     });
   };
 
@@ -1492,11 +1523,34 @@ export function SettingsView({
             <div className="settings-group-head">
               <div>
                 <h3>常规与协作</h3>
-                <p className="settings-group-desc">任务标题自动概括、多 CLI 委派开关及注入给会话的分工与评审规则</p>
+                <p className="settings-group-desc">窗口关闭行为、任务标题自动概括、多 CLI 委派开关及注入给会话的分工与评审规则</p>
               </div>
             </div>
 
             <div className="settings-card">
+              <div className="settings-item">
+                <div className="settings-item-info">
+                  <div className="settings-item-title">关闭主窗口时</div>
+                  <span className="settings-item-desc">点击桌面窗口关闭按钮时的动作；缩小到托盘后可从系统托盘（macOS 也可从菜单栏或 Dock）点击恢复，或右键选择退出</span>
+                </div>
+                <div className="cli-perm-seg" role="group" aria-label="关闭主窗口时" data-testid="setting-close-action">
+                  <button
+                    type="button"
+                    className={`cli-perm-btn ${closeAction === 'tray' ? 'on is-full' : ''}`}
+                    aria-pressed={closeAction === 'tray'}
+                    data-testid="setting-close-action-tray"
+                    onClick={() => setCloseActionNow('tray')}
+                  >缩小到托盘</button>
+                  <button
+                    type="button"
+                    className={`cli-perm-btn ${closeAction === 'quit' ? 'on is-normal' : ''}`}
+                    aria-pressed={closeAction === 'quit'}
+                    data-testid="setting-close-action-quit"
+                    onClick={() => setCloseActionNow('quit')}
+                  >直接退出</button>
+                </div>
+              </div>
+
               <div className="settings-item">
                 <div className="settings-item-info">
                   <div className="settings-item-title setting-row">
@@ -1536,6 +1590,27 @@ export function SettingsView({
                   data-testid="setting-auto-delegate"
                   checked={autoDelegate}
                   onChange={(e) => setAutoDelegateNow(e.target.checked)}
+                />
+              </div>
+
+              <div className="settings-item">
+                <div className="settings-item-info">
+                  <div className="settings-item-title setting-row">
+                    <label htmlFor="setting-rich-output-hints-input" className="settings-item-label">引导 AI 输出图表与提示卡片</label>
+                    <span className="help">
+                      <button type="button" className="help-btn" data-testid="setting-rich-output-hints-help" aria-label="说明" aria-describedby="tip-rich-output-hints">?</button>
+                      <span role="tooltip" id="tip-rich-output-hints" className="help-tip" data-testid="setting-rich-output-hints-tip">{RICH_OUTPUT_HINTS_TIP}</span>
+                    </span>
+                  </div>
+                  <span className="settings-item-desc">启动新会话时告知支持 Mermaid 流程图、ECharts 数据图、GitHub 提示卡片与数学公式</span>
+                </div>
+                <input
+                  id="setting-rich-output-hints-input"
+                  type="checkbox"
+                  className="switch-input"
+                  data-testid="setting-rich-output-hints"
+                  checked={richOutputHints}
+                  onChange={(e) => setRichOutputHintsNow(e.target.checked)}
                 />
               </div>
             </div>

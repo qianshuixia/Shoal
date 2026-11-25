@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { CSSProperties, DragEvent, RefObject } from 'react';
-import type { ActivityPhase, Card, CliToolInfo, Project, QuotaInfo, SessionActivity, SessionContext, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
-import { agentLabel, DELEGATION_LABEL, DELEGATION_MODE_LABEL, canResume, delegationState } from '../../shared/protocol.ts';
+import type { ActivityPhase, Card, CliToolInfo, PaneViewMode, Project, QuotaInfo, SessionActivity, SessionContext, SessionInfo, SessionStreamState, Task, TaskMetrics } from '../../shared/protocol.ts';
+import { agentLabel, DELEGATION_LABEL, DELEGATION_MODE_LABEL, canResume, delegationState, isDeepAgent } from '../../shared/protocol.ts';
 import { attach, detach, fitEntry, focusOnly, isReplayEmpty, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty } from './terms.ts';
+import { send } from './ws.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { ContextMiniBar } from './QuotaPanel.tsx';
 import { AgentIcon } from './agentIcons.tsx';
@@ -10,6 +11,7 @@ import { usePrivacy } from './privacy.ts';
 import { liveWindows, type QuotaDisplayMode } from './quota.ts';
 import { fmtClock } from './util.ts';
 import { DelegationHud, hudVisibleBox, type DelegateView } from './DelegationHud.tsx';
+import { StreamView } from './StreamView.tsx';
 
 interface Props {
   index: number;
@@ -20,6 +22,12 @@ interface Props {
   focused: boolean;
   dual: boolean;
   now: number;
+  connected?: boolean;
+  viewMode?: PaneViewMode;
+  onViewModeChange?(mode: PaneViewMode): void;
+  streamState?: SessionStreamState | null;
+  onSendMessage?(text: string, attachments?: string[]): Promise<void>;
+  onAnswerPrompt?(fingerprint: string, waitSeq: number, data: string): Promise<void>;
   quota?: QuotaInfo;
   quotaMode?: QuotaDisplayMode;
   onOpenQuotaPopover?(): void;
@@ -462,7 +470,7 @@ function FolderIcon() {
   );
 }
 
-export function Pane({ index, sessionId, session, task, project, focused, dual, now, quota, quotaMode = 'remaining', onOpenQuotaPopover, context, onOpenOverview, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath, cliTools }: Props) {
+export function Pane({ index, sessionId, session, task, project, focused, dual, now, connected = true, viewMode = 'term', onViewModeChange, streamState, onSendMessage, onAnswerPrompt, quota, quotaMode = 'remaining', onOpenQuotaPopover, context, onOpenOverview, metrics, activity, onInterrupt, onInspectFile, onFocus, onRename, onResume, card, onApprove, onFeedback, onSwitch, onForward, handoff, onDropSession, delegates, onOpenDelegate, parentTask, onOpenParent, onOpenPath, cliTools }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const mountedSessionRef = useRef<string | null>(null);
   const repaintFrameRef = useRef(0);
@@ -475,6 +483,8 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
   const reviewing = task?.phase === 'review' && !!card && !task.delegation;
   const reviewOpen = reviewing && openCard === card.id;
   const paneAgent = task?.agent ?? session?.agent;
+  const canStream = !!sessionId && !!paneAgent && isDeepAgent(paneAgent);
+  const effectiveMode: PaneViewMode = canStream && viewMode === 'stream' ? 'stream' : 'term';
   const paneWindows = paneAgent ? liveWindows(quota, now) : [];
 
   // Show this session's terminal in the pane and keep it fitted to the pane size.
@@ -520,20 +530,33 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
   }, [sessionId, exited]);
   const noReplay = useSyncExternalStore(subscribeReplayEmpty, () => !!sessionId && isReplayEmpty(sessionId));
 
-  // Repaint the WebGL2 canvas when floating notices/popovers vanish or shift vertically so WebView2 clears vacated pixels.
+  // Watch dual-source stream updates on demand only while this pane is displaying the rich Dialog view.
+  useEffect(() => {
+    if (effectiveMode !== 'stream' || !sessionId || !connected) return;
+    send({ t: 'watch-stream', id: sessionId });
+    return () => {
+      send({ t: 'unwatch-stream', id: sessionId });
+    };
+  }, [effectiveMode, sessionId, connected]);
+
+  // Repaint the WebGL2 canvas when floating notices/popovers vanish, shift vertically, or when leaving StreamView.
   const hasActivity = session?.status === 'working' && activity?.sessionId === sessionId;
   const hasDelegation = !!delegates?.length && !!onOpenDelegate;
   const queued = !!session?.queued;
-  const prevFloatingRef = useRef({ sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation });
+  const prevFloatingRef = useRef({ sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation, effectiveMode });
   useLayoutEffect(() => {
     const prev = prevFloatingRef.current;
-    prevFloatingRef.current = { sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation };
+    prevFloatingRef.current = { sid: sessionId, queued, reviewOpen, hasActivity, hasDelegation, effectiveMode };
+    const leftStream = prev.effectiveMode === 'stream' && effectiveMode === 'term';
     const queuedShifted = prev.queued && queued && (prev.hasActivity !== hasActivity || prev.hasDelegation !== hasDelegation);
     const switchedWithOverlay = prev.sid !== sessionId && (prev.hasActivity || prev.hasDelegation || prev.queued || prev.reviewOpen);
-    if (switchedWithOverlay || (prev.queued && !queued) || queuedShifted || (prev.reviewOpen && !reviewOpen)) {
+    if (leftStream || switchedWithOverlay || (prev.queued && !queued) || queuedShifted || (prev.reviewOpen && !reviewOpen)) {
       repaintPane();
     }
-  }, [sessionId, queued, reviewOpen, hasActivity, hasDelegation, repaintPane]);
+    if (leftStream && sessionId && (!dual || focused)) {
+      focusOnly(sessionId);
+    }
+  }, [sessionId, queued, reviewOpen, hasActivity, hasDelegation, effectiveMode, dual, focused, repaintPane]);
 
   const privacy = usePrivacy();
   const [dropOver, setDropOver] = useState(false);
@@ -647,6 +670,32 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
               </button>
             </span>
           )}
+          {canStream && onViewModeChange && (
+            <span className="seg pane-mode-seg" role="radiogroup" aria-label="视图模式" data-testid="pane-mode-toggle">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={effectiveMode === 'stream'}
+                className={`ghost seg-btn ${effectiveMode === 'stream' ? 'on' : ''}`}
+                data-testid="pane-mode-stream"
+                title="流式对话视图（Alt+M）：保留原生 CLI 后台运行，前置平滑排版与思考/工具时间线"
+                onClick={() => onViewModeChange('stream')}
+              >
+                对话
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={effectiveMode === 'term'}
+                className={`ghost seg-btn ${effectiveMode === 'term' ? 'on' : ''}`}
+                data-testid="pane-mode-term"
+                title="原始终端视图（Alt+M）：直接查看与操作原生 CLI 终端"
+                onClick={() => onViewModeChange('term')}
+              >
+                终端
+              </button>
+            </span>
+          )}
           {task && <button className="btn pane-switch" data-testid="pane-switch" title="让另一个 agent 接手这个任务" onClick={onSwitch}>换 agent</button>}
         </div>
       )}
@@ -658,7 +707,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           onClose={() => setOpenCard(null)}
           onEscape={() => {
             setOpenCard(null);
-            if (!dual || focused) focusOnly(sessionId);
+            if (effectiveMode !== 'stream' && (!dual || focused)) focusOnly(sessionId);
           }}
           onFeedback={onFeedback}
           onForward={onForward}
@@ -714,8 +763,26 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
         {exited && noReplay && (
           <ExitedSummary card={card} transcriptPath={session?.transcriptPath} onOpenPath={onOpenPath} />
         )}
-        {!!session?.queued && (
+        {!!session?.queued && effectiveMode !== 'stream' && (
           <div className="pane-queued" data-testid="pane-queued">消息排队中，agent 空闲后自动发送</div>
+        )}
+        {effectiveMode === 'stream' && onSendMessage && onAnswerPrompt && (
+          <StreamView
+            key={sessionId ?? 'none'}
+            task={task}
+            project={project}
+            session={session}
+            streamState={streamState ?? null}
+            activity={activity}
+            context={context}
+            now={now}
+            privacy={privacy}
+            onSwitchToTerminal={() => onViewModeChange?.('term')}
+            onInterrupt={onInterrupt}
+            onInspectFile={onInspectFile}
+            onSendMessage={onSendMessage}
+            onAnswerPrompt={onAnswerPrompt}
+          />
         )}
       </div>
       {session?.status === 'exited' && task && (

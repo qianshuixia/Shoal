@@ -13,7 +13,7 @@ import type {
   Settings,
 } from '../shared/protocol.ts';
 import { isDeepAgent, isValidCustomCliId } from '../shared/protocol.ts';
-import { agyUsable, codexLaunch, resolveAgy, resolveClaude, resolveCodex } from './agents.ts';
+import { agyUsable, codexLaunchFor, resolveAgy, resolveClaude, resolveCodex } from './agents.ts';
 import type { CliEnv } from './agents.ts';
 import { findExecutable } from './platform.ts';
 
@@ -241,9 +241,17 @@ function uniqueDirs(dirs: string[], platform: NodeJS.Platform): string[] {
 function windowsSearchDirs(env: NodeJS.ProcessEnv, home: string): string[] {
   const appdata = env.APPDATA ?? '';
   const localAppdata = env.LOCALAPPDATA ?? '';
+  const npmPrefix = env.NPM_CONFIG_PREFIX ?? env.npm_config_prefix ?? '';
+  const pnpmHome = env.PNPM_HOME ?? '';
+  const voltaHome = env.VOLTA_HOME ?? '';
+  const nvmSymlink = env.NVM_SYMLINK ?? '';
   const pathDirs = getEnvPath(env).split(';');
   const common = [
     appdata ? path.win32.join(appdata, 'npm') : '',
+    npmPrefix,
+    pnpmHome,
+    voltaHome ? path.win32.join(voltaHome, 'bin') : '',
+    nvmSymlink,
     localAppdata ? path.win32.join(localAppdata, 'agy', 'bin') : '',
     path.win32.join(home, '.local', 'bin'),
     path.win32.join(home, 'bin'),
@@ -295,7 +303,7 @@ export function findExecutableWin(cmd: string, env: NodeJS.ProcessEnv = process.
   const names = ext && WIN_EXT_SET.has(ext) ? [clean] : WIN_EXEC_EXTS.map((e) => `${clean}${e}`);
   for (const dir of dirs) {
     for (const name of names) {
-      const cand = path.win32.join(dir, name);
+      const cand = /^[A-Za-z]:/.test(dir) ? path.win32.join(dir, name) : path.join(dir, name);
       if (isRegularFile(cand)) return cand;
     }
   }
@@ -327,8 +335,13 @@ export function resolveCommandPath(cmd: string, c: CliEnv = {}): string | null {
   return findExecutablePosix(cmd, env, home, c.delimiter ?? ':');
 }
 
-// Unwraps standard npm-generated Windows .cmd shims (e.g. `"%dp0%\node_modules\@google\gemini-cli\dist\index.js"`)
-// directly to the underlying JS entrypoint so node-pty launches Node directly without cmd.exe shell injection risks.
+const SHIM_RUNNER_BASENAMES = new Set(['node.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe']);
+const SHIM_NODE_CALL_RE = /^@?(?:call\s+)?(?:"%_prog%"|node(?:\.exe)?|"(?:%dp0%|%~dp0)[\\/]?node\.exe"|"[A-Za-z]:[\\/][^"\r\n]*[\\/]node\.exe")\s+"([^"\r\n]+\.(?:[mc]?js))"\s+%\*\s*$/i;
+const SHIM_EXE_CALL_RE = /^@?(?:call\s+)?"([^"\r\n]+\.exe)"\s+%\*\s*$/i;
+
+// Unwraps Windows .cmd/.bat shims (npm, pnpm, yarn, scoop, etc.) to their underlying JS entrypoint or native .exe
+// when the batch line is a pure pass-through (`%*` with no extra fixed arguments), so node-pty launches Node or the
+// binary directly without cmd.exe shell injection / quoting failures.
 export function unwrapNpmCmdShim(cmdPath: string): string | null {
   const lower = cmdPath.toLowerCase();
   if (!lower.endsWith('.cmd') && !lower.endsWith('.bat')) return null;
@@ -340,11 +353,47 @@ export function unwrapNpmCmdShim(cmdPath: string): string | null {
   } catch {
     return null;
   }
-  const m = text.match(/%dp0%\\([^"\r\n]+\.(?:[mc]?js))"/i)
-    ?? text.match(/%~dp0\\([^"\r\n]+\.(?:[mc]?js))"/i);
-  if (!m) return null;
-  const target = path.resolve(path.dirname(cmdPath), m[1]);
-  return isRegularFile(target) ? target : null;
+
+  const baseDir = path.dirname(cmdPath);
+  const resolveTarget = (rawTarget: string): string | null => {
+    let target: string;
+    const relMatch = rawTarget.match(/^(?:%dp0%|%~dp0)[\\/]*(.+)$/i);
+    if (relMatch) {
+      const normalized = relMatch[1].replaceAll('\\', path.sep);
+      target = path.resolve(baseDir, normalized);
+    } else if (/^[A-Za-z]:[\\/]/.test(rawTarget)) {
+      target = rawTarget;
+    } else {
+      return null;
+    }
+    if (SHIM_RUNNER_BASENAMES.has(path.win32.basename(target).toLowerCase())) return null;
+    return isRegularFile(target) ? target : null;
+  };
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || /^(@?rem\b|::)/i.test(line) || !line.includes('%*')) continue;
+    // Standard npm shims chain `endLocal & ... || title ... & set PATHEXT=... & "%_prog%" "%dp0%\...\cli.js" %*`.
+    // Inspect the last command segment carrying `%*` so `IF EXIST` / `SET` clauses are never matched.
+    const segments = line.split(/(?:\|\||&&|&)/);
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i].trim();
+      if (!seg.includes('%*')) continue;
+      const jsMatch = seg.match(SHIM_NODE_CALL_RE);
+      if (jsMatch) {
+        const hit = resolveTarget(jsMatch[1]);
+        if (hit) return hit;
+      }
+      const exeMatch = seg.match(SHIM_EXE_CALL_RE);
+      if (exeMatch) {
+        const hit = resolveTarget(exeMatch[1]);
+        if (hit) return hit;
+      }
+      break;
+    }
+  }
+
+  return null;
 }
 
 // Prepares safe file + args (or verbatim Windows command line for non-npm .cmd/.bat) for node-pty.
@@ -357,9 +406,13 @@ export function buildSafeProcessLaunch(resolvedPath: string, args: string[], pla
     return { file: process.execPath, args: [resolvedPath, ...args] };
   }
   if (platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'))) {
-    const unwrappedJs = unwrapNpmCmdShim(resolvedPath);
-    if (unwrappedJs) {
-      return { file: process.execPath, args: [unwrappedJs, ...args] };
+    const unwrapped = unwrapNpmCmdShim(resolvedPath);
+    if (unwrapped) {
+      const unwrappedLower = unwrapped.toLowerCase();
+      if (unwrappedLower.endsWith('.js') || unwrappedLower.endsWith('.mjs') || unwrappedLower.endsWith('.cjs')) {
+        return { file: process.execPath, args: [unwrapped, ...args] };
+      }
+      return { file: unwrapped, args };
     }
     // Non-npm batch script: forbid shell metacharacters so cmd.exe cannot interpret injected commands,
     // and use node-pty's verbatim command-line string branch (`cmd.exe /d /s /c ""path" args"`).
@@ -391,24 +444,18 @@ export function resolveBuiltinPath(spec: BuiltinCliSpec, c: CliEnv = {}): string
   const env = c.env ?? process.env;
   const home = c.home ?? os.homedir();
 
-  // Deep built-ins preserve legacy resolution first so existing setups & tests stay identical.
+  // Deep built-ins preserve legacy default resolution first, with Windows PATH/common-dir fallback inside resolve*().
   if (spec.id === 'claude') {
     const primary = resolveClaude(c);
-    if (primary && isRegularFile(primary)) return primary;
-    if (platform === 'win32') return findExecutableWin('claude', env, home);
-    return null;
+    return primary && isRegularFile(primary) ? primary : null;
   }
   if (spec.id === 'codex') {
     const primary = resolveCodex(c);
-    if (primary && isRegularFile(primary)) return primary;
-    if (platform === 'win32') return findExecutableWin('codex', env, home);
-    return null;
+    return primary && isRegularFile(primary) ? primary : null;
   }
   if (spec.id === 'agy') {
     const primary = resolveAgy(c);
-    if (primary && isRegularFile(primary)) return primary;
-    if (platform === 'win32') return findExecutableWin('agy', env, home);
-    return null;
+    return primary && isRegularFile(primary) ? primary : null;
   }
 
   for (const cmd of spec.commands) {
@@ -566,27 +613,31 @@ export function validateCliPrefsPatch(raw: unknown): Record<string, CliToolPrefe
 }
 
 // Safe async --version probe for built-in CLIs only (never executes raw .cmd/.bat or untrusted custom scripts).
-function probeCliVersion(resolvedPath: string, id: string, platform: NodeJS.Platform = process.platform): Promise<string | null> {
+function probeCliVersion(resolvedPath: string, _id: string, platform: NodeJS.Platform = process.platform): Promise<string | null> {
   if (platform === 'win32' && isCmdBatchPath(resolvedPath, platform)) {
     return Promise.resolve(null);
   }
   let file = resolvedPath;
   let args = ['--version'];
-  if (id === 'codex') {
-    const launch = codexLaunch();
-    file = launch.file;
-    args = [...launch.prefix, '--version'];
-  } else {
-    const lower = resolvedPath.toLowerCase();
-    if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
-      file = process.execPath;
-      args = [resolvedPath, '--version'];
-    } else if (platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'))) {
-      const unwrapped = unwrapNpmCmdShim(resolvedPath);
-      if (!unwrapped) return Promise.resolve(null);
+  const lower = resolvedPath.toLowerCase();
+  if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
+    file = process.execPath;
+    args = [resolvedPath, '--version'];
+  } else if (platform === 'win32' && (lower.endsWith('.cmd') || lower.endsWith('.bat'))) {
+    const unwrapped = unwrapNpmCmdShim(resolvedPath);
+    if (!unwrapped) return Promise.resolve(null);
+    const unwrappedLower = unwrapped.toLowerCase();
+    if (unwrappedLower.endsWith('.js') || unwrappedLower.endsWith('.mjs') || unwrappedLower.endsWith('.cjs')) {
       file = process.execPath;
       args = [unwrapped, '--version'];
+    } else {
+      file = unwrapped;
+      args = ['--version'];
     }
+  } else if (platform !== 'win32') {
+    const launch = codexLaunchFor(resolvedPath);
+    file = launch.file;
+    args = [...launch.prefix, '--version'];
   }
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP_SCAN.test(k)));
   return new Promise((resolve) => {

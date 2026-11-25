@@ -85,10 +85,21 @@ function codexTurns(v: Obj, out: Turn[]) {
   }
 }
 
+// Extracts only the human-authored message from an agy USER_INPUT payload, discarding agy-injected sibling tags
+// such as <ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE>, <SYSTEM_MESSAGE>, or <EPHEMERAL_MESSAGE>.
+export function cleanAgyUserInput(raw: string): string {
+  const match = /<USER_REQUEST>([\s\S]*)<\/USER_REQUEST>/i.exec(raw);
+  if (match) return match[1].trim();
+  return raw
+    .replace(/<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE|EPHEMERAL_MESSAGE)>[\s\S]*?<\/(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE|EPHEMERAL_MESSAGE)>/gi, '')
+    .replace(/<\/?USER_REQUEST>/gi, '')
+    .trim();
+}
+
 function agyTurns(v: Obj, out: Turn[]) {
   if (v.type === 'USER_INPUT') {
     if (v.source !== 'USER_EXPLICIT') return;
-    const text = str(v.content).replace(/<\/?USER_REQUEST>/g, '').trim();
+    const text = cleanAgyUserInput(str(v.content));
     if (text) out.push({ role: 'user', text });
   } else if (v.type === 'PLANNER_RESPONSE') {
     if (str(v.content).trim()) out.push({ role: 'assistant', text: str(v.content).trim() });

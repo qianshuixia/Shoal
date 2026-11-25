@@ -98,9 +98,23 @@ describe('codex launch', () => {
     expect(codexLaunch(ctx(path.dirname(link)))).toEqual({ file: process.execPath, prefix: [fs.realpathSync(js)] });
   });
 
-  it('keeps the Windows launch unchanged: bundled Node plus the npm codex.js', () => {
-    const { file, prefix } = codexLaunch({ platform: 'win32' });
-    expect(file).toBe(process.execPath);
-    expect(prefix).toEqual([path.join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js')]);
+  it('keeps the Windows launch unchanged when default APPDATA codex.js is used, and falls back to PATH custom-prefix codex.cmd', () => {
+    const emptyAppData = path.join(root, 'empty-appdata');
+    fs.mkdirSync(emptyAppData, { recursive: true });
+    const fallback = codexLaunch({ platform: 'win32', env: { APPDATA: emptyAppData, PATH: '' }, home: emptyAppData });
+    expect(fallback.file).toBe(process.execPath);
+    expect(fallback.prefix).toEqual([path.join(emptyAppData, 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js')]);
+
+    // Custom npm prefix under a spaced directory (e.g. D:\Program Files\nodejs\codex.cmd)
+    const customPrefix = path.join(root, 'Program Files', 'nodejs');
+    const customJs = path.join(customPrefix, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    fs.mkdirSync(path.dirname(customJs), { recursive: true });
+    fs.writeFileSync(customJs, '');
+    const customCmd = path.join(customPrefix, 'codex.cmd');
+    fs.writeFileSync(customCmd, '@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n');
+
+    const customEnv = { platform: 'win32' as const, env: { APPDATA: emptyAppData, PATH: customPrefix }, home: emptyAppData };
+    expect(resolveCodex(customEnv)).toBe(customCmd);
+    expect(codexLaunch(customEnv)).toEqual({ file: process.execPath, prefix: [customJs] });
   });
 });

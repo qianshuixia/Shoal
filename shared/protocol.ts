@@ -531,13 +531,20 @@ export interface CliScanResult {
   scannedAt: number;
 }
 
+export type WindowCloseAction = 'tray' | 'quit';
+
 // Workbench-wide settings, stored in the state file.
 export interface Settings {
   aiTitles: boolean; // replace a task's first-line title with one written by a short headless call of its agent
+  // Desktop window close-button behavior: 'tray' hides to system tray (default), 'quit' exits the workbench.
+  closeAction?: WindowCloseAction;
   agyModel?: string; // default model slug passed to new Antigravity tasks ('' or undefined = follow global settings.json)
   // Tell Claude Code, Codex and Antigravity sessions at launch how to delegate work to another CLI with `shoal` (see
   // DELEGATION_INSTRUCTIONS). Off: `shoal` still works, but an agent only uses it when the user asks. Missing = on.
   autoDelegate?: boolean;
+  // Inject a concise visual formatting & chart guide (Mermaid / ECharts / GitHub Alerts / KaTeX) into new sessions
+  // so CLI agents proactively use charts and callouts where helpful. Missing = on.
+  richOutputHints?: boolean;
   // Which kind of work goes to which CLI and when to ask the other two for a joint review; appended to the standing
   // delegation instructions. undefined = the built-in DEFAULT_DELEGATION_RULES, '' = inject no rules.
   delegationRules?: string;
@@ -555,7 +562,7 @@ export const DEFAULT_DELEGATION_RULES = [
   '### 谁擅长什么',
   '- Claude Code：需求澄清、拆解和方案设计，长时间、多步骤的编码和重构，前端视觉和动效（三家里审美最好），终端操作，代码评审，中英文写作。弱项：容易改不全、漏掉同类位置、没看到结果就说做完；不能生成图片；网络安全类任务常被拦截。',
   '- Codex：三家里最严谨。适合接口已定的成块实现（后端、算法、数据处理、性能、数据库迁移），查 bug 修 bug，数学和科学计算，大批量同类改动（选低档模型更省额度），代码评审（自带 `/review`）。弱项：照字面执行，任务里的事实写错也照做、很少反问；汇报信息密、难读；审美弱，不派视觉设计；渗透测试、漏洞利用这类安全任务会被拒绝；默认沙箱关闭网络访问。',
-  '- Antigravity：思路活，思考角度和另两家不同，适合头脑风暴、独立出方案、当界面文案和交互的顾问；看懂截图、设计稿、PDF、图表和视频；超长上下文的全库通读；用内置浏览器点击、截图、验收页面。弱项：三家里最粗心，容易编造文件、行号、结论和对用户的承诺，它的判断要对照代码和实际数据核实后再用；复杂终端任务和大型工程改动不如前两家稳。',
+  '- Antigravity：思路活，思考角度和另两家不同，适合头脑风暴、独立出方案、当界面文案和交互的顾问；看懂截图、设计稿、PDF、图表和视频；超长上下文的全库通读；用内置浏览器点击、截图、验收页面；Google AI Ultra 等付费套餐还自带独立的第三方 Claude 模型额度，可在 Claude Code 额度暂时受限时顶替做评审、规划和方案把关（调用方式见「额度」）。弱项：三家里最粗心，容易编造文件、行号、结论和对用户的承诺，它的判断要对照代码和实际数据核实后再用；复杂终端任务和大型工程改动不如前两家稳。',
   '',
   '### 什么时候委派',
   '- 只能派给上面列出的、已安装且与本会话不同家的 CLI。下面说「派 X」「请 X」而本会话就是 X 时，自己做；没装的也自己做，并在汇报里说明原因。',
@@ -584,15 +591,19 @@ export const DEFAULT_DELEGATION_RULES = [
   '',
   '### 三方评审怎么做',
   '1. 写一份自包含的评审 brief 并存成项目内文件。内容包括：评审对象（需求、方案或 diff 范围）、背景、验收标准、要重点检查的角度、已知风险。评审者看不到本对话。',
-  '2. 对另外两个 CLI 各运行一次 `shoal delegate <agent> --review --file <brief>`。另一家没装时只派一位，在汇报里说明这次是两方评审。',
+  '2. 对另外两个 CLI 各运行一次 `shoal delegate <agent> --review --file <brief>`。另一家没装时只派一位，在汇报里说明这次是两方评审；若只是 Claude Code 额度暂时受限，可按「额度」一节改走 Antigravity 套餐自带的 Claude 额度补位。',
   '3. 等待期间自己先独立评审，写下自己的结论，再看对方的结论，避免被带偏。',
   '4. 按上一节逐条裁决：认可就修改；有异议就写明依据；信息不够就补充后再请评审者确认。',
   '5. 对评审者执行 `shoal done <id>`，然后向用户汇报实际参与各方的结论、各自的分歧和最终裁决。',
   '',
   '### 额度',
-  '三家都按 5 小时窗口加每周上限计量。别让一家的额度耗尽：同类工作在空闲的 CLI 之间轮换，大批量的机械改动用便宜的模型，评审 brief 写清范围，不要让评审者通读整个仓库。',
+  '- 三家都按 5 小时窗口加每周上限计量。别让一家的额度耗尽：同类工作在空闲的 CLI 之间轮换，大批量的机械改动用便宜的模型，评审 brief 写清范围，不要让评审者通读整个仓库。',
+  '- **Claude 额度暂时受限时用 Antigravity 补位**：如果用户的 Antigravity 付费套餐（如 Google AI Ultra）自带第三方 Claude 模型额度（与 Gemini 额度和 Claude Code 独立订阅分开计量），在 Claude Code 限流或额度用完时，可用这份额度顶替原本交给 Claude 的评审、规划、大方案把关和界面文案建议：',
+  '  - **本会话是 Antigravity 时**：优先通过内部子代理/worker 调用 Claude，保持主会话模型与缓存不变。注意 `invoke_subagent` 的 `Model` 参数仅接受档位枚举（`inherit` / `pro` / `flash`），在 Gemini 主会话里默认不会切到 Claude；跨模型调用 Claude 时，先查当前可用模型（`swarm` 的 `models` 或 `agy models`，不写死版本号），按本规则用 `swarm` 派生单个绑定可用 Claude 模型的只读 worker 完成评审或规划，拿回结论后及时 `kill` 回收（或按用户意愿用 `/model` 切换主会话）。',
+  '  - **本会话是 Codex 等其他 CLI 时**：若需 Claude 视角但 Claude Code 限流，可用 `shoal delegate agy --review` 或 `--plan` 派给 Antigravity，并在 brief 里写明「Claude Code 额度暂时受限，若当前套餐有可用 Claude 额度，请在内部通过绑定 Claude 模型的只读子代理/worker 完成本次评审或规划」。',
+  '  - **核实与透明汇报**：若当前 Antigravity 账号没有可用 Claude 模型或该额度也用完，退回 Gemini 或降级处理，不冒充 Claude；使用该额度补位时同样遵守只读与核实纪律，并在汇报中写明由 Antigravity 套餐自带的 Claude 额度补位。',
 ].join('\n');
-export const DEFAULT_SETTINGS: Settings = { aiTitles: false, autoDelegate: true };
+export const DEFAULT_SETTINGS: Settings = { aiTitles: false, closeAction: 'tray', autoDelegate: true, richOutputHints: true };
 
 export interface AgyOptimizeStatus {
   optimized: boolean;
@@ -990,6 +1001,33 @@ export function composeDelegationInstructions(opts: { host: AgentKind; available
   ].join('\n');
 }
 
+// Concise rich-output & visualization hint injected into new sessions when Settings.richOutputHints is enabled.
+export const RICH_OUTPUT_INSTRUCTIONS = [
+  '## Shoal 对话排版与图表渲染支持',
+  'Shoal 对话视图原生支持可视化图表、提示卡片与公式渲染，在适合的场景主动善用（克制使用，不为画图而画图）：',
+  '- 架构、流程、状态机、时序或关系说明：使用 ` ```mermaid ` 代码块（节点文字简短清晰）。',
+  '- 多组数据对比、性能基准、趋势或占比分析：使用 ` ```echarts ` 代码块，内容为严格合法的 ECharts JSON option（不要写 JS 函数或注释，无需指定背景色，界面会自动套用暗色主题）。',
+  '- 关键结论、操作建议或风险提醒：可使用 GitHub 提示块（`> [!TIP]`、`> [!IMPORTANT]`、`> [!WARNING]`、`> [!CAUTION]`）；数学公式支持 `$...$` 与 `$$...$$`。',
+].join('\n');
+
+// Composes standing session instructions from enabled Shoal settings (delegation + optional rich-output hints).
+export function composeSessionInstructions(opts: {
+  host: AgentKind;
+  available: AgentKind[];
+  autoDelegate: boolean;
+  rules: string;
+  richOutputHints: boolean;
+}): string | undefined {
+  const parts: string[] = [];
+  if (opts.autoDelegate) {
+    parts.push(composeDelegationInstructions({ host: opts.host, available: opts.available, rules: opts.rules }));
+  }
+  if (opts.richOutputHints) {
+    parts.push(RICH_OUTPUT_INSTRUCTIONS);
+  }
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
 // First prompt of a delegated task; `review` makes it a read-only reviewer, `plan` a read-only advisor.
 export function delegationPrompt(parent: { title: string; agent: AgentKind }, brief: string, opts?: { mode?: DelegationMode }): string {
   if (opts?.mode === 'plan') {
@@ -1000,7 +1038,7 @@ export function delegationPrompt(parent: { title: string; agent: AgentKind }, br
       '- 独立出方案：不要猜主任务倾向哪种做法；需要时自己读代码和资料核实现状。任务给了现有版本请你改进的（例如界面文案），在回复里给出替代版本和理由，不直接改文件。',
       '- 用一条回复交付：先写推荐方案和理由，再写考虑过的其他做法和取舍、主要风险和还没定的问题。关键判断写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
       '- 需要更多信息就在回复里提问并结束本轮，主任务会补充。',
-      '- 不要再把任务委派或转发给其他 agent。',
+      '- 不要再用 `shoal` 把任务委派或转发给其他 CLI（本 CLI 内部只读子代理不受限）。',
       '',
       '## 任务',
       brief.trim(),
@@ -1014,7 +1052,7 @@ export function delegationPrompt(parent: { title: string; agent: AgentKind }, br
       '- 用一条回复交付：第一行写「结论：PASS」或「结论：FAIL」，然后列 BLOCKING 和 NON-BLOCKING。有 BLOCKING 就是 FAIL。每条写依据（文件:行号、命令输出或来源链接），没核实的标「未验证」。这条回复会自动送回主任务，不需要你自己回传。',
       '- BLOCKING 只放后果严重、并且说得出怎么发生的问题，例如算错钱、丢数据、越权或泄露、发错消息、发布出事故、达不到任务里的验收标准；任务另给了标准的按任务。其余都放 NON-BLOCKING（建议）。',
       '- 需要更多信息就在回复里提问并结束本轮，主任务会补充。',
-      '- 不要再把任务委派或转发给其他 agent。',
+      '- 不要再用 `shoal` 把任务委派或转发给其他 CLI（本 CLI 内部只读子代理不受限）。',
       '',
       '## 任务',
       brief.trim(),
@@ -1026,7 +1064,7 @@ export function delegationPrompt(parent: { title: string; agent: AgentKind }, br
     '- 完成后用一条回复交付：做了什么、改了哪些文件、跑了哪些检查和结果、还有什么没解决。这条回复会自动送回主任务验收，不需要你自己回传。',
     '- 需求不清楚时直接在回复里提问并结束本轮，主任务会补充。',
     '- 工作目录和主任务共用：只改任务范围内的文件；除非任务明确要求，不要提交、推送或发版。',
-    '- 不要再把任务委派或转发给其他 agent。',
+    '- 不要再用 `shoal` 把任务委派或转发给其他 CLI。',
     '',
     '## 任务',
     brief.trim(),
@@ -1254,6 +1292,85 @@ export interface MobileAdminStatus {
   activePair: MobilePairChallengeView | null;
 }
 
+export type PromptKind = 'yn' | 'menu' | 'confirm' | 'unknown';
+export interface PromptKey { label: string; data: string }
+export interface PromptView {
+  kind: PromptKind;
+  lines: string[];
+  keys: PromptKey[];
+  fingerprint: string;
+  waitSeq: number;
+}
+
+export type PaneViewMode = 'term' | 'stream';
+
+export type StreamTodoStatus = 'pending' | 'in_progress' | 'done' | 'skipped' | 'failed';
+
+export interface StreamTodoItem {
+  title: string;
+  status: StreamTodoStatus;
+}
+
+export interface StreamToolEntry {
+  id: string;
+  name: string;
+  summary: string;
+  detail?: string;
+  status: 'running' | 'done' | 'error';
+  files?: string[];
+}
+
+export type StreamBlock =
+  | {
+      id: string;
+      kind: 'user';
+      text: string;
+      at?: number;
+    }
+  | {
+      id: string;
+      kind: 'step';
+      thinking?: string;
+      thinkingSec?: number;
+      tools: StreamToolEntry[];
+      model?: string;
+      at?: number;
+      active?: boolean;
+    }
+  | {
+      id: string;
+      kind: 'assistant';
+      text: string;
+      model?: string;
+      at?: number;
+    }
+  | {
+      id: string;
+      kind: 'card';
+      card: Card;
+    };
+
+export interface LiveStreamTail {
+  phase: 'preparing' | 'thinking' | 'tool' | 'answering';
+  thinkingText?: string;
+  answerText?: string;
+  toolSummary?: string;
+  startedAt: number;
+  updatedAt: number;
+  source: 'pty' | 'activity';
+}
+
+export interface SessionStreamState {
+  sessionId: string;
+  taskId: string;
+  agent: AgentKind;
+  rev: number;
+  blocks: StreamBlock[];
+  todos?: StreamTodoItem[];
+  live: LiveStreamTail | null;
+  prompt: PromptView | null;
+}
+
 export type ConversationItem =
   | { id: string; kind: 'user'; text: string }
   | { id: string; kind: 'assistant'; text: string }
@@ -1283,6 +1400,7 @@ export type ServerMsg =
   | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
   | { t: 'context'; sessionId: string; context: SessionContext | null } // live session context window update
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
+  | { t: 'stream'; state: SessionStreamState } // dual-source rich streaming conversation view update
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per running session right after snapshot, or on 'want-replay'
   | { t: 'out'; id: string; d: string }
@@ -1294,6 +1412,8 @@ export type ClientMsg =
   | { t: 'resize'; id: string; cols: number; rows: number }
   | { t: 'watch-term'; id: string }
   | { t: 'unwatch-term' }
+  | { t: 'watch-stream'; id: string }
+  | { t: 'unwatch-stream'; id: string }
   | { t: 'want-replay'; id: string } // saved output of a session that is not running (answered with 'replay', d may be '')
   | { t: 'term-key'; id: string; d: string }
   | { t: 'ping'; ts: number };

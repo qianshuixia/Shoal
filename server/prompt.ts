@@ -1,21 +1,13 @@
 import crypto from 'node:crypto';
 import xtermHeadless from '@xterm/headless';
-import type { SessionInfo } from '../shared/protocol.ts';
+import type { PromptKey, PromptKind, PromptView, SessionInfo } from '../shared/protocol.ts';
 
 const { Terminal } = xtermHeadless;
 
-// A blocked session's prompt as the phone sees it: the screen lines in full, the keys that answer it, and a
+// A blocked session's prompt as the client sees it: the screen lines in full, the keys that answer it, and a
 // fingerprint the answer must echo so a key is only written while that same prompt is still waiting. `waitSeq` (the
 // wait it was read in) lets a refused answer tell "the screen changed under the same wait" from "already answered".
-export type PromptKind = 'yn' | 'menu' | 'confirm' | 'unknown';
-export interface PromptKey { label: string; data: string }
-export interface PromptView {
-  kind: PromptKind;
-  lines: string[];
-  keys: PromptKey[];
-  fingerprint: string;
-  waitSeq: number;
-}
+export type { PromptKind, PromptKey, PromptView };
 
 const TAIL_BYTES = 128 * 1024;
 const MAX_LABEL_CHARS = 160; // a key label only; the full option line is in `lines`

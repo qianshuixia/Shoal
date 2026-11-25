@@ -1,6 +1,7 @@
 import { Terminal, type IDisposable } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import type { TermLineSample } from '../../shared/ptyLive.ts';
 import { send } from './ws.ts';
 import { pinIme } from './ime.ts';
 
@@ -30,6 +31,79 @@ const wanted = new Set<string>();
 const empty = new Set<string>();
 const emptyListeners = new Set<() => void>();
 const changedEmpty = () => { for (const fn of emptyListeners) fn(); };
+const outListeners = new Map<string, Set<() => void>>();
+
+function notifyOutListeners(id: string): void {
+  const set = outListeners.get(id);
+  if (!set) return;
+  for (const fn of set) fn();
+}
+
+export function subscribeTermOutput(id: string, fn: () => void): () => void {
+  let set = outListeners.get(id);
+  if (!set) {
+    set = new Set();
+    outListeners.set(id, set);
+  }
+  set.add(fn);
+  return () => {
+    const cur = outListeners.get(id);
+    if (!cur) return;
+    cur.delete(fn);
+    if (cur.size === 0) outListeners.delete(id);
+  };
+}
+
+// Reads ONLY the clean active viewport (baseY..baseY+rows) from the live browser xterm.js buffer.
+// Deliberately avoids scrollback rows (< baseY) where Windows ConPTY accumulates repeated inline redraw lines.
+export function readTermLiveSnapshot(id: string): { lines: TermLineSample[]; isAlternate: boolean } | null {
+  const entry = registry.get(id);
+  if (!entry) return null;
+  const b = entry.term.buffer.active;
+  const isAlternate = b.type === 'alternate';
+  if (isAlternate) return { lines: [], isAlternate: true };
+
+  const start = Math.max(0, b.baseY);
+  const end = Math.min(b.length, start + entry.term.rows);
+  const lines: TermLineSample[] = [];
+  const probe = b.getNullCell();
+
+  for (let i = start; i < end; i++) {
+    const line = b.getLine(i);
+    if (!line) continue;
+    const next = i + 1 < end ? b.getLine(i + 1) : undefined;
+    const text = line.translateToString(!next?.isWrapped);
+    if (line.isWrapped && lines.length > 0) {
+      lines[lines.length - 1].text += text;
+      continue;
+    }
+    let muted = false;
+    const len = Math.min(line.length, 40);
+    for (let x = 0; x < len; x++) {
+      const cell = line.getCell(x, probe);
+      if (!cell) continue;
+      const ch = cell.getChars();
+      if (!ch || ch === ' ') continue;
+      if (cell.isDim() || cell.isItalic()) {
+        muted = true;
+      } else if (cell.isFgRGB()) {
+        const c = cell.getFgColor();
+        const r = (c >> 16) & 0xff;
+        const g = (c >> 8) & 0xff;
+        const bl = c & 0xff;
+        const sat = Math.max(r, g, bl) - Math.min(r, g, bl);
+        const lum = 0.299 * r + 0.587 * g + 0.114 * bl;
+        // Classify low-saturation gray (dark #9aa0a6 or Tokyo Night #565f89/#7e86ad) as muted,
+        // without misclassifying colored Tokyo Night headings (#bb9af7) or code (#7aa2f7).
+        if (sat < 48 && lum < 172) muted = true;
+      }
+      break;
+    }
+    lines.push({ startRow: i, text, muted });
+  }
+  while (lines.length > 0 && !lines[lines.length - 1].text.trim()) lines.pop();
+  return { lines, isAlternate: false };
+}
 
 // An exited session's terminal is empty after a page load or a Shoal restart; ask the server for the saved output.
 // Requests made while disconnected are sent again by resendWantedReplays() once the socket opens.
@@ -64,6 +138,7 @@ export const isNewTaskKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyN
 export const isPaneKey = (e: KeyboardEvent): 0 | 1 | null => (altOnly(e) ? (e.code === 'Digit1' ? 0 : e.code === 'Digit2' ? 1 : null) : null);
 export const isSearchKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyK';
 export const isInspectKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyE';
+export const isModeKey = (e: KeyboardEvent) => altOnly(e) && e.code === 'KeyM';
 const ctrlOnly = (e: KeyboardEvent) => e.ctrlKey && !e.altKey && !e.metaKey;
 // Ctrl+= / Ctrl++ (numpad too) zoom in, Ctrl+- out, Ctrl+0 back to 100%: 1 / -1 / 0; null for any other key.
 // Shift is allowed because + is Shift+= on most layouts.
@@ -76,7 +151,7 @@ export function zoomKey(e: KeyboardEvent): 1 | -1 | 0 | null {
 }
 // Ctrl+- stays with the CLI inside a terminal: it is ^_, Claude Code's undo.
 const isPageKey = (e: KeyboardEvent) =>
-  isJumpKey(e) || isNewTaskKey(e) || isPaneKey(e) !== null || isSearchKey(e) || isInspectKey(e) || zoomKey(e) === 1 || zoomKey(e) === 0;
+  isJumpKey(e) || isNewTaskKey(e) || isPaneKey(e) !== null || isSearchKey(e) || isInspectKey(e) || isModeKey(e) || zoomKey(e) === 1 || zoomKey(e) === 0;
 // On macOS the browser pastes on Cmd+V by itself, and Ctrl+V is the CLIs' own image-paste key (Claude Code's
 // chat:imagePaste is Ctrl+V there, Alt+V on Windows), so Ctrl+V goes to the CLI unchanged.
 const MAC_HOST = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform || navigator.userAgent);
@@ -278,7 +353,11 @@ function getEntry(id: string): Entry {
 export function writeOut(id: string, d: string): void {
   const entry = getEntry(id);
   entry.contentSeq++;
-  entry.term.write(d);
+  if (outListeners.has(id)) {
+    entry.term.write(d, () => notifyOutListeners(id));
+  } else {
+    entry.term.write(d);
+  }
   if (!filled.has(id)) {
     filled.add(id);
     if (empty.has(id)) changedEmpty();
@@ -308,6 +387,7 @@ export function replay(id: string, d: string): void {
       ensureGl(entry, false);
       if (entry.gl) entry.term.refresh(0, entry.term.rows - 1);
     }
+    notifyOutListeners(id);
   });
 }
 
@@ -319,6 +399,7 @@ export function dispose(id: string): void {
   entry.term.dispose();
   entry.el.remove();
   registry.delete(id);
+  outListeners.delete(id);
   filled.delete(id);
   wanted.delete(id);
   if (empty.delete(id)) changedEmpty();

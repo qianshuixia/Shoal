@@ -1,0 +1,433 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterAll, describe, expect, it } from 'vitest';
+import type { Card, SessionInfo, Task } from '../shared/protocol.ts';
+import { dedupeLiveThinking } from '../shared/ptyLive.ts';
+import {
+  buildStreamBlocks,
+  composeLiveTail,
+  createStreamWatcher,
+  dedupeLiveAnswer,
+  extractPtyLiveFromLines,
+  extractTodosFromToolCall,
+  parseStreamBlocks,
+  parseStreamData,
+} from './stream.ts';
+
+const dirs: string[] = [];
+afterAll(() => {
+  for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
+});
+
+const jl = (...objs: unknown[]) => objs.map(o => JSON.stringify(o)).join('\n');
+
+describe('parseStreamBlocks', () => {
+  it('agy: parses USER_INPUT, PLANNER_RESPONSE thinking + tools + narration, ignores GENERIC RUNNING and finishes tools per GENERIC DONE', () => {
+    const raw = jl(
+      {
+        step_index: 0,
+        type: 'USER_INPUT',
+        source: 'USER_EXPLICIT',
+        created_at: '2026-11-24T01:50:00.000Z',
+        content: '<USER_REQUEST>\n帮我检查环境\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-25T12:17:25+08:00.\n</ADDITIONAL_METADATA>',
+      },
+      {
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-24T01:50:02.000Z',
+        model: 'gemini-4-neon-xhigh',
+        thinking: 'Let me run uname and check macOS.',
+        content: '好，我就跑一下，看看环境到底是什么情况。',
+        tool_calls: [
+          {
+            name: 'default_api:run_command',
+            args: { CommandLine: '"uname -a"', toolSummary: '"确认执行环境是不是 macOS"' },
+          },
+          {
+            name: 'default_api:read_file',
+            args: { Path: '"G:/Workspace/app/src/index.ts"' },
+          },
+        ],
+      },
+      // Real agy 1.5.x emits GENERIC RUNNING before DONE — must NOT mark tools done yet!
+      { step_index: 2, type: 'GENERIC', status: 'RUNNING', created_at: '2026-11-24T01:50:02.500Z' },
+    );
+
+    const mid = parseStreamBlocks('agy', raw, 'agy1');
+    const midStep = mid[1];
+    expect(midStep.kind).toBe('step');
+    if (midStep.kind === 'step') {
+      expect(midStep.active).toBe(true);
+      expect(midStep.tools.map(t => t.status)).toEqual(['running', 'running']);
+    }
+
+    // Now first tool completes DONE, second tool still running.
+    const raw2 = raw + '\n' + jl(
+      { step_index: 2, type: 'GENERIC', status: 'DONE', created_at: '2026-11-24T01:50:03.000Z' },
+    );
+    const partial = parseStreamBlocks('agy', raw2, 'agy1');
+    if (partial[1].kind === 'step') {
+      expect(partial[1].active).toBe(true);
+      expect(partial[1].tools.map(t => t.status)).toEqual(['done', 'running']);
+    }
+
+    // Second tool completes DONE + final PLANNER_RESPONSE arrives.
+    const raw3 = raw2 + '\n' + jl(
+      { step_index: 3, type: 'GENERIC', status: 'DONE', created_at: '2026-11-24T01:50:04.000Z' },
+      {
+        step_index: 4,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-24T01:50:06.000Z',
+        model: 'gemini-4-neon-xhigh',
+        thinking: 'Everything verified, write concise answer.',
+        content: '### 结论\n\n环境正常。\n\n```ts\nexport const ok = true;\n```',
+        tool_calls: [],
+      },
+    );
+
+    const blocks = parseStreamBlocks('agy', raw3, 'agy1');
+    expect(blocks.map(b => b.kind)).toEqual(['user', 'step', 'assistant', 'step', 'assistant']);
+    // Stable step_index-based IDs across updates prevent React remount / animation replay.
+    expect(blocks[0].id).toBe('agy1-agy-u-0');
+    expect(blocks[0].kind === 'user' ? blocks[0].text : '').toBe('帮我检查环境');
+    expect(blocks[1].id).toBe('agy1-agy-step-1');
+    expect(blocks[2].id).toBe('agy1-agy-a-1');
+    if (blocks[1].kind === 'step') {
+      expect(blocks[1].active).toBe(false);
+      expect(blocks[1].tools.map(t => t.status)).toEqual(['done', 'done']);
+      expect(blocks[1].tools[1]).toMatchObject({ summary: '读取 index.ts', files: ['G:/Workspace/app/src/index.ts'] });
+    }
+  });
+
+  it('claude: extracts thinking, tool_use, tool_result error/done status, and merges consecutive assistant texts', () => {
+    const raw = jl(
+      { type: 'user', timestamp: '2026-11-24T01:00:00.000Z', message: { content: '修一下登录' } },
+      {
+        type: 'assistant',
+        timestamp: '2026-11-24T01:00:03.000Z',
+        message: {
+          model: 'claude-sonnet-4-6',
+          content: [
+            { type: 'thinking', thinking: 'Inspect auth.ts first.' },
+            { type: 'tool_use', id: 'tu_1', name: 'Read', input: { file_path: '/repo/auth.ts' } },
+            { type: 'tool_use', id: 'tu_2', name: 'Bash', input: { command: 'npm test', description: '运行测试' } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        timestamp: '2026-11-24T01:00:05.000Z',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' },
+            { type: 'tool_result', tool_use_id: 'tu_2', is_error: true, content: 'failed' },
+          ],
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: '2026-11-24T01:00:07.000Z',
+        message: { content: [{ type: 'text', text: '发现问题了。' }] },
+      },
+    );
+
+    const blocks = parseStreamBlocks('claude', raw, 'cl1');
+    expect(blocks.map(b => b.kind)).toEqual(['user', 'step', 'assistant']);
+    const step = blocks[1];
+    if (step.kind === 'step') {
+      expect(step.active).toBe(false);
+      expect(step.thinking).toBe('Inspect auth.ts first.');
+      expect(step.thinkingSec).toBe(3);
+      expect(step.tools.map(t => [t.summary, t.status])).toEqual([
+        ['读取 auth.ts', 'done'],
+        ['运行测试', 'error'],
+      ]);
+    }
+  });
+
+  it('codex: pairs reasoning summary with function_call and marks done on function_call_output', () => {
+    const raw = jl(
+      { type: 'response_item', timestamp: '2026-11-24T01:00:00Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '看看配置' }] } },
+      { type: 'response_item', timestamp: '2026-11-24T01:00:02Z', payload: { type: 'reasoning', summary: [{ text: 'Checking package.json' }] } },
+      { type: 'response_item', timestamp: '2026-11-24T01:00:02Z', payload: { type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: '{"cmd":"cat package.json"}' } },
+      { type: 'response_item', timestamp: '2026-11-24T01:00:03Z', payload: { type: 'function_call_output', call_id: 'c1', output: '{}' } },
+      { type: 'response_item', timestamp: '2026-11-24T01:00:05Z', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '配置正常。' }] } },
+    );
+
+    const blocks = parseStreamBlocks('codex', raw, 'cx1');
+    expect(blocks.map(b => b.kind)).toEqual(['user', 'step', 'assistant']);
+    const step = blocks[1];
+    if (step.kind === 'step') {
+      expect(step.thinking).toBe('Checking package.json');
+      expect(step.active).toBe(false);
+      expect(step.tools[0]).toMatchObject({ name: 'exec_command', status: 'done' });
+    }
+  });
+});
+
+describe('PTY live extraction & deduplication (agy 1.5.15+ regression guards)', () => {
+  it('never leaks agy 1.5.15 Working spinner, Tip/Use /settings, stats header, or tool summary into answerText', () => {
+    const lines = [
+      { startRow: 0, text: '41.1s in | 5.2k out | 2.8k thinking', muted: true },
+      { startRow: 1, text: '● 批量读取: H:\\h5-game\\src (ctrl+o to expand)', muted: false },
+      { startRow: 2, text: '  先完成两份代码的差异比对。', muted: false },
+      { startRow: 3, text: '83.6s in | 4.5k out | 2.2k thinking', muted: true },
+      { startRow: 4, text: '● mcp-fast-tools:fastSearch(读取背景信息) (ctrl+o to expand)', muted: false },
+      { startRow: 5, text: '⠼ Working...', muted: true },
+      { startRow: 6, text: '  Tip: Use /settings to configure your environment.', muted: true },
+      { startRow: 7, text: '  Use /settings to configure your environment.', muted: true },
+      { startRow: 8, text: '────────────────────────────────────────────────────────────', muted: true },
+      { startRow: 9, text: '>', muted: false },
+      { startRow: 10, text: '────────────────────────────────────────────────────────────', muted: true },
+      { startRow: 11, text: 'esc to cancel                       auto · Gemini 4 Neon · xhigh', muted: true },
+    ];
+    const ext = extractPtyLiveFromLines('agy', lines);
+    expect(ext.answerText).toBeUndefined();
+    expect(ext.thinkingText).toBeUndefined();
+    expect(ext.spinnerText).toBe('Working...');
+  });
+
+  it('routes dim/muted live lines into thinkingText and bright lines into answerText, and ignores alternate screen', () => {
+    const lines = [
+      { startRow: 0, text: '83.6s in | 4.5k out | 2.2k thinking', muted: true },
+      { startRow: 1, text: '● mcp-fast-tools:fastSearch(查询) (ctrl+o to expand)', muted: false },
+      { startRow: 2, text: '  2. The scene file uses a text node for age verification.', muted: true },
+      { startRow: 3, text: '⠋ Working...', muted: true },
+      { startRow: 4, text: '  Tip: Use /settings to configure your environment.', muted: true },
+    ];
+    const ext = extractPtyLiveFromLines('agy', lines);
+    expect(ext.thinkingText).toBe('2. The scene file uses a text node for age verification.');
+    expect(ext.answerText).toBeUndefined();
+
+    // Alternate screen (interactive picker / question form) must never be scraped.
+    expect(extractPtyLiveFromLines('agy', lines, undefined, true)).toEqual({});
+  });
+
+  it('extracts bright agy streaming response cleanly without chrome', () => {
+    const lines = [
+      { startRow: 0, text: '────────────────────────────────────────────────────────────', muted: true },
+      { startRow: 1, text: '> 帮我列 3 条', muted: false },
+      { startRow: 2, text: '▸ Thought for 5s', muted: true },
+      { startRow: 3, text: '  1. 第一条检查结果', muted: false },
+      { startRow: 4, text: '  2. 第二条正在流式输出', muted: false },
+      { startRow: 5, text: '⣻  Checking the remaining registry entries for backlight...', muted: true },
+      { startRow: 6, text: '└ Tip: Use /help to see all commands.', muted: true },
+      { startRow: 7, text: '────────────────────────────────────────────────────────────', muted: true },
+      { startRow: 8, text: '>', muted: false },
+      { startRow: 9, text: 'esc to cancel                               Gemini 4 Carbon · medium', muted: true },
+    ];
+    const ext = extractPtyLiveFromLines('agy', lines, '帮我列 3 条');
+    expect(ext.thinkingText).toBe('Checking the remaining registry entries for backlight...');
+    expect(ext.answerText).toBe('1. 第一条检查结果\n2. 第二条正在流式输出');
+  });
+
+  it('deduplicates committed Markdown answers and prevents repeating previous-step thinking in live tail', () => {
+    const blocks = [
+      { id: 'u1', kind: 'user' as const, text: 'hi' },
+      {
+        id: 'st1',
+        kind: 'step' as const,
+        thinking: 'The analysis of LoadingSceneController.dll revealed distinct differences.',
+        tools: [],
+      },
+      { id: 'a1', kind: 'assistant' as const, text: '### 结论\n\n1. **第一条检查结果**\n2. `第二条`正在流式输出完成' },
+      { id: 'u2', kind: 'user' as const, text: '继续' },
+    ];
+    expect(dedupeLiveAnswer('结论\n1. 第一条检查结果\n2. 第二条正在流式输出', blocks)).toBeUndefined();
+    expect(dedupeLiveAnswer('结论', blocks)).toBeUndefined();
+    expect(dedupeLiveAnswer('全新的第三轮回复内容在这里', blocks)).toBe('全新的第三轮回复内容在这里');
+
+    // Stale thinking snippet matching previous step must be suppressed.
+    expect(dedupeLiveThinking('The analysis of LoadingSceneController.dll revealed distinct differences.', blocks)).toBeUndefined();
+    expect(dedupeLiveThinking('Inspecting the remaining anti-addiction checks now.', blocks)).toBe('Inspecting the remaining anti-addiction checks now.');
+
+    // Short previous reply ("好的") must NOT suppress a longer new reply starting with "好的，...".
+    const shortBlocks = [{ id: 'a0', kind: 'assistant' as const, text: '好的' }];
+    expect(dedupeLiveAnswer('好的，我现在开始逐项检查配置文件。', shortBlocks)).toBe('好的，我现在开始逐项检查配置文件。');
+
+    // Strips leading lines already committed earlier in the turn, preserving ONLY brand-new streamed lines.
+    const multiStepBlocks = [
+      { id: 'a1', kind: 'assistant' as const, text: '先精读防沉迷相关源码与测试契约。' },
+      { id: 'a2', kind: 'assistant' as const, text: '开始批量落地阶段一修改。' },
+    ];
+    expect(
+      dedupeLiveAnswer('先精读防沉迷相关源码与测试契约。\n开始批量落地阶段一修改。\n最新流式生成的总结内容在这里。', multiStepBlocks),
+    ).toBe('最新流式生成的总结内容在这里。');
+  });
+
+  it('strips bare braille spinner char and wrapped user prompt continuations', () => {
+    const lines = [
+      { startRow: 0, text: '> 第一行用户长提问内容在这里', muted: false },
+      { startRow: 1, text: '  第二行用户提问续行内容在这里', muted: false },
+      { startRow: 2, text: '  全新生成的助手正文', muted: false },
+      { startRow: 3, text: '⣯', muted: true },
+    ];
+    const ext = extractPtyLiveFromLines('agy', lines, '第一行用户长提问内容在这里\n第二行用户提问续行内容在这里');
+    expect(ext.answerText).toBe('全新生成的助手正文');
+  });
+
+  it('extracts live thinking headline past agy bottom todolist panel, promo banner, and wrapped footer', () => {
+    const lines = [
+      { startRow: 0, text: '  第 10 轮已返回，准备第 11 轮。', muted: false },
+      { startRow: 1, text: '⣷  2/6 steps · Defined specifications for crossingcams.com SEO rules...', muted: true },
+      { startRow: 2, text: '  ⎿  ✓ 核实已购域名与项目归档结构', muted: true },
+      { startRow: 3, text: '     ✓ 归档前期调研资料到新项目目录', muted: true },
+      { startRow: 4, text: '     ● 与哥飞 Agent 深度定死全站 SEO 规范', muted: false },
+      { startRow: 5, text: '     ○ 撰写 PRD 与整站架构及内链方案', muted: true },
+      { startRow: 6, text: ' ┃ Introducing Gemini 4 Neon', muted: false },
+      { startRow: 7, text: ' ┃ esc to dismiss', muted: true },
+      { startRow: 8, text: '────────────────────────────────────────────────────────────', muted: true },
+      { startRow: 9, text: '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)', muted: true },
+      { startRow: 10, text: '────────────────────────────────────────────────────────────', muted: true },
+      { startRow: 11, text: '? for shortcuts                                      auto · Gemini', muted: true },
+      { startRow: 12, text: ' 4 Neon · high', muted: true },
+    ];
+    const ext = extractPtyLiveFromLines('agy', lines);
+    expect(ext.thinkingText).toBe('Defined specifications for crossingcams.com SEO rules...');
+    expect(ext.answerText).toBeUndefined();
+  });
+
+  it('extracts latest todo checklist across agy update_steps, claude TodoWrite, and codex update_plan', () => {
+    const agyTodos = extractTodosFromToolCall('default_api:update_steps', {
+      steps: JSON.stringify([
+        { title: '核实已购域名', status: 'done' },
+        { title: '哥飞 Agent 深度定稿', status: 'in_progress' },
+        { title: '三方交叉评审', status: 'pending' },
+      ]),
+    });
+    expect(agyTodos).toEqual([
+      { title: '核实已购域名', status: 'done' },
+      { title: '哥飞 Agent 深度定稿', status: 'in_progress' },
+      { title: '三方交叉评审', status: 'pending' },
+    ]);
+
+    const claudeTodos = extractTodosFromToolCall('TodoWrite', {
+      todos: [
+        { content: 'Read files', status: 'completed' },
+        { content: 'Fix bug', status: 'in_progress' },
+      ],
+    });
+    expect(claudeTodos).toEqual([
+      { title: 'Read files', status: 'done' },
+      { title: 'Fix bug', status: 'in_progress' },
+    ]);
+
+    const codexTodos = extractTodosFromToolCall('update_plan', {
+      plan: [{ step: 'Run tests', status: 'completed' }],
+    });
+    expect(codexTodos).toEqual([{ title: 'Run tests', status: 'done' }]);
+
+    const parsed = parseStreamData('agy', jl({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      tool_calls: [{ name: 'update_steps', args: { steps: JSON.stringify([{ title: 'A', status: 'done' }, { title: 'B', status: 'in_progress' }]) } }],
+    }));
+    expect(parsed.todos).toEqual([
+      { title: 'A', status: 'done' },
+      { title: 'B', status: 'in_progress' },
+    ]);
+    if (parsed.blocks[0]?.kind === 'step') {
+      expect(parsed.blocks[0].tools[0].summary).toBe('更新任务清单（已完成 1/2）');
+    }
+  });
+
+  it('watches/unwatches cleanly on demand and suppresses redundant WS broadcasts when only live.updatedAt advances', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shoal-stream-dedupe-'));
+    dirs.push(dir);
+    const tp = path.join(dir, 'fake.jsonl');
+    fs.writeFileSync(tp, JSON.stringify({ role: 'user', text: '测试去重' }) + '\n');
+
+    const task: Task = {
+      id: 't1', projectId: 'p1', title: '去重', prompt: '测试去重', titleAuto: false,
+      color: '#8baeda', agent: 'fake', sessionId: 's1', createdAt: 1000, phase: 'active', phaseSince: 1000,
+    };
+    const session: SessionInfo = {
+      id: 's1', taskId: 't1', agent: 'fake', nativeSessionId: 'fake-s1', status: 'working',
+      statusSince: 1000, startedAt: 1000, exitCode: null, cols: 100, rows: 30, transcriptPath: tp,
+    };
+    let clock = 2000;
+    const watcher = createStreamWatcher({
+      getSession: id => (id === 's1' ? session : undefined),
+      getTask: id => (id === 't1' ? task : undefined),
+      getCards: () => [],
+      getActivity: () => null,
+      getPromptWait: () => null,
+      now: () => (clock += 100),
+    });
+
+    const sent: string[] = [];
+    const client = { readyState: 1, send: (d: string) => sent.push(d) };
+    expect(watcher.watchedCount()).toBe(0);
+
+    watcher.watch(client, 's1');
+    expect(watcher.watchedCount()).toBe(1);
+    expect(sent.length).toBe(1);
+
+    // Repeated ticks with advancing clock but unchanged state must NOT rebroadcast!
+    watcher.onActivity('s1');
+    watcher.onSessionChange({ ...session, cols: 101 });
+    watcher.onActivity('s1');
+    expect(sent.length).toBe(1);
+
+    // Once transcript updates and session stops, watcher emits clean settled state.
+    fs.appendFileSync(tp, JSON.stringify({ role: 'assistant', text: '完成检查。' }) + '\n');
+    session.status = 'needs_you';
+    watcher.onSessionChange(session);
+    const settled = JSON.parse(sent.at(-1)!);
+    expect(settled.state.live).toBeNull();
+    expect(settled.state.blocks.at(-1)).toMatchObject({ kind: 'assistant', text: '完成检查。' });
+
+    watcher.unwatchClient(client);
+    expect(watcher.watchedCount()).toBe(0);
+    watcher.close();
+  });
+
+  it('builds preparing tail before any PTY or activity signal arrives', () => {
+    const session: SessionInfo = {
+      id: 's1', taskId: 't1', agent: 'agy', nativeSessionId: null, status: 'working',
+      statusSince: 1000, startedAt: 1000, exitCode: null, cols: 120, rows: 36,
+    };
+    const tail = composeLiveTail({ session, blocks: [], activity: null, ptyExtract: null, now: 1500 });
+    expect(tail).toMatchObject({ phase: 'preparing', startedAt: 1000 });
+    expect(buildStreamBlocks({
+      task: { id: 't1', projectId: 'p1', title: 'T', prompt: '你好', titleAuto: false, color: '#fff', agent: 'agy', sessionId: 's1', createdAt: 900, phase: 'active', phaseSince: 900 },
+      session,
+      cards: [],
+    })).toHaveLength(1);
+  });
+
+  it('prefers agy transcript_full.jsonl over truncated compact transcript.jsonl in buildStreamBlocks', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shoal-stream-full-'));
+    dirs.push(dir);
+    const compact = path.join(dir, 'transcript.jsonl');
+    const full = path.join(dir, 'transcript_full.jsonl');
+    fs.writeFileSync(compact, jl({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: '| 检查项 | 结果 |\n| --- | --- |\n| 类型检查 | <truncated 929 bytes> |',
+    }) + '\n');
+    fs.writeFileSync(full, jl({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      content: '| 检查项 | 结果 |\n| --- | --- |\n| 类型检查 | 通过（零错误） |',
+    }) + '\n');
+
+    const blocks = buildStreamBlocks({
+      task: { id: 't1', projectId: 'p1', title: '完整日志', prompt: '测试', titleAuto: false, color: '#fff', agent: 'agy', sessionId: 's1', createdAt: 900, phase: 'active', phaseSince: 900 },
+      session: {
+        id: 's1', taskId: 't1', agent: 'agy', nativeSessionId: null, status: 'needs_you',
+        statusSince: 1000, startedAt: 1000, exitCode: null, cols: 120, rows: 36, transcriptPath: compact,
+      },
+      cards: [],
+    });
+    const assistant = blocks.find(b => b.kind === 'assistant');
+    expect(assistant && assistant.kind === 'assistant' ? assistant.text : '').toContain('通过（零错误）');
+    expect(assistant && assistant.kind === 'assistant' ? assistant.text : '').not.toContain('truncated');
+  });
+});

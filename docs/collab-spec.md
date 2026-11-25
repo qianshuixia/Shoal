@@ -127,11 +127,11 @@ Antigravity 子任务和其他 agy 会话一样，用交互模式 `agy --dangero
 
 关闭后 `shoal` 命令照常可用，只是 agent 不会主动想到它。
 
-实际注入的是 `composeDelegationInstructions()` 的结果：`DELEGATION_INSTRUCTIONS`，加一行“本会话是哪个 CLI、本机装了哪些 CLI（只能委派给这些）”，再加设置项「分工与评审规则」（`Settings.delegationRules`）。规则字段没有设置时用内置的 `DEFAULT_DELEGATION_RULES`；设为 `''` 时不注入规则；上限 `DELEGATION_RULES_MAX`（4000 字）；改动只对之后新启动的会话生效。默认规则写明：主会话负责拆解、验收和转述；各 CLI 的长处与弱项；委派的成本和值得派的活；大方案用 `--plan` 让另一家只拿用户原话独立出一份再合并，界面文案也用 `--plan` 请顾问改一遍；什么时候主动评审；只有后果严重、说得出怎么发生的意见才挡交付，同一评审对象最多首评加一次复核，之后交给用户决定；三方评审的步骤，另一家没装时降为两方。只派给与本会话不同家的 CLI，规则点名的那家就是本会话时自己做。服务端的 `MAX_DELEGATION_ROUNDS`（4 轮，定义在 `shared/protocol.ts`）是执行者、评审者和方案顾问共用的硬上限，规则里的两轮是评审的默认做法；到第 4 轮时回传的下一步不再给 `shoal rework`，再 rework 返回 409。只写能力，不写模型版本号，避免很快过时。资料来源：
+实际注入的是 `composeDelegationInstructions()` 的结果：`DELEGATION_INSTRUCTIONS`，加一行“本会话是哪个 CLI、本机装了哪些 CLI（只能委派给这些）”，再加设置项「分工与评审规则」（`Settings.delegationRules`）。规则字段没有设置时用内置的 `DEFAULT_DELEGATION_RULES`；设为 `''` 时不注入规则；上限 `DELEGATION_RULES_MAX`（4000 字）；改动只对之后新启动的会话生效。默认规则写明：主会话负责拆解、验收和转述；各 CLI 的长处与弱项；委派的成本和值得派的活；大方案用 `--plan` 让另一家只拿用户原话独立出一份再合并，界面文案也用 `--plan` 请顾问改一遍；什么时候主动评审；只有后果严重、说得出怎么发生的意见才挡交付，同一评审对象最多首评加一次复核，之后交给用户决定；三方评审的步骤，另一家没装时降为两方；当 Claude Code 独立订阅额度暂时受限时，可利用 Antigravity 付费套餐（如 Google AI Ultra）自带的独立第三方 Claude 额度补位做评审与规划——在 `agy` 内通过支持指定模型的 `swarm` 派生单个只读 Claude worker（因 `invoke_subagent` 的 `Model` 仅接受档位枚举），其他 CLI 主会话可通过 `shoal delegate agy --review/--plan` 并在 brief 中说明启用，且汇报时须写明由 Antigravity 套餐自带额度补位。只派给与本会话不同家的 CLI，规则点名的那家就是本会话时自己做。服务端的 `MAX_DELEGATION_ROUNDS`（4 轮，定义在 `shared/protocol.ts`）是执行者、评审者和方案顾问共用的硬上限，规则里的两轮是评审的默认做法；到第 4 轮时回传的下一步不再给 `shoal rework`，再 rework 返回 409。只写能力，不写模型版本号，避免很快过时。资料来源：
 
 - Claude：[Models overview](https://platform.claude.com/docs/en/about-claude/models/overview)、[Claude Code model config](https://code.claude.com/docs/en/model-config)（2026-11 查阅）
 - Codex：[Codex models](https://learn.chatgpt.com/docs/models)、[Code review](https://learn.chatgpt.com/docs/code-review)、[Approvals & security](https://learn.chatgpt.com/docs/agent-approvals-security)、[Pricing](https://learn.chatgpt.com/docs/pricing)（2026-11 查阅）
-- Antigravity：[Models](https://antigravity.google/docs/models)、[FAQ](https://antigravity.google/docs/faq)（2026-11 查阅）
+- Antigravity：[Models](https://antigravity.google/docs/models)、[Plans](https://antigravity.google/docs/plans)、[Custom subagents](https://antigravity.google/docs/subagents)、[Swarm](https://antigravity.google/docs/swarm)、[FAQ](https://antigravity.google/docs/faq)（2026-11 查阅）
 - 实际使用经验：数字生命卡兹克《[毫无保留地分享一下，我是如何让Claude、GPT和Gemini完美协同的](https://mp.weixin.qq.com/s/gwj0xLNHPfToQnQJN7IkMA)》（2026-11-23 查阅）。取了其中三家的性格差异（Claude 审美最好但容易改不全，GPT 最严谨但照字面执行、汇报难读，Gemini 思路活但最容易编造）、委派的沟通成本、大方案独立双写、文案顾问、评审分两级和两轮上限；没有采用其中只适用于作者自己环境的脚本和流程。
 
 ### 4.6 界面

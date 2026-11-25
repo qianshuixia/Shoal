@@ -52,17 +52,26 @@ function unquoteArgs(raw: unknown): Obj {
   return out;
 }
 
-// Prefers compact `transcript.jsonl` (~70% smaller, flushed immediately on PLANNER_RESPONSE and GENERIC) in the same
-// logs directory as `transcriptPath`, falling back to `transcriptPath` or `<AGY_CONFIG_DIR>/brain/<id>/.../logs/`.
-export function resolveLiveTranscript(session: Pick<SessionInfo, 'agent' | 'nativeSessionId' | 'transcriptPath'>): string | undefined {
+// Resolves the live transcript file for a session.
+// By default prefers compact `transcript.jsonl` (~70% smaller, flushed immediately on PLANNER_RESPONSE and GENERIC)
+// for lightweight activity polling. Pass `{ preferFull: true }` for rich conversation rendering so long assistant
+// replies and tables are never cut off with `<truncated N bytes>`.
+export function resolveLiveTranscript(
+  session: Pick<SessionInfo, 'agent' | 'nativeSessionId' | 'transcriptPath'>,
+  opts?: { preferFull?: boolean },
+): string | undefined {
   const tp = session.transcriptPath ? path.resolve(session.transcriptPath.replace(/^\\\\\?\\/, '')) : undefined;
   if (session.agent !== 'agy') {
     return tp && fs.existsSync(tp) ? tp : undefined;
   }
+  const preferFull = !!opts?.preferFull;
+  const order = preferFull ? ['transcript_full.jsonl', 'transcript.jsonl'] : ['transcript.jsonl', 'transcript_full.jsonl'];
   if (tp) {
     const dir = path.dirname(tp);
-    const compact = path.join(dir, 'transcript.jsonl');
-    if (fs.existsSync(compact)) return compact;
+    for (const name of order) {
+      const candidate = path.join(dir, name);
+      if (fs.existsSync(candidate)) return candidate;
+    }
     if (fs.existsSync(tp)) return tp;
   }
   const id = session.nativeSessionId;
@@ -71,7 +80,7 @@ export function resolveLiveTranscript(session: Pick<SessionInfo, 'agent' | 'nati
       process.env.AGY_CONFIG_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli'),
       'brain', id, '.system_generated', 'logs',
     );
-    for (const name of ['transcript.jsonl', 'transcript_full.jsonl']) {
+    for (const name of order) {
       const f = path.join(logsDir, name);
       if (fs.existsSync(f)) return f;
     }

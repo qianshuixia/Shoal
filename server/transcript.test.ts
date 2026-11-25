@@ -44,9 +44,13 @@ describe('parseTranscript', () => {
     ]);
   });
 
-  it('agy: explicit user input without the wrapper, planner text and tool calls; GENERIC and implicit input are skipped', () => {
+  it('agy: explicit user input without the wrapper or injected metadata, planner text and tool calls; GENERIC and implicit input are skipped', () => {
     const turns = parseTranscript('agy', jl(
-      { type: 'USER_INPUT', source: 'USER_EXPLICIT', content: '<USER_REQUEST>\n做首页\n</USER_REQUEST>' },
+      {
+        type: 'USER_INPUT',
+        source: 'USER_EXPLICIT',
+        content: '<USER_REQUEST>\n做首页\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-25T12:17:25+08:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nModel changed\n</USER_SETTINGS_CHANGE>',
+      },
       { type: 'USER_INPUT', source: 'SYSTEM', content: 'ctx' },
       { type: 'PLANNER_RESPONSE', content: '', thinking: 'hmm', tool_calls: [{ name: 'view_file', args: { path: 'a' } }] },
       { type: 'PLANNER_RESPONSE', content: '完成', tool_calls: [] },
