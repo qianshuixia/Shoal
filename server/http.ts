@@ -20,12 +20,12 @@ import { capBody, lastReply } from './cards.ts';
 import { agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
 import {
   buildCliTools, delegatableAgentsFrom, effectivePermissionMode, enabledAgentsFrom, getCachedCliScan, getCliTool,
-  scanCliTools, validateCliPrefsPatch, validateCustomClis,
+  resolveCustomCodexHomes, scanCliTools, validateCliPrefsPatch, validateCustomClis,
 } from './cliRegistry.ts';
 import { CollabError, createCollabManager } from './collab.ts';
 import { fallbackCard, generateCard, generatorPrompt, handoffPrompt, runHeadless } from './handoff.ts';
 import type { HandoffInput } from './handoff.ts';
-import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, parseStatusLineContext, readCodexQuotaInfo, readLatestCodexQuotaFromDisk } from './quota.ts';
+import { createQuotaStore, detectLimit, parseAgyQuota, parseClaudeRateLimits, parseStatusLineContext, readCodexQuotaInfo, readLatestCodexQuotaFromDiskWithMeta } from './quota.ts';
 import { findEditor, OpenError, openAction, resolveOpenTarget, runOpen } from './open.ts';
 import { sendRawPreview } from './raw-stream.ts';
 import { readTranscript } from './transcript.ts';
@@ -71,6 +71,7 @@ export interface AppConfig {
   stateDir: string; // handoff generators write their output files here
   usage: Usage;
   onShutdown?: () => void; // POST /api/shutdown: the desktop shell quitting, same as Ctrl+C on the server
+  codexDiskQuota?: boolean; // override disk rollout scan gate in tests (default: enabled outside VITEST / WORKBENCH_FAKE_AGENT)
 }
 
 function readBody(req: http.IncomingMessage, max = MAX_BODY): Promise<string> {
@@ -191,25 +192,88 @@ export function createApp(cfg: AppConfig) {
     }
   }
 
+  const allowCodexDiskQuota = () => cfg.codexDiskQuota ?? (!process.env.VITEST && process.env.WORKBENCH_FAKE_AGENT !== '1');
+
+  function hasLiveCustomCodexSession(): boolean {
+    const nonDeepLive = sessions.list().filter(s => s.status !== 'exited' && !isDeepAgent(s.agent));
+    if (!nonDeepLive.length) return false;
+    const tools = currentCliTools();
+    return nonDeepLive.some(s => tools.some(t => t.id === s.agent && t.source === 'custom' && t.quotaAgent === 'codex'));
+  }
+
+  function isCustomCodexAgent(agent: AgentKind): boolean {
+    if (isDeepAgent(agent)) return false;
+    return currentCliTools().some(t => t.id === agent && t.source === 'custom' && t.quotaAgent === 'codex');
+  }
+
+  const customQuotaHomeByKey = new Map<string, string>();
+  const normDirKey = (dir: string) => {
+    const resolved = path.resolve(dir.replace(/^\\\\\?\\/, '')).replace(/[\\/]+$/, '');
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  const isFileInsideDir = (file: string, dir: string) => {
+    const f = normDirKey(file);
+    const d = normDirKey(dir);
+    return f.startsWith(`${d}${path.sep}`);
+  };
+
   function refreshCodexQuota(allowDiskFallback = false): QuotaInfo | null {
-    const codexSessions = sessions.list()
-      .filter(s => s.agent === 'codex' && s.transcriptPath)
-      .sort((a, b) => b.statusSince - a.statusSince);
-    for (const s of codexSessions) {
-      const parsed = readCodexQuotaInfo(s.transcriptPath!);
-      if (parsed) {
-        const info = quota.set('codex', parsed.windows, Date.now(), { plan: parsed.plan, source: 'rollout' });
-        if (info) broadcast({ t: 'quota', agent: 'codex', quota: info });
-        return info ?? quota.all().codex ?? null;
+    const { hasDefaultCodex, customHomes } = resolveCustomCodexHomes(store.settings());
+    const activeCustomHomes = new Map(customHomes.map(h => [h.id, normDirKey(h.codexHome)]));
+    // Prune stale custom CLI buckets (deleted, disabled, switched back to shared CODEX_HOME, or re-targeted to a different CODEX_HOME).
+    for (const k of Object.keys(quota.all())) {
+      if (!isDeepAgent(k)) {
+        const nextHome = activeCustomHomes.get(k);
+        const prevHome = customQuotaHomeByKey.get(k);
+        if (!nextHome || (prevHome !== undefined && prevHome !== nextHome)) {
+          if (quota.delete(k)) broadcast({ t: 'quota', agent: k, quota: null });
+        }
       }
     }
-    if (allowDiskFallback && !process.env.VITEST && currentAgents().includes('codex')) {
-      const parsed = readLatestCodexQuotaFromDisk();
-      if (parsed) {
-        const info = quota.set('codex', parsed.windows, Date.now(), { plan: parsed.plan, source: 'rollout' });
-        if (info) broadcast({ t: 'quota', agent: 'codex', quota: info });
-        return info ?? quota.all().codex ?? null;
+    for (const k of [...customQuotaHomeByKey.keys()]) {
+      if (!activeCustomHomes.has(k)) customQuotaHomeByKey.delete(k);
+    }
+
+    const now = Date.now();
+    const defaultSessionsDir = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+    let bestDefault: { quota: NonNullable<ReturnType<typeof readCodexQuotaInfo>>; mtimeMs: number } | null = null;
+    if (hasDefaultCodex) {
+      const codexSessions = sessions.list()
+        .filter(s => s.agent === 'codex' && s.transcriptPath && isFileInsideDir(s.transcriptPath, defaultSessionsDir))
+        .sort((a, b) => b.statusSince - a.statusSince);
+      for (const s of codexSessions) {
+        let mtimeMs: number;
+        try {
+          mtimeMs = fs.statSync(s.transcriptPath!).mtimeMs;
+        } catch { continue; }
+        if (bestDefault && mtimeMs <= bestDefault.mtimeMs) continue;
+        const parsed = readCodexQuotaInfo(s.transcriptPath!);
+        if (parsed && parsed.windows.some(w => w.resetsAt > now)) {
+          bestDefault = { quota: parsed, mtimeMs };
+        }
       }
+    }
+    if (allowDiskFallback && allowCodexDiskQuota()) {
+      if (hasDefaultCodex) {
+        const disk = readLatestCodexQuotaFromDiskWithMeta();
+        if (disk && (!bestDefault || disk.mtimeMs >= bestDefault.mtimeMs)) {
+          bestDefault = disk;
+        }
+      }
+      for (const { id, codexHome } of customHomes) {
+        customQuotaHomeByKey.set(id, normDirKey(codexHome));
+        const disk = readLatestCodexQuotaFromDiskWithMeta(codexHome);
+        if (disk) {
+          const info = quota.set(id, disk.quota.windows, Date.now(), { plan: disk.quota.plan, source: 'rollout' });
+          if (info) broadcast({ t: 'quota', agent: id, quota: info });
+        } else if (quota.delete(id)) {
+          broadcast({ t: 'quota', agent: id, quota: null });
+        }
+      }
+    }
+    if (bestDefault) {
+      const info = quota.set('codex', bestDefault.quota.windows, Date.now(), { plan: bestDefault.quota.plan, source: 'rollout' });
+      if (info) broadcast({ t: 'quota', agent: 'codex', quota: info });
     }
     return quota.all().codex ?? null;
   }
@@ -264,8 +328,9 @@ export function createApp(cfg: AppConfig) {
   };
 
   let lastTelemetryJson = '';
+  const hasConnectedClients = () => clients.size > 0 || (mobile?.clientCount() ?? 0) > 0;
   function refreshTelemetry(force = false) {
-    if (!clients.size) return;
+    if (!hasConnectedClients()) return;
     const telemetry = cfg.usage.telemetry(force);
     const next = JSON.stringify(telemetry);
     if (next !== lastTelemetryJson) {
@@ -343,6 +408,9 @@ export function createApp(cfg: AppConfig) {
         if (m.session.status === 'working' && task.phase !== 'active') setPhase(task, 'active');
         else if (saved?.status !== m.session.status) collab.syncProjectPeers(task.projectId);
         if (task.delegation && m.session.blocked) collab.onChildBlocked(task, m.session);
+      }
+      if (saved?.status !== 'exited' && m.session.status === 'exited' && isCustomCodexAgent(m.session.agent)) {
+        refreshCodexQuota(true);
       }
       return;
     }
@@ -1089,6 +1157,7 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/clis/scan') {
       const scanned = await scanCliTools(store.settings());
       broadcast({ t: 'clis', agents: scanned.agents, cliTools: scanned.cliTools });
+      refreshCodexQuota(true);
       return send(res, 200, scanned);
     }
     if (method === 'POST' && pathname === '/api/settings') {
@@ -1154,6 +1223,7 @@ export function createApp(cfg: AppConfig) {
       if (clisChanged) {
         const cliTools = currentCliTools();
         broadcast({ t: 'clis', agents: enabledAgentsFrom(settings, cliTools), cliTools });
+        refreshCodexQuota(true);
       }
       return send(res, 200, settings);
     }
@@ -1458,6 +1528,7 @@ export function createApp(cfg: AppConfig) {
     sessions,
     activity,
     availableAgents: currentAgents,
+    onClientConnect: () => refreshCodexQuota(true),
     snapshot,
     createTask,
     renameTask,
@@ -1537,8 +1608,14 @@ export function createApp(cfg: AppConfig) {
   // Poll git, live usage, and transcript activity only while somebody is looking; unref so timers never keep the process alive.
   const gitTimer = setInterval(() => { if (clients.size) void refreshAllGit(); }, 10_000);
   gitTimer.unref();
+  let lastCustomCodexPollAt = 0;
   const usageTimer = setInterval(() => {
-    if (clients.size && sessions.list().some(s => s.status === 'working')) refreshTelemetry();
+    if (!hasConnectedClients()) return;
+    if (sessions.list().some(s => s.status === 'working')) refreshTelemetry();
+    if (Date.now() - lastCustomCodexPollAt >= 8_000 && hasLiveCustomCodexSession()) {
+      lastCustomCodexPollAt = Date.now();
+      refreshCodexQuota(true);
+    }
   }, 4_000);
   usageTimer.unref();
   const activityTimer = setInterval(() => {
@@ -1575,6 +1652,7 @@ export function createApp(cfg: AppConfig) {
   });
 
   wss.on('connection', ws => {
+    refreshCodexQuota(true);
     clients.add(ws);
     if (activity.hasActive()) activity.tick();
     void refreshAllGit(); // fill in (or freshen) git state for a client that just opened

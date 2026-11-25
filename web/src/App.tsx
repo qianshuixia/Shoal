@@ -20,7 +20,7 @@ import { FeedbackDialog, ForwardDialog, ProjectDialog, SwitchDialog, TaskDialog,
 import { EditableTitle, PencilIcon, StatusTag, TelemetryPill } from './bits.tsx';
 import { AgentIcon } from './agentIcons.tsx';
 import { QuotaPopover, TopQuotaBar } from './QuotaPanel.tsx';
-import { fmtRelativeAge, loadQuotaMode, saveQuotaMode, type QuotaDisplayMode } from './quota.ts';
+import { fmtRelativeAge, loadQuotaMode, resolveQuotaForAgent, saveQuotaMode, type QuotaDisplayMode } from './quota.ts';
 import { SettingsView } from './SettingsView.tsx';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
@@ -382,7 +382,12 @@ export function App() {
         break;
       }
       case 'quota':
-        setData((d) => ({ ...d, quota: { ...d.quota, [msg.agent]: msg.quota } }));
+        setData((d) => {
+          const next = { ...d.quota };
+          if (msg.quota) next[msg.agent] = msg.quota;
+          else delete next[msg.agent];
+          return { ...d, quota: next };
+        });
         break;
       case 'telemetry':
         setData((d) => ({ ...d, telemetry: msg.telemetry }));
@@ -1152,6 +1157,7 @@ export function App() {
         </button>
         <TopQuotaBar
           quota={data.quota}
+          cliTools={data.cliTools}
           now={now}
           mode={quotaMode}
           open={quotaPopoverOpen}
@@ -1455,7 +1461,7 @@ export function App() {
                   data: answerData,
                 });
               }}
-              quota={paneAgent ? data.quota[paneAgent] : undefined}
+              quota={paneAgent ? resolveQuotaForAgent(paneAgent, data.quota, now, data.cliTools).quota : undefined}
               quotaMode={quotaMode}
               onOpenQuotaPopover={() => setQuotaPopoverOpen((v) => !v)}
               context={id ? data.context?.[id] : undefined}

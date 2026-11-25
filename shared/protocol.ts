@@ -523,6 +523,8 @@ export interface CliToolInfo {
   capabilities: string[];
   limitations?: string;
   promptArg: 'positional' | 'none';
+  quotaAgent?: 'codex'; // vendor family for icon/badge/accent when a custom CLI is recognized as Codex
+  quotaKey?: AgentKind; // authoritative quota bucket key in Snapshot.quota ('codex' when sharing default CODEX_HOME, or tool.id for an isolated CODEX_HOME); never contains local paths
 }
 
 export interface CliScanResult {
@@ -853,6 +855,14 @@ export const AGENT_LABEL: Partial<Record<string, string>> = {
 export function agentLabel(agent: AgentKind, cliTools?: readonly Pick<CliToolInfo, 'id' | 'label'>[]): string {
   const fromTools = cliTools?.find((t) => t.id === agent)?.label;
   return fromTools ?? AGENT_LABEL[agent] ?? agent;
+}
+
+export function quotaVendorOf(agent: AgentKind, cliTools?: readonly Pick<CliToolInfo, 'id' | 'quotaAgent'>[]): AgentKind {
+  return cliTools?.find((t) => t.id === agent)?.quotaAgent ?? agent;
+}
+
+export function quotaKeyOf(agent: AgentKind, cliTools?: readonly Pick<CliToolInfo, 'id' | 'quotaKey'>[]): AgentKind {
+  return cliTools?.find((t) => t.id === agent)?.quotaKey ?? agent;
 }
 
 export interface SwitchAgentBody {
@@ -1396,7 +1406,7 @@ export type ServerMsg =
   | { t: 'settings'; settings: Settings }
   | { t: 'clis'; agents: AgentKind[]; cliTools: CliToolInfo[] }
   | { t: 'git'; projectId: string; git: GitInfo | null } // sent only when the value changed
-  | { t: 'quota'; agent: AgentKind; quota: QuotaInfo } // sent only when the windows changed
+  | { t: 'quota'; agent: AgentKind; quota: QuotaInfo | null } // sent only when the windows changed or a custom bucket was cleared
   | { t: 'telemetry'; telemetry: TelemetrySummary } // sent when token usage / cache / speed changes
   | { t: 'context'; sessionId: string; context: SessionContext | null } // live session context window update
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update

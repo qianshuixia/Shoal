@@ -149,6 +149,7 @@ export interface MobileHandlers {
   sessions: SessionManager;
   activity: ActivityTracker;
   availableAgents(): AgentKind[];
+  onClientConnect?(): void;
   snapshot(): Snapshot;
   createTask(body: Record<string, unknown>): { task: Task; session: SessionInfo };
   renameTask(id: string, body: Record<string, unknown>): Task;
@@ -1419,6 +1420,7 @@ export function createMobileController(handlers: MobileHandlers) {
     });
 
     nextWss.on('connection', (ws: WebSocket, _req: http.IncomingMessage, deviceId: string, via: MobileRouteVia) => {
+      handlers.onClientConnect?.();
       let set = wsByDevice.get(deviceId);
       if (!set) {
         set = new Set();
@@ -1729,6 +1731,9 @@ export function createMobileController(handlers: MobileHandlers) {
       for (const [ws] of wsMeta) {
         if (ws.readyState === 1) ws.send(sanitized);
       }
+    },
+    clientCount(): number {
+      return wsMeta.size;
     },
     forwardMobileError(err: unknown) {
       return err instanceof MobileGatewayError ? { status: err.status, message: err.message, code: err.code } : null;

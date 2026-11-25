@@ -34,7 +34,9 @@ export interface BuiltinCliSpec {
 
 const DEEP_CAPS = ['Hooks 状态感知', '待验收卡片', '自动续接', 'Token 与额度统计', '跨 CLI 委派'];
 const GENERIC_CAPS = ['原生终端交互', '任务管理', '权限模式切换'];
+const GENERIC_CODEX_CAPS = [...GENERIC_CAPS, 'Codex 订阅额度'];
 const GENERIC_LIMITS = '未深度适配：不支持自动状态感知（工作中/待验收卡片）、自动对话续接、Token 统计与跨 CLI 自动委派';
+const GENERIC_CODEX_LIMITS = '未深度适配：不支持自动状态感知（工作中/待验收卡片）、自动对话续接、Token 统计与跨 CLI 自动委派；已识别为 Codex，支持显示订阅额度';
 
 // Curated built-in AI coding CLI catalog. Every fullAccessArgs entry is verified against official CLI --help or docs;
 // CLIs without a verified interactive skip-permission flag keep fullAccessArgs: [] with an explicit fullAccessNote.
@@ -338,10 +340,14 @@ export function resolveCommandPath(cmd: string, c: CliEnv = {}): string | null {
 const SHIM_RUNNER_BASENAMES = new Set(['node.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe']);
 const SHIM_NODE_CALL_RE = /^@?(?:call\s+)?(?:"%_prog%"|node(?:\.exe)?|"(?:%dp0%|%~dp0)[\\/]?node\.exe"|"[A-Za-z]:[\\/][^"\r\n]*[\\/]node\.exe")\s+"([^"\r\n]+\.(?:[mc]?js))"\s+%\*\s*$/i;
 const SHIM_EXE_CALL_RE = /^@?(?:call\s+)?"([^"\r\n]+\.exe)"\s+%\*\s*$/i;
+const SHIM_ALLOWED_SET_VARS = new Set(['_prog', 'dp0', 'pathext', 'node_path', '_bin', '_basedir', 'local_node_path']);
+const SHIM_SET_VAR_RE = /^@?set\s+(?:"([A-Za-z_][A-Za-z0-9_]*)=|([A-Za-z_][A-Za-z0-9_]*)=)/i;
+const SHIM_IF_EXIST_RE = /^@?if\s+(?:not\s+)?exist\s+(?:"[^"\r\n()]+"|[^\s()]+)(?:\s*\(|\s+set\s+(?:"([A-Za-z_][A-Za-z0-9_]*)=|([A-Za-z_][A-Za-z0-9_]*)=)[^\r\n()]+)?$/i;
+const SHIM_BOILERPLATE_SEG_RE = /^@?(?:echo\s+off|setlocal|endlocal|goto\b|else\b|exit\s+\/b\b|call\s+:[A-Za-z0-9_.-]+|title\b|set\b|:[A-Za-z0-9_.-]+)(?:\s|$)/i;
 
 // Unwraps Windows .cmd/.bat shims (npm, pnpm, yarn, scoop, etc.) to their underlying JS entrypoint or native .exe
-// when the batch line is a pure pass-through (`%*` with no extra fixed arguments), so node-pty launches Node or the
-// binary directly without cmd.exe shell injection / quoting failures.
+// ONLY when every statement in the batch script matches pure pass-through shim boilerplate (no custom env vars like
+// CODEX_HOME, no `cd`/`pushd`/arbitrary `if` branches, and no extra fixed arguments).
 export function unwrapNpmCmdShim(cmdPath: string): string | null {
   const lower = cmdPath.toLowerCase();
   if (!lower.endsWith('.cmd') && !lower.endsWith('.bat')) return null;
@@ -370,30 +376,56 @@ export function unwrapNpmCmdShim(cmdPath: string): string | null {
     return isRegularFile(target) ? target : null;
   };
 
+  let matchedTarget: string | null = null;
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || /^(@?rem\b|::)/i.test(line) || !line.includes('%*')) continue;
-    // Standard npm shims chain `endLocal & ... || title ... & set PATHEXT=... & "%_prog%" "%dp0%\...\cli.js" %*`.
-    // Inspect the last command segment carrying `%*` so `IF EXIST` / `SET` clauses are never matched.
+    if (!line || /^(@?rem\b|::)/i.test(line)) continue;
     const segments = line.split(/(?:\|\||&&|&)/);
-    for (let i = segments.length - 1; i >= 0; i--) {
-      const seg = segments[i].trim();
-      if (!seg.includes('%*')) continue;
-      const jsMatch = seg.match(SHIM_NODE_CALL_RE);
-      if (jsMatch) {
-        const hit = resolveTarget(jsMatch[1]);
-        if (hit) return hit;
+    for (const rawSeg of segments) {
+      const seg = rawSeg.trim().replace(/^[()]+|[()]+$/g, '').trim();
+      if (!seg) continue;
+      // Reject any custom `set VAR=...` (such as CODEX_HOME, OPENAI_API_KEY, etc.) so wrapper env setup is never bypassed.
+      const setMatch = seg.match(SHIM_SET_VAR_RE);
+      if (setMatch) {
+        const varName = (setMatch[1] ?? setMatch[2] ?? '').toLowerCase();
+        if (!SHIM_ALLOWED_SET_VARS.has(varName)) return null;
+        continue;
       }
-      const exeMatch = seg.match(SHIM_EXE_CALL_RE);
-      if (exeMatch) {
-        const hit = resolveTarget(exeMatch[1]);
-        if (hit) return hit;
+      if (seg.includes('%*')) {
+        const jsMatch = seg.match(SHIM_NODE_CALL_RE);
+        if (jsMatch) {
+          const hit = resolveTarget(jsMatch[1]);
+          if (hit) {
+            if (matchedTarget && matchedTarget !== hit) return null;
+            matchedTarget = hit;
+            continue;
+          }
+        }
+        const exeMatch = seg.match(SHIM_EXE_CALL_RE);
+        if (exeMatch) {
+          const hit = resolveTarget(exeMatch[1]);
+          if (hit) {
+            if (matchedTarget && matchedTarget !== hit) return null;
+            matchedTarget = hit;
+            continue;
+          }
+        }
+        return null;
       }
-      break;
+      // Allow only npm/pnpm-style `IF EXIST <path> (` or `IF EXIST <path> SET <allowed>=...` guards; reject arbitrary `if` commands.
+      if (/^@?if\b/i.test(seg)) {
+        const ifMatch = seg.match(SHIM_IF_EXIST_RE);
+        if (!ifMatch) return null;
+        const varName = (ifMatch[1] ?? ifMatch[2] ?? '').toLowerCase();
+        if (varName && !SHIM_ALLOWED_SET_VARS.has(varName)) return null;
+        continue;
+      }
+      // Reject non-boilerplate commands (e.g. `cd`, `pushd`, `call other.cmd`, `echo ...`) so wrapper behavior is preserved.
+      if (!SHIM_BOILERPLATE_SEG_RE.test(seg)) return null;
     }
   }
 
-  return null;
+  return matchedTarget;
 }
 
 // Prepares safe file + args (or verbatim Windows command line for non-npm .cmd/.bat) for node-pty.
@@ -680,6 +712,582 @@ function cachedCustomPath(command: string, c: CliEnv): string | null {
   return resolved;
 }
 
+const CODEX_NAME_TOKEN_RE = /(?:^|[-_.])codex(?:[-_.]|$)/i;
+const CODEX_PKG_RE = /@openai[\\/]codex(?:@[^\s"']+)?(?:[\\/]|$)/i;
+const CODEX_EXEC_TOKEN_RE = /^(?:(?:[A-Za-z]:[\\/]|\/|\.\.?[\\/]|(?:%dp0%|%~dp0)[\\/]*)?[^"\r\n]*[\\/])?codex(?:\.(?:exe|cmd|bat|js|mjs|cjs))?$/i;
+const CODEX_RUNNER_COMMANDS = new Set([
+  'node', 'npx', 'pnpm', 'pnpx', 'yarn', 'bun', 'bunx', 'deno', 'corepack',
+  'wsl', 'env', 'cmd', 'bash', 'sh', 'zsh', 'pwsh', 'powershell',
+  'volta', 'mise', 'asdf', 'fnm', 'nvm',
+]);
+const CODEX_WRAPPER_EXT_RE = /\.(?:cmd|bat|sh)$/i;
+const STRIP_EXEC_EXT_RE = /\.(?:exe|cmd|bat|com|js|mjs|cjs|sh)$/i;
+const BATCH_SET_CODEX_HOME_RE = /^@?set\s+(?:"CODEX_HOME=([^"\r\n]*)"|CODEX_HOME=([^&\r\n]*))$/i;
+const SHELL_VAR_ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+
+function pathBaseNoExt(raw: string): string {
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '');
+  const base = cleaned.split(/[\\/]/).pop() ?? cleaned;
+  return base.replace(STRIP_EXEC_EXT_RE, '');
+}
+
+function isCodexPathOrName(raw: string): boolean {
+  const cleaned = raw.trim().replace(/^["']|["']$/g, '');
+  if (!cleaned) return false;
+  if (CODEX_PKG_RE.test(cleaned)) return true;
+  return CODEX_NAME_TOKEN_RE.test(pathBaseNoExt(cleaned));
+}
+
+function isCodexRunnerCommand(command: string): boolean {
+  return CODEX_RUNNER_COMMANDS.has(pathBaseNoExt(command).toLowerCase());
+}
+
+function isCodexExecutableToken(token: string): boolean {
+  const cleaned = token.trim().replace(/^["']|["']$/g, '');
+  if (!cleaned) return false;
+  return CODEX_PKG_RE.test(cleaned) || CODEX_EXEC_TOKEN_RE.test(cleaned);
+}
+
+const NODE_VALUE_FLAGS = new Set([
+  '-r', '--require', '--import', '--loader', '--experimental-loader', '--env-file', '--env-file-if-exists',
+  '--conditions', '-C', '--diagnostic-dir', '--heapsnapshot-signal', '--inspect-port', '--max-old-space-size',
+  '--redirect-warnings', '--title', '-c', '--eval', '-e', '-p', '--print',
+]);
+const NPX_VALUE_FLAGS = new Set(['-p', '--package', '-c', '--call', '--userconfig', '--cache', '--registry']);
+const WSL_VALUE_FLAGS = new Set(['-d', '--distribution', '-u', '--user', '--cd', '--shell-type']);
+
+function isCodexArgs(command: string, args?: readonly string[], depth = 0): boolean {
+  if (!args?.length || depth > 3) return false;
+  const runner = pathBaseNoExt(command).toLowerCase();
+  if (!CODEX_RUNNER_COMMANDS.has(runner)) return false;
+
+  if (runner === 'node' || runner === 'bun' || runner === 'deno') {
+    let i = 0;
+    if (runner === 'bun' && args[0] === 'run') i = 1;
+    if (runner === 'deno' && args[0] === 'run') i = 1;
+    for (; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') { i++; break; }
+      if (a.startsWith('-')) {
+        if (!a.includes('=') && NODE_VALUE_FLAGS.has(a)) i++;
+        continue;
+      }
+      return isCodexExecutableToken(a);
+    }
+    return i < args.length ? isCodexExecutableToken(args[i]) : false;
+  }
+
+  if (runner === 'npx' || runner === 'bunx' || runner === 'pnpx') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === '--') {
+        const next = args[i + 1];
+        return next ? isCodexExecutableToken(next) : false;
+      }
+      if (a === '-p' || a === '--package') {
+        const pkg = args[i + 1];
+        if (pkg && isCodexExecutableToken(pkg)) return true;
+        i++;
+        continue;
+      }
+      if (a.startsWith('--package=')) {
+        if (isCodexExecutableToken(a.slice('--package='.length))) return true;
+        continue;
+      }
+      if (a.startsWith('-')) {
+        if (!a.includes('=') && NPX_VALUE_FLAGS.has(a)) i++;
+        continue;
+      }
+      return isCodexExecutableToken(a);
+    }
+    return false;
+  }
+
+  if (runner === 'pnpm' || runner === 'yarn') {
+    let i = 0;
+    while (i < args.length && args[i].startsWith('-')) i++;
+    const sub = args[i]?.toLowerCase();
+    if (sub !== 'dlx' && sub !== 'exec' && sub !== 'x') return false;
+    i++;
+    while (i < args.length && args[i].startsWith('-')) {
+      if ((args[i] === '--package' || args[i] === '-p') && args[i + 1]) {
+        if (isCodexExecutableToken(args[i + 1])) return true;
+        i += 2;
+        continue;
+      }
+      i++;
+    }
+    const target = args[i];
+    return target ? (isCodexExecutableToken(target) || isCodexArgs(target, args.slice(i + 1), depth + 1)) : false;
+  }
+
+  if (runner === 'volta' || runner === 'mise' || runner === 'asdf' || runner === 'fnm' || runner === 'nvm' || runner === 'corepack') {
+    let i = 0;
+    while (i < args.length && args[i].startsWith('-')) i++;
+    const sub = args[i]?.toLowerCase();
+    if (sub === 'run' || sub === 'exec' || sub === 'x') i++;
+    while (i < args.length && args[i].startsWith('-')) {
+      if (!args[i].includes('=') && (args[i] === '--node' || args[i] === '--npm' || args[i] === '--yarn')) i++;
+      i++;
+    }
+    if (args[i] === '--') i++;
+    const target = args[i];
+    return target ? (isCodexExecutableToken(target) || isCodexArgs(target, args.slice(i + 1), depth + 1)) : false;
+  }
+
+  if (runner === 'wsl') {
+    let i = 0;
+    while (i < args.length) {
+      const a = args[i];
+      if (a === '--' || a === '-e' || a === '--exec') { i++; break; }
+      if (a.startsWith('-')) {
+        if (!a.includes('=') && WSL_VALUE_FLAGS.has(a)) i++;
+        i++;
+        continue;
+      }
+      break;
+    }
+    const target = args[i];
+    return target ? (isCodexExecutableToken(target) || isCodexArgs(target, args.slice(i + 1), depth + 1)) : false;
+  }
+
+  if (runner === 'env') {
+    let i = 0;
+    while (i < args.length) {
+      const a = args[i];
+      if (a === '--') { i++; break; }
+      if (a === '-u' || a === '--unset') { i += 2; continue; }
+      if (a.startsWith('-') || SHELL_VAR_ASSIGN_RE.test(a)) { i++; continue; }
+      break;
+    }
+    const target = args[i];
+    return target ? (isCodexExecutableToken(target) || isCodexArgs(target, args.slice(i + 1), depth + 1)) : false;
+  }
+
+  // Shells (`cmd`, `bash`, `sh`, `zsh`, `pwsh`, `powershell`): inspect command argument only when `-c` / `/c` / `/k` / `-Command` or direct script path is given.
+  if (runner === 'cmd' || runner === 'bash' || runner === 'sh' || runner === 'zsh' || runner === 'pwsh' || runner === 'powershell') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      const al = a.toLowerCase();
+      if (al === '/c' || al === '/k' || al === '-c' || al === '-lc' || al === '-command') {
+        const inline = args.slice(i + 1).join(' ');
+        for (const seg of splitCommandSegments(inline)) {
+          const toks = tokenizeCommandSegment(seg);
+          const first = toks[0]?.text ?? '';
+          if (first && (isCodexExecutableToken(first) || isCodexArgs(first, toks.slice(1).map(t => t.text), depth + 1))) {
+            return true;
+          }
+        }
+        return false;
+      }
+      if (a.startsWith('-') || a.startsWith('/')) continue;
+      return isCodexExecutableToken(a);
+    }
+    return false;
+  }
+
+  return false;
+}
+
+interface ShellToken {
+  text: string;
+  raw: string;
+}
+
+function tokenizeCommandSegment(seg: string): ShellToken[] {
+  const tokens: ShellToken[] = [];
+  let cur = '';
+  let raw = '';
+  let quote: '"' | "'" | null = null;
+  let hasToken = false;
+  for (let i = 0; i < seg.length; i++) {
+    const ch = seg[i];
+    if (quote) {
+      raw += ch;
+      if (ch === quote) {
+        quote = null;
+      } else if (ch === '\\' && quote === '"' && i + 1 < seg.length && (seg[i + 1] === '"' || seg[i + 1] === '\\' || seg[i + 1] === '$')) {
+        const next = seg[++i];
+        raw += next;
+        cur += next;
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      raw += ch;
+      hasToken = true;
+    } else if (/\s/.test(ch)) {
+      if (hasToken) {
+        tokens.push({ text: cur, raw });
+        cur = '';
+        raw = '';
+        hasToken = false;
+      }
+    } else {
+      cur += ch;
+      raw += ch;
+      hasToken = true;
+    }
+  }
+  if (hasToken) tokens.push({ text: cur, raw });
+  return tokens;
+}
+
+function splitCommandSegments(line: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+      else if (ch === '\\' && quote === '"' && i + 1 < line.length) cur += line[++i];
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if ((ch === '&' || ch === '|') && line[i + 1] === ch) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+      i++;
+      continue;
+    }
+    if (ch === '&' || ch === ';' || ch === '|') {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+function isAbsoluteAny(p: string): boolean {
+  return path.isAbsolute(p) || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('/');
+}
+
+function expandBatchCodexHome(raw: string, scriptDir: string, env: NodeJS.ProcessEnv, home: string): string | null {
+  let out = raw.trim().replace(/^"|"$/g, '');
+  if (!out) return null;
+  const dp0 = scriptDir.endsWith('\\') || scriptDir.endsWith('/') ? scriptDir : `${scriptDir}${path.sep}`;
+  out = out.replace(/%~dp0|%dp0%/gi, dp0);
+  out = out.replace(/%(USERPROFILE|HOME|APPDATA|LOCALAPPDATA)%/gi, (_, key: string) => {
+    const upper = key.toUpperCase();
+    if (upper === 'USERPROFILE' || upper === 'HOME') return env[upper] ?? env.USERPROFILE ?? env.HOME ?? home;
+    return env[upper] ?? `%${key}%`;
+  });
+  if (/%[^%]+%/.test(out)) return null;
+  if (!isAbsoluteAny(out)) return null;
+  return path.normalize(out);
+}
+
+function expandShellCodexHomeRaw(rawRhs: string, env: NodeJS.ProcessEnv, home: string): string | null {
+  const trimmed = rawRhs.trim();
+  if (!trimmed) return null;
+  const homeVal = env.HOME ?? home;
+  let out = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else out += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') { quote = null; continue; }
+      if (ch === '\\' && i + 1 < trimmed.length && (trimmed[i + 1] === '"' || trimmed[i + 1] === '\\' || trimmed[i + 1] === '$')) {
+        out += trimmed[++i];
+        continue;
+      }
+      if (ch === '$') {
+        if (trimmed.startsWith('${HOME}', i)) { out += homeVal; i += 6; continue; }
+        if (/^\$HOME(?![A-Za-z0-9_])/.test(trimmed.slice(i))) { out += homeVal; i += 4; continue; }
+        return null; // unexpanded $VAR inside double quotes
+      }
+      out += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '\\' && i + 1 < trimmed.length) { out += trimmed[++i]; continue; }
+    if (i === 0 && ch === '~' && (trimmed.length === 1 || trimmed[1] === '/' || trimmed[1] === '\\')) {
+      out += homeVal;
+      continue;
+    }
+    if (ch === '$') {
+      if (trimmed.startsWith('${HOME}', i)) { out += homeVal; i += 6; continue; }
+      if (/^\$HOME(?![A-Za-z0-9_])/.test(trimmed.slice(i))) { out += homeVal; i += 4; continue; }
+      return null; // unexpanded $VAR
+    }
+    out += ch;
+  }
+  if (!out || !isAbsoluteAny(out)) return null;
+  return path.normalize(out);
+}
+
+const WRAPPER_CACHE_MAX = 64;
+const wrapperCodexCache = new Map<string, { isCodex: boolean; codexHome?: string }>();
+
+function inspectWrapperForCodex(resolvedPath: string, env: NodeJS.ProcessEnv, home: string): { isCodex: boolean; codexHome?: string } {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolvedPath);
+    if (!stat.isFile() || stat.size === 0 || stat.size > 16 * 1024) return { isCodex: false };
+  } catch {
+    return { isCodex: false };
+  }
+  const inheritedExported = typeof env.CODEX_HOME === 'string';
+  const cacheKey = `${resolvedPath}|${stat.ino}|${stat.mtimeMs}|${stat.ctimeMs}|${stat.size}|${home}|${env.USERPROFILE ?? ''}|${env.HOME ?? ''}|${env.APPDATA ?? ''}|${env.LOCALAPPDATA ?? ''}|${inheritedExported ? '1' : '0'}`;
+  const cached = wrapperCodexCache.get(cacheKey);
+  if (cached) return cached;
+
+  let text: string;
+  try {
+    const buf = fs.readFileSync(resolvedPath);
+    if (buf.includes(0)) return { isCodex: false };
+    text = buf.toString('utf8');
+  } catch {
+    return { isCodex: false };
+  }
+  const isScript = CODEX_WRAPPER_EXT_RE.test(resolvedPath) || text.startsWith('#!');
+  if (!isScript) return { isCodex: false };
+
+  const scriptDir = path.dirname(resolvedPath);
+  const isBatch = /\.(?:cmd|bat)$/i.test(resolvedPath);
+  let isCodex = false;
+  let activeCodexHome: string | undefined; // batch: set CODEX_HOME; shell: exported CODEX_HOME
+  let shellLocalCodexHome: string | undefined; // shell: assigned but not yet exported CODEX_HOME
+  let shellCodexHomeExported = inheritedExported;
+  let effectiveCodexHome: string | undefined;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (isBatch ? /^(@?rem\b|::)/i.test(line) : line.startsWith('#')) continue;
+
+    for (const seg of splitCommandSegments(line)) {
+      if (isBatch) {
+        const setMatch = seg.match(BATCH_SET_CODEX_HOME_RE);
+        if (setMatch) {
+          const val = setMatch[1] ?? setMatch[2] ?? '';
+          activeCodexHome = val.trim() ? (expandBatchCodexHome(val, scriptDir, env, home) ?? undefined) : undefined;
+          continue;
+        }
+        const tokens = tokenizeCommandSegment(seg);
+        let idx = 0;
+        if (tokens[idx]?.text.startsWith('@')) tokens[idx] = { ...tokens[idx], text: tokens[idx].text.slice(1) };
+        if (tokens[idx] && tokens[idx].text.toLowerCase() === 'call') idx++;
+        const cmd = tokens[idx]?.text ?? '';
+        const rest = tokens.slice(idx + 1).map(t => t.text);
+        if (cmd && (isCodexExecutableToken(cmd) || isCodexArgs(cmd, rest))) {
+          isCodex = true;
+          effectiveCodexHome = activeCodexHome;
+        }
+      } else {
+        const tokens = tokenizeCommandSegment(seg);
+        if (!tokens.length) continue;
+        // Handle `export CODEX_HOME=...`, `export CODEX_HOME`, and `unset CODEX_HOME`
+        if (tokens[0].text === 'export') {
+          for (const t of tokens.slice(1)) {
+            if (t.text === 'CODEX_HOME') {
+              shellCodexHomeExported = true;
+              activeCodexHome = shellLocalCodexHome;
+              continue;
+            }
+            const m = t.raw.match(SHELL_VAR_ASSIGN_RE);
+            if (m && m[1] === 'CODEX_HOME') {
+              const val = expandShellCodexHomeRaw(m[2], env, home) ?? undefined;
+              shellCodexHomeExported = true;
+              shellLocalCodexHome = val;
+              activeCodexHome = val;
+            }
+          }
+          continue;
+        }
+        if (tokens[0].text === 'unset') {
+          if (tokens.slice(1).some(t => t.text === 'CODEX_HOME')) {
+            shellCodexHomeExported = false;
+            shellLocalCodexHome = undefined;
+            activeCodexHome = undefined;
+          }
+          continue;
+        }
+
+        // Parse optional leading `VAR=VAL` assignments, `exec`/`command`/`nohup`, and `env [VAR=VAL | -u VAR]...`
+        let idx = 0;
+        let inlineCodexHome: string | undefined;
+        let inlineSet = false;
+        let inlineUnset = false;
+        while (idx < tokens.length) {
+          const t = tokens[idx];
+          const m = t.raw.match(SHELL_VAR_ASSIGN_RE);
+          if (m) {
+            if (m[1] === 'CODEX_HOME') {
+              inlineCodexHome = expandShellCodexHomeRaw(m[2], env, home) ?? undefined;
+              inlineSet = true;
+              inlineUnset = false;
+            }
+            idx++;
+            continue;
+          }
+          break;
+        }
+        if (idx >= tokens.length) {
+          // Pure `CODEX_HOME=...` without a command: exported if already exported (including inherited env) or later `export CODEX_HOME`.
+          if (inlineSet) {
+            shellLocalCodexHome = inlineCodexHome;
+            if (shellCodexHomeExported) activeCodexHome = inlineCodexHome;
+          }
+          continue;
+        }
+
+        while (idx < tokens.length) {
+          const word = tokens[idx].text;
+          if (word === 'exec' || word === 'command' || word === 'nohup') {
+            idx++;
+            continue;
+          }
+          if (word === 'env') {
+            idx++;
+            while (idx < tokens.length) {
+              const et = tokens[idx];
+              if (et.text === '-i' || et.text === '--ignore-environment') {
+                inlineCodexHome = undefined;
+                inlineUnset = true;
+                idx++;
+                continue;
+              }
+              if ((et.text === '-u' || et.text === '--unset') && idx + 1 < tokens.length) {
+                if (tokens[idx + 1].text === 'CODEX_HOME') {
+                  inlineCodexHome = undefined;
+                  inlineUnset = true;
+                }
+                idx += 2;
+                continue;
+              }
+              if (et.text === '--') {
+                idx++;
+                break;
+              }
+              const em = et.raw.match(SHELL_VAR_ASSIGN_RE);
+              if (em) {
+                if (em[1] === 'CODEX_HOME') {
+                  inlineCodexHome = expandShellCodexHomeRaw(em[2], env, home) ?? undefined;
+                  inlineUnset = false;
+                }
+                idx++;
+                continue;
+              }
+              break;
+            }
+            continue;
+          }
+          break;
+        }
+
+        const cmd = tokens[idx]?.text ?? '';
+        const rest = tokens.slice(idx + 1).map(t => t.text);
+        if (cmd && (isCodexExecutableToken(cmd) || isCodexArgs(cmd, rest))) {
+          isCodex = true;
+          effectiveCodexHome = inlineCodexHome ?? (inlineUnset ? undefined : activeCodexHome);
+        }
+      }
+    }
+  }
+  const res = { isCodex, ...(isCodex && effectiveCodexHome ? { codexHome: effectiveCodexHome } : {}) };
+  if (wrapperCodexCache.size >= WRAPPER_CACHE_MAX) {
+    const oldest = wrapperCodexCache.keys().next().value;
+    if (oldest !== undefined) wrapperCodexCache.delete(oldest);
+  }
+  wrapperCodexCache.set(cacheKey, res);
+  return res;
+}
+
+export interface CustomCodexDetection {
+  isCodex: boolean;
+  codexHome?: string;
+}
+
+// Recognizes whether a user-defined custom CLI wraps or launches OpenAI Codex CLI (and extracts an explicit CODEX_HOME
+// from .cmd/.bat/.sh wrapper scripts when present). Pure read-only inspection; never executes untrusted files.
+export function detectCustomCodex(
+  custom: CustomCliConfig,
+  resolvedPath: string | null,
+  c: CliEnv = {},
+): CustomCodexDetection {
+  const env = c.env ?? process.env;
+  const home = c.home ?? os.homedir();
+  const wrapper = resolvedPath ? inspectWrapperForCodex(resolvedPath, env, home) : { isCodex: false };
+
+  let isCodex = wrapper.isCodex;
+  if (!isCodex && resolvedPath) {
+    const unwrapped = unwrapNpmCmdShim(resolvedPath);
+    if (unwrapped && isCodexPathOrName(unwrapped)) isCodex = true;
+  }
+  if (!isCodex && resolvedPath) {
+    try {
+      const real = fs.realpathSync(resolvedPath);
+      if (isCodexPathOrName(real)) isCodex = true;
+    } catch { /* ignore */ }
+  }
+  if (!isCodex && (isCodexPathOrName(custom.command) || (resolvedPath ? isCodexPathOrName(resolvedPath) : false))) {
+    isCodex = true;
+  }
+  if (!isCodex && (isCodexArgs(custom.command, custom.fullAccessArgs) || isCodexArgs(custom.command, custom.normalArgs))) {
+    isCodex = true;
+  }
+  if (!isCodex && CODEX_NAME_TOKEN_RE.test(custom.id)) {
+    isCodex = true;
+  }
+  return { isCodex, ...(isCodex && wrapper.codexHome ? { codexHome: wrapper.codexHome } : {}) };
+}
+
+function normHomeKey(dir: string, platform: NodeJS.Platform): string {
+  const resolved = path.resolve(dir).replace(/[\\/]+$/, '');
+  return platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function isDistinctCodexHome(codexHome: string | undefined, c: CliEnv): boolean {
+  if (!codexHome) return false;
+  const platform = c.platform ?? process.platform;
+  const env = c.env ?? process.env;
+  const home = c.home ?? os.homedir();
+  const defaultHome = path.resolve(env.CODEX_HOME || path.join(home, '.codex'));
+  return normHomeKey(codexHome, platform) !== normHomeKey(defaultHome, platform);
+}
+
+// Resolves which CODEX_HOME directories should be scanned for subscription quota:
+// - hasDefaultCodex: true when built-in `codex` or any enabled custom Codex CLI uses the default CODEX_HOME.
+// - customHomes: enabled custom Codex CLIs whose wrapper script explicitly sets a distinct CODEX_HOME.
+export function resolveCustomCodexHomes(
+  settings: Settings,
+  c: CliEnv = {},
+): { hasDefaultCodex: boolean; customHomes: { id: string; codexHome: string }[] } {
+  const tools = buildCliTools(settings, c);
+  const customById = new Map((settings.customClis ?? []).map((x) => [x.id, x]));
+
+  let hasDefaultCodex = tools.some((t) => t.id === 'codex' && t.enabled && t.usable);
+  const customHomes: { id: string; codexHome: string }[] = [];
+
+  for (const t of tools) {
+    if (t.source !== 'custom' || t.quotaAgent !== 'codex' || !t.enabled || !t.usable) continue;
+    const cfg = customById.get(t.id);
+    const det = cfg ? detectCustomCodex(cfg, t.path, c) : { isCodex: true };
+    if (det.codexHome && isDistinctCodexHome(det.codexHome, c)) {
+      customHomes.push({ id: t.id, codexHome: det.codexHome });
+    } else {
+      hasDefaultCodex = true;
+    }
+  }
+  return { hasDefaultCodex, customHomes };
+}
+
 export function buildCliTools(settings: Settings, c: CliEnv = {}): CliToolInfo[] {
   const prefs = settings.cliPrefs;
   const platform = c.platform ?? process.platform;
@@ -730,6 +1338,10 @@ export function buildCliTools(settings: Settings, c: CliEnv = {}): CliToolInfo[]
     const fullAccessArgs = [...(custom.fullAccessArgs ?? [])];
     const normalArgs = [...(custom.normalArgs ?? [])];
     const isBatch = isCmdBatchPath(resolved, platform);
+    const codexDet = detectCustomCodex(custom, resolved, c);
+    const quotaKey = codexDet.isCodex
+      ? (isDistinctCodexHome(codexDet.codexHome, c) ? custom.id : 'codex')
+      : undefined;
     tools.push({
       id: custom.id,
       label: custom.label,
@@ -746,9 +1358,10 @@ export function buildCliTools(settings: Settings, c: CliEnv = {}): CliToolInfo[]
       normalArgs,
       supportsFullAccessFlag: fullAccessArgs.length > 0,
       ...(fullAccessArgs.length === 0 ? { fullAccessNote: '未配置全权启动参数，全放开与正常模式启动参数相同' } : {}),
-      capabilities: GENERIC_CAPS,
-      limitations: GENERIC_LIMITS,
+      capabilities: codexDet.isCodex ? [...GENERIC_CODEX_CAPS] : [...GENERIC_CAPS],
+      limitations: codexDet.isCodex ? GENERIC_CODEX_LIMITS : GENERIC_LIMITS,
       promptArg: isBatch ? 'none' : (custom.promptArg ?? 'positional'),
+      ...(codexDet.isCodex ? { quotaAgent: 'codex' as const, quotaKey } : {}),
     });
   }
 

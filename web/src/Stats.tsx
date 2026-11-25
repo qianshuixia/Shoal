@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { usePrivacy } from './privacy.ts';
 import type { AgentKind, CliToolInfo, QuotaInfo, UsageCounts, UsageReport, UsageRow } from '../../shared/protocol.ts';
-import { agentLabel, usageTotal } from '../../shared/protocol.ts';
+import { agentLabel, quotaKeyOf, usageTotal } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
 import { QuotaDashboard } from './QuotaPanel.tsx';
-import { QUOTA_AGENTS, type QuotaDisplayMode } from './quota.ts';
+import { liveWindows, quotaDisplayAgents, type QuotaDisplayMode } from './quota.ts';
 import { fmtPct, fmtTokens, hitRate } from './util.ts';
 
 type Preset = 'today' | '7d' | '30d' | 'all' | 'custom';
@@ -102,7 +102,11 @@ export function StatsView({
   const total = report?.total;
   const rows = report?.[group] ?? [];
   const sum = total ? usageTotal(total) : 0;
-  const providerOptions = QUOTA_AGENTS.filter((a) => a !== 'fake' && (agents.includes(a) || !!quota[a]));
+  const enabledQuotaKeys = new Set(agents.map((id) => quotaKeyOf(id, cliTools)));
+  const providerOptions = quotaDisplayAgents(quota, cliTools).filter(
+    (a) => a !== 'fake' && (enabledQuotaKeys.has(a) || liveWindows(quota[a], now).length > 0),
+  );
+  const effectiveProviderFilter = providerFilter === 'all' || providerOptions.includes(providerFilter) ? providerFilter : 'all';
 
   return (
     <section className="stats" data-testid="stats-view" hidden={!visible}>
@@ -117,7 +121,7 @@ export function StatsView({
                 <select
                   className="stats-provider-select"
                   aria-label="按厂商筛选"
-                  value={providerFilter}
+                  value={effectiveProviderFilter}
                   onChange={(e) => setProviderFilter(e.target.value)}
                 >
                   <option value="all">全部厂商</option>
@@ -152,7 +156,7 @@ export function StatsView({
             cliTools={cliTools}
             now={now}
             mode={quotaMode}
-            providerFilter={providerFilter}
+            providerFilter={effectiveProviderFilter}
             compact={section === 'all'}
             refreshing={refreshingQuota}
             onModeChange={onQuotaModeChange}

@@ -1096,7 +1096,7 @@ function CliToolsSection({
         </div>
         <div className="cli-tier-row">
           <span className="cli-tier-badge tier-generic">通用终端</span>
-          <span>其余扫描到的 AI CLI 与自定义 CLI：支持原生终端交互、任务管理与权限模式切换；暂不支持自动状态感知、结果卡片、自动续接与 Token 统计。</span>
+          <span>其余扫描到的 AI CLI 与自定义 CLI：支持原生终端交互、任务管理与权限模式切换；暂不支持自动状态感知、结果卡片、自动续接与 Token 统计（识别为 Codex 的自定义 CLI 支持显示订阅额度）。</span>
         </div>
         <div className="cli-tier-foot">
           默认全部以「全部放开」启动，修改后对新启动或续接的会话生效；跨 CLI 委派时，子 agent 自动继承主 agent 当前的权限模式。
@@ -1209,6 +1209,9 @@ function CliToolsSection({
                       {tool.tier === 'deep' ? '深度适配' : '通用终端'}
                     </span>
                     {tool.source === 'custom' && <span className="settings-inline-badge">自定义</span>}
+                    {tool.source === 'custom' && tool.quotaAgent === 'codex' && (
+                      <span className="settings-inline-badge" data-testid={`cli-codex-quota-badge-${tool.id}`}>Codex 订阅额度</span>
+                    )}
                     {tool.version && <span className="settings-inline-badge">v{tool.version}</span>}
                     {!tool.usable && <span className="settings-inline-badge is-warn">{tool.installed ? '不可用' : '未找到'}</span>}
                   </div>

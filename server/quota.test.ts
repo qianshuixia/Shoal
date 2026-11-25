@@ -4,8 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   createQuotaStore, detectLimit, inferWindowMinutes, parseAgyQuota, parseClaudeRateLimits,
-  parseCodexQuotaInfo, parseCodexRateLimits, parseStatusLineContext, readCodexQuota, readResetsAt, windowLabel,
+  parseCodexQuotaInfo, parseCodexRateLimits, parseStatusLineContext, readCodexQuota, readLatestCodexQuotaFromDisk, readResetsAt, windowLabel,
 } from './quota.ts';
+import type { CliToolInfo, QuotaInfo } from '../shared/protocol.ts';
+import { bestSwitchCandidate, quotaDisplayAgents, quotaTitle, resolveQuotaForAgent, vendorPlanBadge } from '../web/src/quota.ts';
 
 const MSG = "You've hit your session limit · resets 1:20am (Asia/Shanghai)";
 
@@ -240,5 +242,133 @@ describe('createQuotaStore', () => {
     expect(createQuotaStore(path.join(dir, 'mixed.json')).all()).toEqual({
       claude: { windows: [{ label: '5h', usedPercent: 1, resetsAt: 1793447357000, windowMinutes: 300 }], at: 5 },
     });
+  });
+});
+
+describe('readLatestCodexQuotaFromDisk & custom Codex quota helpers', () => {
+  it('picks the newest live rollout even past 24 empty rollouts and non-date directories, and invalidates cache on same-size overwrite', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-codex-disk-'));
+    // 8 non-date empty directories sorting alphabetically ahead of 2026 must not starve date dirs.
+    for (let i = 1; i <= 8; i++) fs.mkdirSync(path.join(home, 'sessions', `zzz-${i}`), { recursive: true });
+    const prevDay = path.join(home, 'sessions', '2026', '11', '24');
+    const todayDir = path.join(home, 'sessions', '2026', '11', '25');
+    fs.mkdirSync(prevDay, { recursive: true });
+    fs.mkdirSync(todayDir, { recursive: true });
+
+    const pastSec = Math.floor((Date.now() - 3_600_000) / 1000);
+    const futureSec = Math.floor((Date.now() + 3_600_000) / 1000);
+
+    // 25 rollouts today with null/expired rate_limits must not prevent falling back to yesterday's live rollout.
+    for (let i = 0; i < 24; i++) {
+      fs.writeFileSync(
+        path.join(todayDir, `rollout-2026-11-25T16-${String(i).padStart(2, '0')}-00-empty.jsonl`),
+        tc({ primary: null, secondary: null }) + '\n',
+      );
+    }
+    fs.writeFileSync(
+      path.join(todayDir, 'rollout-2026-11-25T16-59-00-expired.jsonl'),
+      tc({ primary: { used_percent: 99, window_minutes: 300, resets_at: pastSec }, secondary: null, plan_type: 'plus' }) + '\n',
+    );
+    const liveFile = path.join(prevDay, 'rollout-2026-11-24T23-00-00-live.jsonl');
+    fs.writeFileSync(
+      liveFile,
+      tc({ primary: { used_percent: 30, window_minutes: 300, resets_at: futureSec }, secondary: null, plan_type: 'pro' }) + '\n',
+    );
+
+    const first = readLatestCodexQuotaFromDisk(home);
+    expect(first?.plan).toBe('pro');
+    expect(first?.windows[0].usedPercent).toBe(30);
+
+    // Same-size overwrite (30 -> 40) updates ctime/mtime and must invalidate the cache.
+    const prevStat = fs.statSync(liveFile);
+    fs.writeFileSync(
+      liveFile,
+      tc({ primary: { used_percent: 40, window_minutes: 300, resets_at: futureSec }, secondary: null, plan_type: 'pro' }) + '\n',
+    );
+    // Even if mtime is held equal, Windows/POSIX overwrite updates ctime (or if same tick, bump mtime by 1ms).
+    const nextStat = fs.statSync(liveFile);
+    if (nextStat.ctimeMs === prevStat.ctimeMs && nextStat.mtimeMs === prevStat.mtimeMs) {
+      const bumped = new Date(prevStat.mtimeMs + 1000);
+      fs.utimesSync(liveFile, bumped, bumped);
+    }
+    const second = readLatestCodexQuotaFromDisk(home);
+    expect(second?.windows[0].usedPercent).toBe(40);
+
+    // Resumed session in an older day directory (day 8+) with the newest mtimeMs must win globally over newer date folders.
+    const day8Dir = path.join(home, 'sessions', '2026', '11', '10');
+    fs.mkdirSync(day8Dir, { recursive: true });
+    for (let d = 17; d <= 23; d++) {
+      const dd = path.join(home, 'sessions', '2026', '11', String(d));
+      fs.mkdirSync(dd, { recursive: true });
+      fs.writeFileSync(
+        path.join(dd, `rollout-2026-11-${d}T10-00-00.jsonl`),
+        tc({ primary: { used_percent: 20, window_minutes: 300, resets_at: futureSec }, secondary: null, plan_type: 'plus' }) + '\n',
+      );
+    }
+    const resumedOld = path.join(day8Dir, 'rollout-2026-11-10T09-00-00-resumed.jsonl');
+    fs.writeFileSync(
+      resumedOld,
+      tc({ primary: { used_percent: 95, window_minutes: 300, resets_at: futureSec }, secondary: null, plan_type: 'pro' }) + '\n',
+    );
+    const newest = new Date(Date.now() + 10_000);
+    fs.utimesSync(resumedOld, newest, newest);
+    const third = readLatestCodexQuotaFromDisk(home);
+    expect(third?.windows[0].usedPercent).toBe(95);
+  });
+
+  it('uses authoritative quotaKey strictly: no cross-account fallback, no stale bucket hijack, and disabled CLIs are excluded', () => {
+    const now = 1_000_000;
+    const mkTool = (id: string, label: string, quotaKey: string, enabled = true): CliToolInfo => ({
+      id, label, tier: 'generic', source: 'custom', installed: true, usable: true, path: null, command: 'codex',
+      enabled, permissionMode: 'full', fullAccessArgs: [], normalArgs: [], supportsFullAccessFlag: false,
+      capabilities: [], promptArg: 'positional', quotaAgent: 'codex', quotaKey,
+    });
+    const tools = [
+      mkTool('my-codex', '自定义 Codex', 'codex', true),
+      mkTool('codex-work', 'Codex 工作号', 'codex-work', true),
+      mkTool('codex-disabled', '已禁用 Codex', 'codex-disabled', false),
+    ];
+    const mkQuota = (usedPercent: number, resetsAt = now + 3_600_000): QuotaInfo => ({
+      windows: [{ label: '5h', usedPercent, resetsAt, windowMinutes: 300, primary: true }],
+      at: now,
+    });
+
+    const quota = {
+      codex: mkQuota(85),
+      claude: mkQuota(20),
+      'codex-work': mkQuota(30),
+      'codex-disabled': mkQuota(10),
+    };
+
+    // Shared custom Codex resolves to 'codex'; isolated custom Codex resolves strictly to 'codex-work'.
+    expect(resolveQuotaForAgent('my-codex', quota, now, tools).key).toBe('codex');
+    expect(resolveQuotaForAgent('my-codex', quota, now, tools).windows[0].usedPercent).toBe(85);
+    expect(resolveQuotaForAgent('codex-work', quota, now, tools).key).toBe('codex-work');
+    expect(resolveQuotaForAgent('codex-work', quota, now, tools).windows[0].usedPercent).toBe(30);
+
+    // Isolated custom Codex with NO data yet must NOT leak default 'codex' quota!
+    expect(resolveQuotaForAgent('codex-work', { codex: mkQuota(85) }, now, tools)).toEqual({
+      key: 'codex-work',
+      quota: undefined,
+      windows: [],
+    });
+
+    // Topbar/popover list includes enabled isolated 'codex-work', NOT shared 'my-codex', NOT disabled 'codex-disabled'.
+    const displayed = quotaDisplayAgents(quota, tools);
+    expect(displayed).toContain('codex');
+    expect(displayed).toContain('codex-work');
+    expect(displayed).not.toContain('my-codex');
+    expect(displayed).not.toContain('codex-disabled');
+
+    // Never suggests switching from my-codex -> codex (same shared bucket), suggests claude (80% left) instead.
+    expect(bestSwitchCandidate(quota, ['codex', 'my-codex', 'claude'], 'my-codex', now, tools)).toEqual({
+      agent: 'claude',
+      minLeftPercent: 80,
+    });
+    expect(bestSwitchCandidate({ codex: mkQuota(85) }, ['codex', 'my-codex'], 'my-codex', now, tools)).toBeNull();
+
+    // Badge & tooltip reflect custom CLI label and Codex subscription fallback.
+    expect(vendorPlanBadge('my-codex', undefined, tools)).toBe('Codex 订阅');
+    expect(quotaTitle('codex-work', quota['codex-work'], quota['codex-work'].windows, now, 'remaining', tools)).toContain('Codex 工作号 订阅额度');
   });
 });

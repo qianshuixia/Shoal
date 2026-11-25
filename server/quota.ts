@@ -315,34 +315,110 @@ export function readCodexQuota(transcriptPath: string): QuotaWindow[] | null {
   return readCodexQuotaInfo(transcriptPath)?.windows ?? null;
 }
 
+const DISK_QUOTA_CACHE_MAX = 64;
+const diskQuotaCache = new Map<string, ParsedCodexQuota | null>();
+
+function readCodexQuotaInfoCached(file: string, st: fs.Stats): ParsedCodexQuota | null {
+  const key = `${file}|${st.ino}|${st.mtimeMs}|${st.ctimeMs}|${st.size}`;
+  if (diskQuotaCache.has(key)) return diskQuotaCache.get(key) ?? null;
+  let text: string;
+  try {
+    text = readTail(file);
+  } catch {
+    return null; // do not cache transient read failures
+  }
+  const parsed = parseCodexQuotaInfo(text);
+  if (diskQuotaCache.size >= DISK_QUOTA_CACHE_MAX) {
+    const oldest = diskQuotaCache.keys().next().value;
+    if (oldest !== undefined) diskQuotaCache.delete(oldest);
+  }
+  diskQuotaCache.set(key, parsed);
+  return parsed;
+}
+
+export interface DiskCodexQuotaResult {
+  quota: ParsedCodexQuota;
+  mtimeMs: number;
+}
+
+const DATE_DIR_RE = /^\d{2,4}$/;
+
+function sortDirEntriesNewestFirst(dirs: fs.Dirent[]): fs.Dirent[] {
+  return dirs.sort((a, b) => {
+    const aDate = DATE_DIR_RE.test(a.name);
+    const bDate = DATE_DIR_RE.test(b.name);
+    if (aDate !== bDate) return aDate ? -1 : 1;
+    if (aDate && bDate) {
+      const diff = Number(b.name) - Number(a.name);
+      if (diff !== 0) return diff;
+    }
+    return b.name.localeCompare(a.name);
+  });
+}
+
 // Lightweight scan of the most recent Codex rollout files on disk so Codex quota can be warmed/refreshed without waiting for a Stop hook.
-export function readLatestCodexQuotaFromDisk(codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex')): ParsedCodexQuota | null {
+// Prioritizes date-partitioned subdirectories (YYYY/MM/DD) newest-first, checks recent day buckets jointly by mtimeMs
+// (so a resumed session in a prior day still wins), and continues scanning older days if recent rollouts have no live quota.
+export function readLatestCodexQuotaFromDiskWithMeta(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')): DiskCodexQuotaResult | null {
   try {
     const sessionsRoot = path.join(codexHome, 'sessions');
     if (!fs.existsSync(sessionsRoot)) return null;
-    const candidates: { file: string; mtimeMs: number }[] = [];
-    const walk = (dir: string, depth: number) => {
-      if (depth > 4) return;
+
+    // Collect leaf directories containing rollouts in newest-date-first order (capped at 36 directories for safety).
+    const leafDirs: string[] = [];
+    const MAX_LEAF_DIRS = 36;
+    const walkDirs = (dir: string, depth: number) => {
+      if (depth > 4 || leafDirs.length >= MAX_LEAF_DIRS) return;
       let entries: fs.Dirent[];
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full, depth + 1);
-        else if (e.isFile() && e.name.startsWith('rollout-') && e.name.endsWith('.jsonl')) {
+      const hasRollout = entries.some(e => e.isFile() && e.name.startsWith('rollout-') && e.name.endsWith('.jsonl'));
+      if (hasRollout) leafDirs.push(dir);
+      const subdirs = sortDirEntriesNewestFirst(entries.filter(e => e.isDirectory()));
+      for (const d of subdirs) {
+        if (leafDirs.length >= MAX_LEAF_DIRS) break;
+        walkDirs(path.join(dir, d.name), depth + 1);
+      }
+    };
+    walkDirs(sessionsRoot, 0);
+    if (!leafDirs.length) return null;
+
+    const collectFromDirs = (dirs: string[]) => {
+      const out: { file: string; st: fs.Stats }[] = [];
+      for (const dir of dirs) {
+        let entries: fs.Dirent[];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+        for (const e of entries) {
+          if (!e.isFile() || !e.name.startsWith('rollout-') || !e.name.endsWith('.jsonl')) continue;
+          const full = path.join(dir, e.name);
           try {
-            candidates.push({ file: full, mtimeMs: fs.statSync(full).mtimeMs });
+            out.push({ file: full, st: fs.statSync(full) });
           } catch { /* vanished */ }
         }
       }
+      out.sort((a, b) => b.st.mtimeMs - a.st.mtimeMs);
+      return out;
     };
-    walk(sessionsRoot, 0);
-    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    for (const c of candidates.slice(0, 8)) {
-      const parsed = readCodexQuotaInfo(c.file);
-      if (parsed && parsed.windows.some(w => w.resetsAt > Date.now())) return parsed;
+
+    const now = Date.now();
+    const MAX_FILES_CHECKED = 128;
+    // Collect rollout files across all newest date-prioritized leaf directories and sort globally by mtimeMs,
+    // so a recently resumed session in an older day directory (e.g. day 8+) always beats older mtimes.
+    const candidates = collectFromDirs(leafDirs);
+    let checked = 0;
+    for (const c of candidates) {
+      if (checked >= MAX_FILES_CHECKED) break;
+      checked++;
+      const parsed = readCodexQuotaInfoCached(c.file, c.st);
+      if (parsed && parsed.windows.some(w => w.resetsAt > now)) {
+        return { quota: parsed, mtimeMs: c.st.mtimeMs };
+      }
     }
   } catch { /* ignore */ }
   return null;
+}
+
+export function readLatestCodexQuotaFromDisk(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')): ParsedCodexQuota | null {
+  return readLatestCodexQuotaFromDiskWithMeta(codexHome)?.quota ?? null;
 }
 
 // Extracts live session context occupancy from Claude Code or Antigravity statusLine payloads.
@@ -399,6 +475,8 @@ export interface QuotaStore {
   all(): Partial<Record<AgentKind, QuotaInfo>>;
   // The new entry, or null (nothing changes) when the windows are the same as before or empty.
   set(agent: AgentKind, windows: QuotaWindow[], at?: number, meta?: { plan?: string; source?: QuotaInfo['source'] }): QuotaInfo | null;
+  // Removes an entry (e.g. a deleted/disabled/re-targeted custom CLI bucket); returns true if one existed.
+  delete(agent: AgentKind): boolean;
 }
 
 export function createQuotaStore(file: string): QuotaStore {
@@ -449,6 +527,18 @@ export function createQuotaStore(file: string): QuotaStore {
         console.warn('[quota.json]', (e as Error).message);
       }
       return info;
+    },
+    delete(agent) {
+      if (!(agent in data)) return false;
+      const next = { ...data };
+      delete next[agent];
+      data = next;
+      try {
+        fs.writeFileSync(file, JSON.stringify(data));
+      } catch (e) {
+        console.warn('[quota.json]', (e as Error).message);
+      }
+      return true;
     },
   };
 }

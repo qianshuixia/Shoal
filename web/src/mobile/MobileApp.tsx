@@ -69,8 +69,12 @@ function applyServerMsg(prev: Snapshot, m: ServerMsg): Snapshot {
       return { ...prev, agents: m.agents, cliTools: m.cliTools };
     case 'git':
       return { ...prev, git: { ...prev.git, [m.projectId]: m.git } };
-    case 'quota':
-      return { ...prev, quota: { ...prev.quota, [m.agent]: m.quota } };
+    case 'quota': {
+      const next = { ...prev.quota };
+      if (m.quota) next[m.agent] = m.quota;
+      else delete next[m.agent];
+      return { ...prev, quota: next };
+    }
     case 'telemetry':
       return { ...prev, telemetry: m.telemetry };
     case 'activity': {

@@ -637,7 +637,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
           {context && <ContextMiniBar context={context} onClick={onOpenOverview} />}
           {metrics && <TelemetryPill counts={metrics} tps={metrics.tps} label="本任务累计用量" compact testId="pane-metrics" />}
           {paneAgent && quota && paneWindows.length > 0 && (
-            <QuotaPill agent={paneAgent} quota={quota} windows={paneWindows} now={now} compact mode={quotaMode} onClick={onOpenQuotaPopover} />
+            <QuotaPill agent={paneAgent} cliTools={cliTools} quota={quota} windows={paneWindows} now={now} compact mode={quotaMode} onClick={onOpenQuotaPopover} />
           )}
           {session && !((task?.phase === 'approved' || task?.phase === 'review') && session.status === 'needs_you') && <StatusTag status={session.status} since={session.statusSince} now={now} />}
           {reviewing && (
