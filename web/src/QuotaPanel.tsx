@@ -11,16 +11,20 @@ import {
 import { fmtPct, fmtTokens, hitRate } from './util.ts';
 
 export function PaceGlyph({ pace, delta }: { pace: QuotaPace; delta: number | null }) {
-  const tip = pace === 'depleted'
-    ? '当前窗口额度已耗尽'
-    : pace === 'fast'
-      ? `消耗快于时间进度${delta !== null ? `（${Math.round(delta)}%）` : ''}`
-      : pace === 'ahead'
-        ? `额度充裕，慢于时间消耗${delta !== null ? `（+${Math.round(delta)}%）` : ''}`
-        : '消耗与时间进度基本同步';
+  const tip = pace === 'idle'
+    ? '未使用，首次调用后开始计时'
+    : pace === 'depleted'
+      ? '当前窗口额度已耗尽'
+      : pace === 'fast'
+        ? `消耗快于时间进度${delta !== null ? `（${Math.round(delta)}%）` : ''}`
+        : pace === 'ahead'
+          ? `额度充裕，慢于时间消耗${delta !== null ? `（+${Math.round(delta)}%）` : ''}`
+          : '消耗与时间进度基本同步';
   return (
     <span className={`pace-glyph pace-${pace}`} title={tip} aria-label={tip}>
-      {pace === 'ahead' ? (
+      {pace === 'idle' ? (
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" /><path d="M8 5v3l2 1.5" /></svg>
+      ) : pace === 'ahead' ? (
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 5.5l4 4 2.5-2.5 4.5 4.5M10.5 11.5h3v-3" /></svg>
       ) : pace === 'fast' ? (
         <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 11.5l4-4 2.5 2.5 4.5-4.5M10.5 5.5h3v3" /></svg>
@@ -297,7 +301,7 @@ export function QuotaPopover({
                       </span>
                       <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(agent)} />
                       <PaceGlyph pace={m.pace} delta={m.paceDelta} />
-                      <span className="qp-row-reset" title={`${m.resetClock} 重置`}>{m.resetRelative}</span>
+                      <span className="qp-row-reset" title={m.unstarted ? '未使用，首次调用后开始计时' : `${m.resetClock} 重置`}>{m.resetRelative}</span>
                     </div>
                   );
                 })}
@@ -461,8 +465,8 @@ export function QuotaDashboard({
                               <span className="qd-slot-badge">1</span>
                               {w.poolLabel ?? agentLabel(agent, cliTools)} {val}%
                             </span>
-                            <span className="qd-card-reset" title={`将于 ${m.resetClock} 重置`}>
-                              ↻ {m.resetRelative} · {m.resetClock}
+                            <span className="qd-card-reset" title={m.unstarted ? '未使用，首次调用后开始计时' : `将于 ${m.resetClock} 重置`}>
+                              {m.unstarted ? '未使用 · 首次调用后开始计时' : `↻ ${m.resetRelative} · ${m.resetClock}`}
                             </span>
                           </div>
                         </div>

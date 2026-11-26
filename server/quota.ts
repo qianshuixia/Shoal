@@ -109,7 +109,6 @@ interface AgyBucketMeta {
   poolLabel: string;
   primary: boolean;
   rank: number;
-  fallbackMs: number;
 }
 
 function parseWindowUnit(raw: string): { label: string; minutes: number; subRank: number } | null {
@@ -134,7 +133,7 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
   const raw = key.trim().toLowerCase();
   if (!raw) return null;
   if (raw === 'gemini') {
-    return { label: '配额', windowMinutes: 300, pool: 'gemini', poolLabel: 'Gemini', primary: true, rank: 2.5, fallbackMs: 5 * 3_600_000 };
+    return { label: '配额', windowMinutes: 300, pool: 'gemini', poolLabel: 'Gemini', primary: true, rank: 2.5 };
   }
   const direct = parseWindowUnit(raw);
   if (direct) {
@@ -145,7 +144,6 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
       poolLabel: 'Gemini',
       primary: true,
       rank: direct.subRank,
-      fallbackMs: direct.minutes * 60_000,
     };
   }
   const m = /^([a-z0-9]+)[-_]+(.+)$/.exec(raw);
@@ -161,7 +159,6 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
         poolLabel: poolInfo.poolLabel,
         primary: poolInfo.primary,
         rank: poolInfo.baseRank + unit.subRank,
-        fallbackMs: unit.minutes * 60_000,
       };
     }
     // Nested sub-pool like gemini-pro-5h
@@ -175,7 +172,6 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
         poolLabel: `${poolInfo.poolLabel} ${sub[1]}`,
         primary: poolInfo.primary,
         rank: poolInfo.baseRank + inner.subRank + 0.5,
-        fallbackMs: inner.minutes * 60_000,
       };
     }
     return {
@@ -185,7 +181,6 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
       poolLabel: poolInfo.poolLabel,
       primary: poolInfo.primary,
       rank: poolInfo.baseRank + 3,
-      fallbackMs: 5 * 3_600_000,
     };
   }
   return {
@@ -195,7 +190,6 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
     poolLabel: '其他',
     primary: false,
     rank: 50,
-    fallbackMs: 5 * 3_600_000,
   };
 }
 
@@ -203,7 +197,7 @@ function agyBucketMeta(key: string): AgyBucketMeta | null {
 // Keeps both the primary Gemini pool and secondary shared/3p pools so Popover / Dashboard / Inspector can show every pool.
 // Note: StatusLineQuotaBucket in agy's Go struct marks `remaining_fraction`, `reset_time` and `reset_in_seconds` as
 // `omitempty`: 0.0 remaining is omitted when depleted (reset still present -> 100% used), while an untouched bucket
-// (`remaining_fraction: 1`) may omit both reset fields before the rolling window starts ticking.
+// (`remaining_fraction: 1`) either omits reset fields or sets `reset_time` to Unix epoch ("1970-01-01T00:00:00Z").
 export function parseAgyQuota(quota: unknown, now = Date.now()): QuotaWindow[] {
   if (!quota || typeof quota !== 'object' || Array.isArray(quota)) return [];
   const entries = Object.entries(quota as Record<string, unknown>).filter(
@@ -216,9 +210,14 @@ export function parseAgyQuota(quota: unknown, now = Date.now()): QuotaWindow[] {
     const meta = agyBucketMeta(key);
     if (!meta) continue;
     let resetsAt: number | null = null;
-    if (typeof b.reset_time === 'string' && b.reset_time) {
-      const t = Date.parse(b.reset_time);
-      if (Number.isFinite(t)) resetsAt = t;
+    let epochReset = false;
+    const rawResetTime = typeof b.reset_time === 'string' ? b.reset_time.trim() : '';
+    if (rawResetTime) {
+      const t = Date.parse(rawResetTime);
+      if (Number.isFinite(t)) {
+        if (t > 0) resetsAt = t;
+        else if (t === 0) epochReset = true;
+      }
     }
     if (resetsAt === null && isNum(b.reset_in_seconds) && b.reset_in_seconds > 0) {
       resetsAt = now + b.reset_in_seconds * 1000;
@@ -232,15 +231,16 @@ export function parseAgyQuota(quota: unknown, now = Date.now()): QuotaWindow[] {
       usedPercent = 100;
     }
     if (usedPercent === null) continue;
-    if (resetsAt === null && b.reset_time === undefined && b.reset_in_seconds === undefined) {
-      resetsAt = now + meta.fallbackMs;
-    }
-    if (resetsAt === null) continue;
+    const missingReset = (b.reset_time === undefined || rawResetTime === '') &&
+      (b.reset_in_seconds === undefined || b.reset_in_seconds === 0);
+    const unstarted = resetsAt === null && usedPercent === 0 && (epochReset || missingReset);
+    if (!unstarted && resetsAt === null) continue;
     ranked.push({
       window: {
         label: meta.label,
         usedPercent,
-        resetsAt,
+        resetsAt: unstarted ? 0 : resetsAt!,
+        ...(unstarted ? { unstarted: true } : {}),
         windowMinutes: meta.windowMinutes,
         pool: meta.pool,
         poolLabel: meta.poolLabel,
@@ -412,6 +412,7 @@ export function createQuotaStore(file: string): QuotaStore {
             .filter(w => w && typeof w.label === 'string' && isNum(w.usedPercent) && isNum(w.resetsAt))
             .map(w => ({
               ...w,
+              ...(w.unstarted !== true && w.resetsAt === 0 && w.usedPercent === 0 ? { unstarted: true } : {}),
               ...(w.windowMinutes === undefined && inferWindowMinutes(w.label) !== undefined
                 ? { windowMinutes: inferWindowMinutes(w.label) }
                 : {}),
@@ -435,7 +436,7 @@ export function createQuotaStore(file: string): QuotaStore {
       const prev = data[agent];
       const nextPlan = meta?.plan ?? prev?.plan;
       const nextSource = meta?.source ?? prev?.source;
-      if (prev && sameQuotaPayload(prev, windows, nextPlan, nextSource)) return null;
+      if (prev && sameQuotaPayload(prev, windows, nextPlan, nextSource) && (nextSource !== 'provider' || at <= prev.at)) return null;
       const info: QuotaInfo = {
         windows,
         at,

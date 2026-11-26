@@ -17,6 +17,7 @@ import { createStreamWatcher } from './stream.ts';
 import { clipboardFiles, writeClipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
+import { readAgyQuota } from './agyQuota.ts';
 import { agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
 import {
   buildCliTools, delegatableAgentsFrom, effectivePermissionMode, enabledAgentsFrom, getCachedCliScan, getCliTool,
@@ -212,6 +213,21 @@ export function createApp(cfg: AppConfig) {
       }
     }
     return quota.all().codex ?? null;
+  }
+
+  let agyQuotaRequest: Promise<void> | undefined;
+  let lastAgyQuotaAttempt = 0;
+  function refreshAgyQuota(force = false): Promise<void> | undefined {
+    if (agyQuotaRequest) return agyQuotaRequest;
+    if (process.env.VITEST || process.env.WORKBENCH_FAKE_AGENT === '1' || (!force && Date.now() - lastAgyQuotaAttempt < 60_000)) return;
+    const agy = getCliTool('agy', store.settings());
+    if (!agy?.enabled || !agy.usable || !agy.path) return;
+    lastAgyQuotaAttempt = Date.now();
+    agyQuotaRequest = readAgyQuota(agy.path, cfg.stateDir).then(windows => {
+      const info = quota.set('agy', windows, Date.now(), { plan: 'Google', source: 'provider' });
+      if (info) broadcast({ t: 'quota', agent: 'agy', quota: info });
+    }).finally(() => { agyQuotaRequest = undefined; });
+    return agyQuotaRequest;
   }
 
   function observeQuota(body: HookBody): void {
@@ -1082,6 +1098,7 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/quota/refresh') {
       refreshCodexQuota(true);
       refreshTelemetry(true);
+      await refreshAgyQuota(true);
       return send(res, 200, { quota: quota.all(), context: currentContexts() });
     }
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
@@ -1600,5 +1617,5 @@ export function createApp(cfg: AppConfig) {
     });
   });
 
-  return { server, wss, mobile };
+  return { server, wss, mobile, refreshAgyQuota };
 }
