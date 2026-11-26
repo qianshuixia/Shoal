@@ -1,6 +1,6 @@
 # Shoal 跨厂商原生 CLI 轻量协作机制规范
 
-本文档定义 Shoal（`agent-workbench`）中面向 Claude Code、Codex CLI 与 Antigravity CLI（`agy`）的三层轻量协作机制、建立在它们之上的委派编排（第 4 节），以及支撑安全投递的底层 PTY 护栏。
+本文档定义 Shoal 中面向 Claude Code、Codex CLI、Antigravity CLI（`agy`）和 Pi Agent 的协作机制、委派编排及 PTY 投递护栏。
 
 ## 1. 设计原则与硬边界
 

@@ -265,7 +265,7 @@ export function QuotaPopover({
       </div>
 
       {sections.length === 0 ? (
-        <div className="qp-empty">暂无实时订阅配额记录。启动 Claude Code、Codex 或 Antigravity 会话后会自动上报。</div>
+        <div className="qp-empty">暂无实时订阅配额记录。启动支持配额的会话或刷新配额。</div>
       ) : (
         <div className="qp-body">
           {sections.map(({ agent, quota: q, windows }) => (
@@ -405,7 +405,7 @@ export function QuotaDashboard({
 
       {listedAgents.length === 0 ? (
         <div className="card qd-empty">
-          当前还没有实时订阅配额数据。启动 Claude Code、Codex 或 Antigravity 会话后会自动上报。
+          当前还没有实时订阅配额数据。启动 Claude Code、Codex、Antigravity 或 Pi Agent 会话后会自动上报，或点击右上角刷新配额。
         </div>
       ) : (
         <div className="qd-providers">

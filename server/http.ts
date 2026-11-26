@@ -17,6 +17,8 @@ import { createStreamWatcher } from './stream.ts';
 import { clipboardFiles, writeClipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
+import { piSessionHeader, samePiWorkspace } from '../shared/piSession.ts';
+import { readPiOpenCodeGoQuota } from './piQuota.ts';
 import { agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
 import {
   buildCliTools, delegatableAgentsFrom, effectivePermissionMode, enabledAgentsFrom, getCachedCliScan, getCliTool,
@@ -214,6 +216,21 @@ export function createApp(cfg: AppConfig) {
     return quota.all().codex ?? null;
   }
 
+  let piQuotaRequest: Promise<void> | undefined;
+  let lastPiQuotaAttempt = 0;
+  function refreshPiQuota(force = false): Promise<void> | undefined {
+    if (piQuotaRequest) return piQuotaRequest;
+    if (process.env.VITEST || process.env.WORKBENCH_FAKE_AGENT === '1' || (!force && Date.now() - lastPiQuotaAttempt < 60_000)) return;
+    const pi = getCliTool('pi', store.settings());
+    if (!pi?.enabled || !pi.usable || !pi.path) return;
+    lastPiQuotaAttempt = Date.now();
+    piQuotaRequest = readPiOpenCodeGoQuota(pi.path, cfg.stateDir).then(windows => {
+      const info = quota.set('pi', windows, Date.now(), { plan: 'OpenCode Go', source: 'provider' });
+      if (info) broadcast({ t: 'quota', agent: 'pi', quota: info });
+    }).finally(() => { piQuotaRequest = undefined; });
+    return piQuotaRequest;
+  }
+
   function observeQuota(body: HookBody): void {
     const session = sessions.list().find(s => s.id === body.sessionId);
     if (!session) return;
@@ -233,6 +250,13 @@ export function createApp(cfg: AppConfig) {
         statusLineContexts.set(session.id, ctx);
         broadcastContextUpdates();
       }
+    } else if (session.agent === 'pi' && ['SessionStart', 'PiContext', 'Stop', 'StopFailure'].includes(body.event)) {
+      const payload = body.payload as Record<string, unknown> | null;
+      const ctx = parseStatusLineContext('pi', payload, body.at);
+      if (ctx) statusLineContexts.set(session.id, ctx);
+      else statusLineContexts.delete(session.id);
+      broadcastContextUpdates();
+      if (typeof payload?.model === 'string' && payload.model.startsWith('opencode-go/')) void refreshPiQuota();
     } else if (body.event === 'Stop' && session.agent === 'codex' && session.transcriptPath) {
       const parsed = readCodexQuotaInfo(session.transcriptPath);
       if (parsed) {
@@ -242,6 +266,15 @@ export function createApp(cfg: AppConfig) {
     }
     const info = windows && quota.set(session.agent, windows, undefined, meta);
     if (info) broadcast({ t: 'quota', agent: session.agent, quota: info });
+  }
+
+  function refreshCliTools(): Promise<void> | undefined {
+    if (process.env.VITEST || process.env.WORKBENCH_FAKE_AGENT === '1') return;
+    return scanCliTools(store.settings())
+      .then((scanned) => {
+        broadcast({ t: 'clis', agents: scanned.agents, cliTools: scanned.cliTools });
+      })
+      .catch(() => { /* startup scan is best-effort */ });
   }
 
   const currentCliTools = () => buildCliTools(store.settings());
@@ -473,6 +506,7 @@ export function createApp(cfg: AppConfig) {
       session = sessions.spawn({
         taskId: task.id, projectId: project.id, agent, cwd: project.path, prompt, model,
         permissionMode, cliMeta,
+        readOnly: !!extra?.delegation?.mode,
         instructions: delegationInstructions(task),
         cols: typeof body.cols === 'number' ? body.cols : undefined,
         rows: typeof body.rows === 'number' ? body.rows : undefined,
@@ -584,7 +618,7 @@ export function createApp(cfg: AppConfig) {
     try {
       session = sessions.spawn({
         taskId: task.id, projectId: project.id, agent: merged.agent, cwd: project.path, model,
-        permissionMode, cliMeta, instructions: delegationInstructions(merged), ...o,
+        permissionMode, cliMeta, readOnly: !!merged.delegation?.mode, instructions: delegationInstructions(merged), ...o,
       });
     } catch (e) {
       throw new HttpError(500, `启动失败：${(e as Error).message}`);
@@ -607,11 +641,16 @@ export function createApp(cfg: AppConfig) {
   }
 
   // Native session id to reopen for an exited session, if its conversation still exists.
-  function resumableNative(prev: SessionInfo | undefined): string | undefined {
+  function resumableNative(prev: SessionInfo | undefined, cwd: string): string | undefined {
     if (!prev || !isDeepAgent(prev.agent)) return undefined;
     const native = canResume(prev) ? prev.nativeSessionId! : undefined;
     if (native && prev.agent === 'claude') return claudeResumeId(native, prev.transcriptPath);
     if (native && prev.agent === 'agy') return agyResumeId(native, prev.transcriptPath);
+    if (native && prev.agent === 'pi') {
+      const file = prev.transcriptPath;
+      const header = file && piSessionHeader(file);
+      return header && header.id === native && samePiWorkspace(header.cwd, cwd) ? file : undefined;
+    }
     return native;
   }
 
@@ -626,7 +665,7 @@ export function createApp(cfg: AppConfig) {
     if (!currentAgents().includes(task.agent)) throw new HttpError(400, `智能体不可用：${task.agent}`);
     const prev = task.sessionId ? sessions.list().find(s => s.id === task.sessionId) : undefined;
     if (prev && prev.status !== 'exited') throw new HttpError(409, '会话还在运行');
-    const native = body.fresh === true ? undefined : resumableNative(prev);
+    const native = body.fresh === true ? undefined : resumableNative(prev, project.path);
     if (body.fresh !== true && native === undefined) throw new HttpError(409, '上次会话没有对话记录', 'no-conversation');
     const { task: next, session } = replaceSession(task, project, prev, {
       prompt: '', resume: native,
@@ -661,7 +700,7 @@ export function createApp(cfg: AppConfig) {
     for (const task of candidates) {
       const prev = task.sessionId ? byId.get(task.sessionId) : undefined;
       const project = store.getProject(task.projectId);
-      const native = prev && project && avail.has(task.agent) ? resumableNative(prev) : undefined;
+      const native = prev && project && avail.has(task.agent) ? resumableNative(prev, project.path) : undefined;
       if (!prev || !project || !native) {
         skipped++;
         continue;
@@ -702,7 +741,7 @@ export function createApp(cfg: AppConfig) {
       sessions.enqueue(prev.id, text, enqueueOpts);
       return { task: next, session: prev };
     }
-    const native = resumableNative(prev);
+    const native = resumableNative(prev, project.path);
     if (!native) throw new HttpError(400, errors.noConversation);
     const r = replaceSession(task, project, prev, { prompt: '', resume: native, ...size }, patch);
     sessions.enqueue(r.session.id, text, enqueueOpts);
@@ -760,7 +799,7 @@ export function createApp(cfg: AppConfig) {
       const tp = (healedAgyId ? agyTranscriptFile(healedAgyId) : undefined) ?? before?.transcriptPath;
       const input: HandoffInput = {
         task: first, from, to: agent, cards: store.cards().filter(c => c.taskId === id),
-        turns: tp ? readTranscript(from, tp) : [],
+        turns: tp ? readTranscript(from, tp, before?.transcriptLeafId) : [],
         transcriptPath: tp, note, limit: before?.limit,
       };
       const generated = await generateCard(agent, generatorPrompt(input), { cwd: project.path, stateDir: cfg.stateDir, available: currentAgents() });
@@ -1082,6 +1121,7 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/quota/refresh') {
       refreshCodexQuota(true);
       refreshTelemetry(true);
+      await refreshPiQuota(true);
       return send(res, 200, { quota: quota.all(), context: currentContexts() });
     }
     if (method === 'POST' && pathname === '/api/open') return send(res, 200, openTarget(body));
@@ -1428,7 +1468,7 @@ export function createApp(cfg: AppConfig) {
             collab.onPrimaryStop({ task, session: latest, replyText: '', canceledOrLimit: true });
           }
         }
-        if (hookBody.event === 'Stop' || hookBody.event === 'PostInvocation') needTelemetry = true;
+        if (hookBody.event === 'Stop' || hookBody.event === 'PostInvocation' || (latest?.agent === 'pi' && hookBody.event === 'StopFailure')) needTelemetry = true;
       }
     }
     send(res, 204);
@@ -1600,5 +1640,5 @@ export function createApp(cfg: AppConfig) {
     });
   });
 
-  return { server, wss, mobile };
+  return { server, wss, mobile, refreshCliTools, refreshPiQuota };
 }

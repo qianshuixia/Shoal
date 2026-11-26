@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ActivityPhase, ActivityStep, AgentKind, SessionActivity, SessionInfo } from '../shared/protocol.ts';
+import { piMessage } from './piTranscript.ts';
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -108,6 +109,7 @@ export function summarizeToolCall(rawName: string, rawArgs: unknown): ParsedTool
 
   switch (shortName) {
     case 'read_file':
+    case 'read':
     case 'Read': {
       const p = str(args.Path || args.file_path || args.path);
       addRead(p);
@@ -127,13 +129,15 @@ export function summarizeToolCall(rawName: string, rawArgs: unknown): ParsedTool
     case 'replace_file_content':
     case 'multi_replace_file_content':
     case 'Edit':
-    case 'MultiEdit': {
+    case 'MultiEdit':
+    case 'edit': {
       const p = str(args.Path || args.TargetFile || args.file_path || args.path);
       addWrite(p);
       return { summary: p ? `修改 ${baseOf(p)}` : '修改文件', detail: rawName, subagent: false, filesRead, filesWritten };
     }
     case 'write_file':
     case 'write_to_file':
+    case 'write':
     case 'Write': {
       const p = str(args.Path || args.TargetFile || args.file_path || args.path);
       addWrite(p);
@@ -141,22 +145,26 @@ export function summarizeToolCall(rawName: string, rawArgs: unknown): ParsedTool
     }
     case 'grep_search':
     case 'fast_search':
+    case 'grep':
     case 'Grep': {
       const q = str(args.Query || args.query || args.pattern);
       return { summary: q ? `搜索「${cut(q, 24)}」` : '搜索代码', detail: rawName, subagent: false, filesRead, filesWritten };
     }
     case 'find_by_name':
     case 'fast_glob':
+    case 'find':
     case 'Glob': {
       const pat = str(args.Pattern || args.pattern);
       return { summary: pat ? `查找文件 ${cut(pat, 24)}` : '查找文件', detail: rawName, subagent: false, filesRead, filesWritten };
     }
     case 'list_dir':
-    case 'fast_tree': {
+    case 'fast_tree':
+    case 'ls': {
       const dir = str(args.DirectoryPath || args.path);
       return { summary: dir ? `浏览目录 ${baseOf(dir)}` : '浏览目录树', detail: rawName, subagent: false, filesRead, filesWritten };
     }
     case 'run_command':
+    case 'bash':
     case 'Bash':
     case 'exec_command':
     case 'shell': {
@@ -579,6 +587,10 @@ export function createActivityTracker(opts: {
       if (session.agent === 'agy' || session.agent === 'fake') applyAgyRecord(obj, t, tNow);
       else if (session.agent === 'claude') applyClaudeRecord(obj, t, tNow);
       else if (session.agent === 'codex') applyCodexRecord(obj, t, tNow);
+      else if (session.agent === 'pi') {
+        const message = piMessage(obj);
+        if (message) applyClaudeRecord(message, t, tNow);
+      }
     }
   };
 

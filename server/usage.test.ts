@@ -42,6 +42,24 @@ const claudeLine = (id: string, t: number, u: Record<string, unknown>, model = '
   ({ type: 'assistant', timestamp: iso(t), requestId: 'r-' + id, message: { id, model, usage: u } });
 
 describe('usage', () => {
+  it('attributes Pi tokens, cache warming and reported model-price estimates once to the Shoal run', () => {
+    addTask('t1', 'Pi task', 's1', 'pi', T0);
+    const assistant = (id: string, at: number) => ({ type: 'message', id, timestamp: iso(at), message: {
+      role: 'assistant', model: 'model-one', provider: 'custom-provider',
+      usage: { input: 12, output: 6, reasoning: 2, cacheRead: 40, cacheWrite: 3, cost: { total: 0.002 } },
+    } });
+    const current = assistant('current', T0 + MIN);
+    const f = write('pi/session.jsonl', lines(assistant('old', T0 - MIN), current, current, {
+      type: 'usage', kind: 'cache_warm', id: 'warm', timestamp: iso(T0 + 2 * MIN), provider: 'custom-provider',
+      model: 'model-one', usage: { cacheRead: 15, cost: { total: 0.001 } },
+    }));
+    hook('s1', 'pi', T0 + 1000, { transcript_path: f });
+    const report = createUsage({ stateDir: dir, source }).report(null, null);
+    expect(report.total).toEqual({ input: 12, output: 6, cacheRead: 55, cacheWrite: 3, reasoning: 2, requests: 2, piCostUsd: 0.003 });
+    expect(report.byAgent).toMatchObject([{ key: 'pi', label: 'Pi Agent' }]);
+    expect(report.byModel).toMatchObject([{ label: 'custom-provider/model-one', vendor: 'custom-provider' }]);
+  });
+
   it('counts a claude conversation once per message, including subagent files, and maps the vendor', () => {
     addTask('t1', '修登录', 's1', 'claude', T0);
     const f = write('claude/abc.jsonl', lines(

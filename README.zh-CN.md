@@ -2,10 +2,10 @@
 
 [English](README.md) | 简体中文
 
-本机多 agent 工作台（Windows 和 macOS）：在一个网页（或 Tauri 桌面端）里同时管理 Claude Code、Codex、agy 的原生交互式会话（node-pty，Windows 上走 ConPTY），用颜色区分任务，用 hooks 判断每个会话是在工作还是在等你。版本更新记录见 [CHANGELOG.md](CHANGELOG.md)，需求与方案见 [docs/v1-spec.md](docs/v1-spec.md)（[English](docs/v1-spec.en.md)）、[docs/inspector-spec.md](docs/inspector-spec.md) 与 [docs/collab-spec.md](docs/collab-spec.md)。
+本机多 agent 工作台（Windows 和 macOS）：在一个网页（或 Tauri 桌面端）里同时管理 Claude Code、Codex、Antigravity 和 Pi Agent 的原生交互式会话（node-pty，Windows 上走 ConPTY），用颜色区分任务，用 hooks 判断每个会话是在工作还是在等你。版本更新记录见 [CHANGELOG.md](CHANGELOG.md)，需求与方案见 [docs/v1-spec.md](docs/v1-spec.md)（[English](docs/v1-spec.en.md)）、[docs/inspector-spec.md](docs/inspector-spec.md) 与 [docs/collab-spec.md](docs/collab-spec.md)。
 
 > [!WARNING]
-> 三家 CLI 都以完全权限启动（跳过审批，codex 关闭沙箱），agent 可以直接改文件、跑命令。只在你信任的项目目录里使用，详见下文「权限」。
+> CLI 默认使用完全权限，agent 可以直接改文件、跑命令。只在你信任的项目目录里使用，详见下文「权限」。
 
 当前进度：M3（换 agent 和转发）。agent 每轮做完，最后一条回复成为结果卡片，任务进入「待验收」；可以写反馈让它继续，或者通过。额度用完或想换人时，可以把任务交给另一家 CLI，接手方会收到自动整理的交接卡片；结果卡片可以转发给别的任务。项目、任务、会话和卡片持久化在 `<stateDir>/state.json`；重启服务后旧任务显示「已退出」，可手动续接。
 
@@ -16,7 +16,7 @@
 Windows：
 
 1. 下载 `Shoal_<版本>_x64-setup.exe` 并运行。安装包没有代码签名，SmartScreen 可能拦截：点「更多信息」，再点「仍要运行」。
-2. 至少装好并登录一个 CLI：Claude Code、Codex CLI 或 agy。
+2. 至少装好并登录一个 CLI，例如 Claude Code、Codex CLI、agy 或 Pi Agent。
 
 macOS 13.5 及以上：
 
@@ -29,7 +29,7 @@ macOS 13.5 及以上：
    ```
 
    不想用终端的话，也可以先双击打开一次，再到「系统设置 → 隐私与安全性」里点「仍要打开」。如果提示应用「已损坏」，请用上面的终端命令。
-4. 至少装好并登录一个 CLI：Claude Code、Codex CLI 或 agy。Shoal 会读取登录 shell 的 `PATH`，所以终端里能找到的 CLI，从 Finder 或 Dock 启动 Shoal 时也能找到；装 CLI 时 Shoal 已经开着的话，重启一次 Shoal。
+4. 至少装好并登录一个 CLI，例如 Claude Code、Codex CLI、agy 或 Pi Agent。Shoal 会读取登录 shell 的 `PATH`，所以终端里能找到的 CLI，从 Finder 或 Dock 启动 Shoal 时也能找到；装 CLI 时 Shoal 已经开着的话，重启一次 Shoal。
 
 ## 从源码运行
 
@@ -83,6 +83,16 @@ build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 mac
 
 ## 使用
 
+### Pi Agent
+
+本机 `pi --version` 达到 1.6 后，在项目中新建「Pi Agent」任务。Shoal 使用 Pi 已配置的模型和登录方式，仅为从 Shoal 启动的 Pi 进程加载适配扩展。任务支持原生终端、状态、结果卡片、对话视图、续接和 `shoal delegate pi`。Pi 的正常权限模式通过终端确认写入、运行命令及其他非只读工具调用。评审与方案委派仅启用 Pi 自带的只读模型工具。
+
+「Token 统计」可按 Pi Agent、供应商、模型和任务查看输入、输出、缓存及请求数。Pi 记录的用量成本以美元显示，费用可能来自供应商回报或模型标价估算。会话上下文占用来自 Pi 的估算。
+
+Pi 已登录 OpenCode Go 时，顶栏配额显示 5 小时、每周和月度额度以及重置时间。Shoal 启动时查询，可在配额面板手动刷新。查询由 Pi 在本机使用已有认证向官方用量接口发起，不触发模型请求。刷新失败时保留上次成功的读数及更新时间。
+
+### 工作台
+
 - 「新建项目」填名称和已存在的目录（也可点「浏览…」在本机目录里选）。
 - 移除项目：悬停项目名，点 `+` 左边的垃圾桶。确认后项目和它的全部任务（含已归档）从工作台移除，在跑的会话被结束；项目目录、CLI 对话记录和 Token 统计不删（统计里标「已删除」）。工作台里的任务和结果卡片不能恢复，可以用「新建项目」重新添加同一目录。
 - 新建任务有三种方式：
@@ -107,7 +117,7 @@ build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 mac
 - 双屏时窗格标题的文件夹标签显示该屏的项目，侧栏里正在显示的任务右侧标「左」或「右」；把任务行拖到某一屏上，就直接在那一屏打开（拖到另一屏正在显示的任务会两屏互换）。
 - 任务行最左边是状态标记：琥珀实心点 = 需要你，蓝色呼吸点 = 工作中，空心圈 = 待验收（灰白）/ 就绪（暗灰），勾 = 已通过，小灰点 = 已退出或已归档。正在某一屏显示的任务，标记右侧有任务色细条。行尾是对应 CLI 的彩色图标（Claude Code / Codex / Antigravity），图标来自 [lobehub/lobe-icons](https://github.com/lobehub/lobe-icons)（MIT）。
 - 缩放：整体缩放界面和终端字号（80%–150%，每次 5%）。`Ctrl+滚轮`（任何位置）、`Ctrl+=` / `Ctrl+-`、`Ctrl+0` 恢复 100%；也可以点顶栏右侧的 `−` / `+`、在上面滚动滚轮、点百分比数字恢复。焦点在终端里时 `Ctrl+-` 交给 CLI（它是 Claude Code 的撤销 `^_`），不缩放。设置保存在本机浏览器。
-- Token 统计：顶栏的「Token 统计」页签（「工作台」页签切回，终端不会断开）。数据来自三家 CLI 自己的对话记录，只统计工作台启动的会话，每小时汇总存进 `<stateDir>/usage.json`，删除任务后仍保留。
+- Token 统计在顶栏。数据来自各深度适配 CLI 的对话记录，只统计工作台启动的会话。数据按小时汇总到 `<stateDir>/usage.json`，删除任务后仍保留。切换页签时终端保持连接。
   - 时间：今天 / 近 7 天（默认）/ 近 30 天 / 全部 / 自定义日期（按本地时间，含结束日）。
   - 总量、输入、输出（含推理）、缓存读取、缓存写入、缓存命中率、请求数；趋势图按小时（2 天以内）或按天堆叠显示，悬停看精确数字。
   - 明细按任务、模型、厂商、agent、项目分组；已删除的任务标「已删除」。
@@ -123,20 +133,20 @@ build-desktop.cmd mac   # 在 Windows 上拿 macOS 的 .dmg：由 GitHub 的 mac
   - 「文件」标签：按层惰性加载目录树（默认显示 `.env*` 等点文件，弱化折叠 `node_modules` 等产物目录，标记有 Git 改动的目录与文件），支持 `Ctrl+P` 快速模糊搜索项目里的所有文件（被 `.gitignore` 忽略的文件也能搜到，标记「已忽略」并排在后面；跳过 `node_modules`、`target` 等依赖与缓存目录以及嵌套仓库和 worktree）、CodeMirror 语法高亮编辑与 `Ctrl+F` 页内查找、Markdown 安全渲染预览（`预览 | 源码` 切换，禁用原始 HTML 脚本执行）、图片、视频（mp4/webm/mov 等）、音频（mp3/wav/flac 等）和 PDF 内联预览（音视频支持拖动进度，内置播放器解不了的编码会提示并提供「在外部打开」，用系统默认程序打开），并对其他二进制文件或超过 2 MB 的文本文件提供安全拦截。
   - 并发保护：Agent 在后台改写磁盘文件时，若当前编辑器无未保存修改则静默热重载最新内容；若你有未保存修改则保留草稿并弹出冲突提示条，由你选择「重新加载磁盘版本」或「保留并覆盖」。
 - ``Alt+` `` 跳到等你最久的会话（Chrome 不把 `Ctrl+Tab` 交给网页）。
-- 权限：三家 CLI 一律以完全权限启动（新建和续接都是），不再弹审批：claude `--dangerously-skip-permissions`、codex `--dangerously-bypass-approvals-and-sandbox`（同时关闭沙箱）、agy `--dangerously-skip-permissions`。agent 可以直接改文件、跑命令，只在信任的项目目录里用。
+- 新建或续接会话时使用对应 CLI 的权限设置。完全模式下 Claude Code、Codex 和 Antigravity 跳过审批，Codex 同时关闭沙箱。Pi 完全模式沿用原生工具权限，正常模式会在终端要求确认。
 - 状态：启动中 / 就绪 / 工作中 / 需要你（琥珀色，显示已等多久）/ 待验收 / 已通过 / 已退出。「就绪」是新会话停在空输入框、还没开始干活，不是琥珀色，也不计入「需要你」。已退出的任务如果还没验收，行上仍显示「待验收」。
 - 页面标题显示等你处理的数量，如 `(3) Shoal`（需要你 + 待验收）；桌面版的任务栏标题同步，数量增加且窗口不在前台时任务栏按钮闪烁提醒。Codex 首次启动如果提示 “Hooks need review”，在终端里按提示信任一次。
 - 待验收：agent 一轮结束（Stop hook），它最后一条回复就成为结果卡片，任务进入「待验收」，顶栏「待验收」计数加一，点它跳到等验收最久的任务。面板标题栏直接出现「通过」按钮和旁边的下拉箭头，点箭头在面板右上角弹出浮层（「新会话继续…」、「转发结果…」，以及「查看原文」展开卡片全文），按 `Esc` 或点外部收起，全程不挤压终端高度、不触发重绘闪烁。你在终端里继续对话，任务会回到进行中，下一轮结束后再生成新卡片。
   - 「通过」：在标题栏直接点一次，任务离开「待验收」，留在列表里显示「已通过」，也不计入「需要你」；在终端里继续对话会回到进行中。通过不会归档。
   - 「新会话继续…」：在弹窗里写下接下来要做的事，点「开新会话」（`Ctrl+Enter`），在原面板开一个新会话，初始需求包括原任务需求、上一轮结果和你写的内容。适合上下文太长、想带着结论重开的时候；要接着和原会话说话，直接在终端里打字。
 - 实时订阅额度：顶栏和当前面板标题栏（agent 标识旁）显示各家订阅的窗口已用比例（如 `5h 48% · 7d 6%`），悬停可看精确重置时间与倒计时；已用 ≥ 80% 变琥珀色，100% 加粗，窗口到点后自动消失，最新数据持久化在 `<stateDir>/quota.json`。Claude Code 与 agy（Antigravity / Gemini 订阅）通过各自的 `statusLine` 实时上报（如果你自己配了 `statusLine`，工作台的中继脚本会原样继续执行你的状态栏；agy 默认叠加保留原生状态栏），Codex 在每轮结束时从对话记录读取。
-- 额度用完：claude 报额度用完（rate limit / billing，或回复 “You've hit your … limit”）时，这一轮不生成结果卡片，面板顶部出现额度横条，侧栏显示「额度用完」。codex 和 agy 还没有额度用完的样本，不会自动识别，需要时手动换 agent。
+- 额度用完：claude 报额度用完（rate limit / billing，或回复 “You've hit your … limit”）以及 Pi 报 `rate_limit` 时，这一轮不生成结果卡片，面板顶部出现额度横条，侧栏显示「额度用完」。codex 和 agy 还没有额度用完的样本，不会自动识别，需要时手动换 agent。
 - 换 agent：面板标题栏的「换 agent」或额度横条上的按钮。选接手的 CLI，可写补充说明，提交（`Ctrl+Enter`）后工作台用接手的 CLI 跑一次 headless 短调用（几秒到二十几秒，会用少量额度），读任务需求、结果和反馈卡片、旧会话的对话记录，写出交接卡片；然后在原面板用新 CLI 开新会话，第一条消息是交接卡片、你的补充和旧对话记录的路径。生成失败时改用按记录摘录的兜底卡片，并提示“已按记录摘录”。面板顶部的「交接」细条点「展开」会以浮层展示卡片全文，不改变终端高度。
 - 转发：点开面板标题栏通过按钮旁的下拉菜单，选「转发结果…」把这张结果卡片发给另一个任务或新建的任务。弹窗里可以写附言（不写就用默认附言）、预览将发送的完整内容，也可按需勾选「对方本轮完成后，自动把结果传回当前任务」（精确单次回传，不会修改普通对话窗口布局）。发给已有任务时排队投递：目标正在工作、有权限提示、启动信任弹窗、你正在输入草稿/5 秒内打过字或刚按了 `Ctrl+C`，以及它一轮刚结束不到 1.5 秒时，终端右上角浮出“消息排队中”，侧栏该任务显示「排队」，直到安全空闲时再发出；目标会话已退出时先续接，续接不了会提示改为转发到新任务。转发不改变源任务的状态。
 - 跨 CLI 轻量协作（详见 [docs/collab-spec.md](docs/collab-spec.md)）：
   - **同项目静默黑板**：每次主会话结束会自动把最新回复同步到 `<stateDir>/collab/<projectId>/PEERS.md` 与 `turns/<taskId>-latest.md`（并注入 `WORKBENCH_PEERS_FILE`；`agy` 会额外通过 `--add-dir` 获得所属项目黑板的只读/读写路径），任意会话都可直接按需阅读隔壁进度而零打扰。
   - **终端内 `shoal` 命令**：工作台会为会话静默注入 `<stateDir>/bin`（`shoal.cmd` / `shoal`）与会话令牌，支持 `shoal peers`、`shoal send <target> ...` 与 `shoal ask <target> ...`（异步请求并在对方本轮完成后自动回传 1 次，带 4 跳防循环熔断）。
-  - **委派编排**：在任意任务里让 agent 把一件完整的事派给另一个 CLI（`shoal delegate <claude|codex|agy>`）。Shoal 新开对应的原生 CLI 终端作为子任务，主任务不被锁定；子任务每轮结束，结果自动回到主任务，由主任务验收后 `shoal done` 关闭、`shoal rework` 打回或 `shoal cancel` 放弃。子任务缩进显示在侧栏主任务下面，主任务面板右上角的「委派」浮层显示每个子任务的状态和正在做的事，点击即可在旁边打开它的终端。归档主任务会一并关闭它的子任务。设置里的「允许主 agent 主动委派」（默认开）决定是否在 Claude Code、Codex 和 Antigravity 会话启动时告诉它们这套命令。同时注入的还有设置里的「分工与评审规则」：默认按三家官方资料和实际使用经验写明各 CLI 擅长和不擅长什么、什么活值得派给谁、大方案怎么请另一家独立出一份、什么时候主动请另外两家评审、哪些评审意见才挡交付，可以直接改成你自己的分工，或清空不注入。`shoal delegate <agent> --review` 派出只读评审者，它只回 PASS/FAIL 和 BLOCKING / NON-BLOCKING 意见，提示词要求它首评和复核都只读、不改文件；同时派给另外两个 CLI 就是三方评审。`shoal delegate <agent> --plan` 派出只读方案顾问，它独立出一份方案（推荐做法、其他做法和取舍、风险），由主任务和自己的方案合并。主任务和子任务目前共用同一个工作目录。
+  - **委派编排**：在任意任务里让 agent 把一件完整的事派给另一个 CLI（`shoal delegate <agent>`）。Shoal 新开对应的原生 CLI 终端作为子任务，主任务不被锁定；子任务每轮结束，结果自动回到主任务，由主任务验收后 `shoal done` 关闭、`shoal rework` 打回或 `shoal cancel` 放弃。子任务缩进显示在侧栏主任务下面，主任务面板右上角的「委派」浮层显示每个子任务的状态和正在做的事，点击即可在旁边打开它的终端。归档主任务会一并关闭它的子任务。设置里的「允许主 agent 主动委派」（默认开）决定是否在 深度适配的 CLI 会话启动时告诉它们这套命令。同时注入的还有设置里的「分工与评审规则」：默认按三家官方资料和实际使用经验写明各 CLI 擅长和不擅长什么、什么活值得派给谁、大方案怎么请另一家独立出一份、什么时候主动请另外两家评审、哪些评审意见才挡交付，可以直接改成你自己的分工，或清空不注入。`shoal delegate <agent> --review` 派出只读评审者，它只回 PASS/FAIL 和 BLOCKING / NON-BLOCKING 意见，提示词要求它首评和复核都只读、不改文件；同时派给另外两个 CLI 就是三方评审。`shoal delegate <agent> --plan` 派出只读方案顾问，它独立出一份方案（推荐做法、其他做法和取舍、风险），由主任务和自己的方案合并。主任务和子任务目前共用同一个工作目录。
   - 注意：Antigravity 的 [FAQ](https://antigravity.google/docs/faq) 写明，用第三方软件访问 Antigravity 登录违反其服务条款，且消费级订阅不支持把 `agy` 包进第三方 coding agent 或应用；Shoal 运行的是你本机安装的原生 `agy` 交互终端，但是否适用请自行判断风险。
 - 手机遥控与锁屏提醒（配置教程见 [docs/mobile-guide.md](docs/mobile-guide.md)，设计文档见 [docs/mobile-spec.md](docs/mobile-spec.md)）：点击右上角「手机遥控」即可启用隔离移动安全网关（默认端口 `47801`，不暴露 `47800` 管理接口，全程校验配对设备 Cookie 与 6 位确认码、绝不缩放桌面 ConPTY 尺寸、支持只读 Diff 验收与应急按键）。全部凭据仅存于用户本机 `<stateDir>/mobile.json`：
   - **三档网络接入**：同局域网 Wi-Fi 零配置直连、免账号一键 Cloudflare Quick Tunnel（`trycloudflare.com`）、或自有域名 Cloudflare Named Tunnel（可选叠加 Cloudflare Access 邮箱白名单）/ Tailscale Serve，并附有代理客户端放行 `7844` 端口的规则排障说明；

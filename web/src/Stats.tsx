@@ -18,7 +18,7 @@ const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
 // Stack order bottom -> top; colors are the dataviz dark categorical slots 1-4, validated on --surface.
-const SERIES: { key: keyof UsageCounts; label: string; color: string }[] = [
+const SERIES: { key: 'input' | 'output' | 'cacheRead' | 'cacheWrite'; label: string; color: string }[] = [
   { key: 'cacheRead', label: '缓存读取', color: '#3987e5' },
   { key: 'cacheWrite', label: '缓存写入', color: '#d95926' },
   { key: 'input', label: '输入', color: '#199e70' },
@@ -189,6 +189,11 @@ export function StatsView({
                   <Tile label="输出" value={total.output} note={total.reasoning ? `含推理 ${fmt(total.reasoning)}` : undefined} />
                   <Tile label="缓存读取" value={total.cacheRead} />
                   <Tile label="缓存写入" value={total.cacheWrite} />
+                  {!!total.piCostUsd && <div className="tile">
+                    <span className="tile-label">Pi 用量成本</span>
+                    <span className="tile-value" data-testid="usage-pi-cost">{total.piCostUsd.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 6 })}</span>
+                    <span className="tile-note">含模型标价估算</span>
+                  </div>}
                   <div className="tile">
                     <span className="tile-label">缓存命中率</span>
                     <span className="tile-value" data-testid="usage-hit-rate">{pct(hitRate(total))}</span>
@@ -278,7 +283,7 @@ function columns(r: UsageReport): { cols: Column[]; hourly: boolean } {
   for (const h of r.hours) {
     const col = slots.get(hourly ? h.t : midnight(h.t));
     if (!col) continue;
-    for (const k of Object.keys(col.c) as (keyof UsageCounts)[]) col.c[k] += h[k];
+    for (const { key } of SERIES) col.c[key] += h[key];
   }
   return { cols: [...slots.values()], hourly };
 }

@@ -2,7 +2,7 @@ import { agentLabel } from '../../shared/protocol.ts';
 import type { AgentKind, QuotaInfo, QuotaWindow } from '../../shared/protocol.ts';
 
 // Agents in header order.
-export const QUOTA_AGENTS: AgentKind[] = ['claude', 'codex', 'agy', 'fake'];
+export const QUOTA_AGENTS: AgentKind[] = ['claude', 'codex', 'agy', 'pi', 'fake'];
 export const QUOTA_WARN = 80; // usedPercent >= 80 (i.e. remaining <= 20) triggers warning styling
 
 export type QuotaDisplayMode = 'remaining' | 'used';

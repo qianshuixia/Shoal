@@ -10,6 +10,7 @@ import { inferContextWindowSize } from './quota.ts';
 //           model from the preceding turn_context
 //   agy     ~/.gemini/antigravity-cli/brain/<conv>/.system_generated/logs/transcript_full.jsonl: PLANNER_RESPONSE per step,
 //           model from the hook payload's modelName
+//   pi      native session JSONL: assistant messages and other model-attributed usage entries
 // Which files belong to which session (and when the session ran) comes from events.jsonl and the store. Files are read
 // incrementally by byte offset; per-hour totals are kept in <stateDir>/usage.json, so they survive deleted tasks and
 // transcripts the CLIs clean up later.
@@ -69,6 +70,10 @@ const MAX_SPEED_SAMPLES = 5;
 const MAX_STEP_MS = 600_000;
 
 export function parsePromptAt(v: Obj): number | null {
+  if (v.type === 'message' && isObj(v.message) && (v.message.role === 'user' || v.message.role === 'toolResult')) {
+    const t = Date.parse(str(v.timestamp));
+    return Number.isFinite(t) ? t : null;
+  }
   if (v.type === 'user') {
     const t = Date.parse(str(v.timestamp));
     return Number.isFinite(t) ? t : null;
@@ -113,13 +118,28 @@ const zero = (): UsageCounts => ({ input: 0, output: 0, cacheRead: 0, cacheWrite
 const add = (a: UsageCounts, b: UsageCounts) => {
   a.input += b.input; a.output += b.output; a.cacheRead += b.cacheRead; a.cacheWrite += b.cacheWrite;
   a.reasoning += b.reasoning; a.requests += b.requests;
+  if (b.piCostUsd) a.piCostUsd = (a.piCostUsd ?? 0) + b.piCostUsd;
 };
 
 // Codex 0.167 reports resumed transcripts as \\?\C:\...; one spelling per file.
 export const normPath = (p: string) => path.resolve(p.replace(/^\\\\\?\\/, ''));
 
-// Usage carried by one transcript line, in any of the three formats. `file` keeps per-file codex state up to date.
+// Usage carried by one transcript line. `file` keeps per-file Codex state up to date.
 export function parseUsageLine(v: Obj, file: FileState, fileKey: string): UsageHit | null {
+  const piRecord = v.type === 'message' && isObj(v.message) && v.message.role === 'assistant' ? v.message
+    : v.type === 'usage' || v.type === 'compaction' || v.type === 'branch_summary' ? v : null;
+  if (piRecord && isObj(piRecord.usage) && typeof v.id === 'string') {
+    const u = piRecord.usage;
+    const provider = str(piRecord.provider);
+    const model = str(piRecord.model);
+    const cost = isObj(u.cost) ? num(u.cost.total) : 0;
+    const c: UsageCounts = {
+      ...zero(), input: num(u.input), output: num(u.output), cacheRead: num(u.cacheRead),
+      cacheWrite: num(u.cacheWrite), reasoning: Math.min(num(u.reasoning), num(u.output)), requests: 1,
+      ...(cost > 0 ? { piCostUsd: cost } : {}),
+    };
+    return { t: Date.parse(str(v.timestamp)), key: `p:${fileKey}:${v.id}`, model: provider && model ? `${provider}/${model}` : model || undefined, c };
+  }
   if (v.type === 'assistant' && isObj(v.message) && isObj(v.message.usage)) {
     const m = v.message;
     const u = m.usage as Obj;
@@ -216,7 +236,7 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
   let savePending = false;
 
   const sess = (id: string, agent: AgentKind, at: number) =>
-    (st.sessions[id] ??= { agent, start: at - START_SLACK, lastAt: at, files: [], models: [] });
+    (st.sessions[id] ??= { agent, start: agent === 'pi' ? at : at - START_SLACK, lastAt: at, files: [], models: [] });
   const addFile = (s: SessState, p: string) => {
     const f = normPath(p);
     if (s.files.includes(f)) return;
@@ -292,7 +312,7 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
 
   // The session whose run covers time t, latest start first.
   const runEnd = (id: string, s: SessState, live: Set<string>) =>
-    s.end !== undefined ? s.end + END_SLACK : live.has(id) ? Infinity : s.lastAt + OPEN_END;
+    s.end !== undefined ? s.end + (s.agent === 'pi' ? 0 : END_SLACK) : live.has(id) ? Infinity : s.lastAt + OPEN_END;
 
   function owner(ids: string[], t: number, live: Set<string>): [string, SessState] | null {
     let best: [string, SessState] | null = null;
@@ -317,6 +337,8 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
     if (r.next === fs0.offset) return { changed: false, complete: r.complete };
     for (const line of r.text.split('\n')) {
       const relevant = line.includes('_tokens"')
+        || line.includes('"usage"')
+        || line.includes('"toolResult"')
         || line.includes('"turn_context"')
         || line.includes('"user"')
         || line.includes('"USER_INPUT"')
@@ -348,7 +370,7 @@ export function createUsage(o: { stateDir: string; source: UsageSource; now?: ()
       const cachedTokens = hit.c.cacheRead + hit.c.cacheWrite;
       const uncachedTokens = hit.c.input;
       const usedTokens = cachedTokens + uncachedTokens;
-      if (usedTokens > 0) {
+      if (usedTokens > 0 && s.agent !== 'pi') {
         const cwSize = hit.contextWindowSize ?? fileContextSize.get(f) ?? inferContextWindowSize(model, s.agent);
         const prevCtx = liveContexts.get(sid);
         const turns = (prevCtx?.turns ?? 0) + 1;
