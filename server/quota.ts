@@ -262,6 +262,7 @@ export function windowLabel(minutes: number): string {
 export interface ParsedCodexQuota {
   windows: QuotaWindow[];
   plan?: string;
+  observedAt?: number; // ms epoch from the token_count event's own timestamp
 }
 
 // The last rate_limits with a non-null primary or secondary in codex rollout text (event_msg token_count lines).
@@ -270,9 +271,14 @@ export function parseCodexQuotaInfo(text: string): ParsedCodexQuota | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!lines[i].includes('"rate_limits"')) continue;
     let rl: Record<string, unknown> | null | undefined;
+    let observedAt: number | undefined;
     try {
       const o = JSON.parse(lines[i]);
       rl = (o?.payload?.rate_limits ?? o?.rate_limits) as Record<string, unknown> | null | undefined;
+      if (typeof o?.timestamp === 'string' && o.timestamp) {
+        const ts = Date.parse(o.timestamp);
+        if (Number.isFinite(ts) && ts > 0) observedAt = ts;
+      }
     } catch { continue; /* cut first line of the tail */ }
     if (!rl || typeof rl !== 'object') continue;
     const pool = typeof rl.limit_id === 'string' && rl.limit_id.trim() ? rl.limit_id.trim() : 'codex';
@@ -293,7 +299,7 @@ export function parseCodexQuotaInfo(text: string): ParsedCodexQuota | null {
         });
       }
     }
-    if (windows.length) return { windows, ...(plan ? { plan } : {}) };
+    if (windows.length) return { windows, ...(plan ? { plan } : {}), ...(observedAt !== undefined ? { observedAt } : {}) };
   }
   return null;
 }
@@ -401,18 +407,25 @@ export function readLatestCodexQuotaFromDiskWithMeta(codexHome = process.env.COD
 
     const now = Date.now();
     const MAX_FILES_CHECKED = 128;
-    // Collect rollout files across all newest date-prioritized leaf directories and sort globally by mtimeMs,
-    // so a recently resumed session in an older day directory (e.g. day 8+) always beats older mtimes.
+    // Collect rollout files across all newest date-prioritized leaf directories and sort globally by mtimeMs.
+    // Rank candidates by each rate_limits event's own timestamp (falling back to file mtimeMs) so an older rollout
+    // whose mtime was touched by a non-token event (e.g. background cleanup) never shadows a genuinely newer quota.
     const candidates = collectFromDirs(leafDirs);
     let checked = 0;
+    let best: DiskCodexQuotaResult | null = null;
     for (const c of candidates) {
       if (checked >= MAX_FILES_CHECKED) break;
+      if (best && c.st.mtimeMs + 60_000 < best.mtimeMs) break;
       checked++;
       const parsed = readCodexQuotaInfoCached(c.file, c.st);
       if (parsed && parsed.windows.some(w => w.resetsAt > now)) {
-        return { quota: parsed, mtimeMs: c.st.mtimeMs };
+        const effectiveTs = parsed.observedAt ?? c.st.mtimeMs;
+        if (!best || effectiveTs > best.mtimeMs) {
+          best = { quota: parsed, mtimeMs: effectiveTs };
+        }
       }
     }
+    return best;
   } catch { /* ignore */ }
   return null;
 }
