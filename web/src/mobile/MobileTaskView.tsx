@@ -9,6 +9,7 @@ import type {
 } from '../../../shared/protocol.ts';
 import { agentLabel, canResume } from '../../../shared/protocol.ts';
 import { AgentIcon } from '../agentIcons.tsx';
+import { useAutoResizeTextarea } from '../autoResizeTextarea.ts';
 import { MarkdownPreview } from '../MarkdownPreview.tsx';
 import { STATUS_LABEL } from '../util.ts';
 import { mobileGet, mobilePost, mobileUploadImage, newClientMsgId } from './api.ts';
@@ -261,14 +262,16 @@ export function MobileTaskView({
     scrollToBottom();
   };
 
-  // Reply box grows with its content (JS, not field-sizing: Safari lacks it); CSS max-height caps it at ~6 lines.
-  useEffect(() => {
-    const el = composerRef.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    const border = el.offsetHeight - el.clientHeight;
-    el.style.height = `${el.scrollHeight + border}px`;
-  }, [input]);
+  // Reply box grows with its content (JS, not field-sizing: Safari lacks it) without transiently shrinking
+  // `.mob-composer-row` and clamping `.mob-scroll.scrollTop`; CSS max-height caps it at ~6 lines.
+  useAutoResizeTextarea(composerRef, input, {
+    mounted: !(session?.status === 'exited' && !canResume(session)),
+    onGrow: () => {
+      if (stickBottomRef.current && scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    },
+  });
 
   // Throttled draft persistence; flushed when the page is hidden or the view unmounts.
   const flushDraft = useCallback(() => {
@@ -327,6 +330,7 @@ export function MobileTaskView({
       text,
       mode: 'same',
       ...(sentAttachments.length ? { attachments: sentAttachments } : {}),
+      ...(session?.id ? { expectedSessionId: session.id } : {}),
     };
     const clientMsgId = resolveSendId(task.id, JSON.stringify(body), newClientMsgId);
     // Optimistic: clear right away; restore (merged with anything typed meanwhile) if the request fails.
@@ -577,6 +581,11 @@ export function MobileTaskView({
         {!wsConnected && (
           <div className="mob-send-status" data-testid="mobile-send-offline">连接中断，重连后才能发送</div>
         )}
+        {session?.hasTerminalDraft && session.status !== 'exited' ? (
+          <div className="mob-sub" data-testid="mobile-term-draft-hint" role="status">
+            桌面终端有未发送草稿，发送的消息将排队等待
+          </div>
+        ) : null}
         {session?.queued ? (
           <div className="mob-sub" data-testid="mobile-queued-badge">
             队列中有 {session.queued} 条指令等待当前轮次完成后发送

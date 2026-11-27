@@ -344,7 +344,11 @@ export function NewSessionSheet({
     setBusy(true);
     setError('');
     try {
-      await mobilePost(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, { text: text.trim(), mode: 'new' });
+      await mobilePost(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, {
+        text: text.trim(),
+        mode: 'new',
+        ...(task.sessionId ? { expectedSessionId: task.sessionId } : {}),
+      });
       onDone();
     } catch (e) {
       setError((e as Error).message);

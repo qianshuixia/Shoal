@@ -549,6 +549,7 @@ export async function listChanges(projectDir: string): Promise<ProjectChanges> {
 
 export async function readDiff(projectDir: string, rawRelPath: string): Promise<DiffPayload> {
   const { realRoot, absPath, relPosix } = resolveProjectPath(projectDir, rawRelPath, { preserveSpaces: true });
+  if (process.platform === 'win32' && relPosix.includes(':')) throw new WorkspaceError(400, '文件路径无效');
   const stRes = await runGitBuf(realRoot, ['status', '--porcelain=v2', '-z', '--branch', '--untracked-files=all', '--', relPosix]);
   let status: ChangeStatus | null = null;
   let origPosix: string | undefined;
@@ -573,18 +574,21 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
   let size = 0;
   let mtimeMs: number | null = null;
   try {
-    const fst = await fs.promises.stat(absPath);
-    if (fst.isDirectory()) {
-      isSubmoduleOrDir = true;
-    } else if (fst.isFile()) {
-      size = fst.size;
-      mtimeMs = fst.mtimeMs;
-      if (!isSubmoduleOrDir && !opaqueMedia && size <= MAX_TEXT_BYTES) {
-        diskBuf = await fs.promises.readFile(absPath);
+    const current = checkedRealPath(realRoot, absPath);
+    if (fs.statSync(current).isDirectory()) isSubmoduleOrDir = true;
+    else {
+      const fd = fs.openSync(current, RAW_OPEN_FLAGS);
+      try {
+        const stat = checkedFileHandle(realRoot, absPath, fd);
+        size = Number(stat.size);
+        mtimeMs = statMtimeMs(stat);
+        if (!isSubmoduleOrDir && !opaqueMedia && size <= MAX_TEXT_BYTES) diskBuf = readBoundedFile(fd, size);
+      } finally {
+        fs.closeSync(fd);
       }
     }
-  } catch {
-    // Missing in worktree (e.g. status === 'D')
+  } catch (err) {
+    if (err instanceof WorkspaceError || !['ENOENT', 'ENOTDIR', 'EBUSY', 'EACCES'].includes((err as NodeJS.ErrnoException).code ?? '')) throw err;
   }
 
   if (isSubmoduleOrDir) {
@@ -628,7 +632,7 @@ export async function readDiff(projectDir: string, rawRelPath: string): Promise<
 }
 
 export function readFileEntry(projectDir: string, rawRelPath: string, statOnly = false): FilePayload {
-  const { absPath, relPosix } = resolveProjectPath(projectDir, rawRelPath, { preserveSpaces: true });
+  const { realRoot, absPath, relPosix } = resolveProjectPath(projectDir, rawRelPath, { preserveSpaces: true });
   let fst: fs.Stats;
   try {
     fst = fs.statSync(absPath);
@@ -638,24 +642,37 @@ export function readFileEntry(projectDir: string, rawRelPath: string, statOnly =
   if (!fst.isFile()) {
     throw new WorkspaceError(400, '目标不是普通文件');
   }
+  // On case-insensitive Windows volumes, canonicalize the relative path to on-disk casing so Inspector's tree lookup
+  // (`entry.path === filePath`) still highlights and scrolls to the file even if a link differed in letter case.
+  let canonicalRel = relPosix;
+  if (process.platform === 'win32') {
+    try {
+      const realAbs = fs.realpathSync.native(absPath);
+      if (realAbs.toLowerCase() === absPath.toLowerCase() && isInsideRoot(realRoot, realAbs)) {
+        canonicalRel = toPosix(path.relative(realRoot, realAbs));
+      }
+    } catch {
+      // fall back to resolved relative path
+    }
+  }
   const preview = rawPreviewOf(absPath);
   if (preview) {
     // Video, audio and PDF stream through Range requests, so only images (decoded whole by <img>) have a size cap.
     const tooLarge = preview.kind === 'image' && fst.size > MAX_IMAGE_BYTES;
-    return { path: relPosix, kind: tooLarge ? 'too_large' : preview.kind, size: fst.size, mtimeMs: fst.mtimeMs, mime: preview.mime };
+    return { path: canonicalRel, kind: tooLarge ? 'too_large' : preview.kind, size: fst.size, mtimeMs: fst.mtimeMs, mime: preview.mime };
   }
   if (fst.size > MAX_TEXT_BYTES) {
-    return { path: relPosix, kind: 'too_large', size: fst.size, mtimeMs: fst.mtimeMs };
+    return { path: canonicalRel, kind: 'too_large', size: fst.size, mtimeMs: fst.mtimeMs };
   }
   if (statOnly) {
-    return { path: relPosix, kind: 'text', size: fst.size, mtimeMs: fst.mtimeMs };
+    return { path: canonicalRel, kind: 'text', size: fst.size, mtimeMs: fst.mtimeMs };
   }
   const buf = fs.readFileSync(absPath);
   if (isBinaryBuffer(buf)) {
-    return { path: relPosix, kind: 'binary', size: fst.size, mtimeMs: fst.mtimeMs };
+    return { path: canonicalRel, kind: 'binary', size: fst.size, mtimeMs: fst.mtimeMs };
   }
   return {
-    path: relPosix,
+    path: canonicalRel,
     kind: 'text',
     content: buf.toString('utf8'),
     size: fst.size,
@@ -675,6 +692,36 @@ export interface RawPreviewFile {
 // server, until a writer appears; fstat then rejects it as not a regular file. Reads of regular files ignore the flag.
 // Windows has no FIFOs in the file namespace and no O_NONBLOCK constant.
 const RAW_OPEN_FLAGS = process.platform === 'win32' ? fs.constants.O_RDONLY : fs.constants.O_RDONLY | fs.constants.O_NONBLOCK;
+
+function checkedRealPath(realRoot: string, target: string): string {
+  const real = fs.realpathSync.native(target);
+  if (!isInsideRoot(realRoot, real)) throw new WorkspaceError(403, '拒绝访问指向项目目录之外的符号链接');
+  if (hasGitSegment(path.relative(realRoot, real))) throw new WorkspaceError(403, '不允许通过符号链接访问 .git 内部文件');
+  return real;
+}
+
+function checkedFileHandle(realRoot: string, target: string, fd: number): fs.BigIntStats {
+  const stat = fs.fstatSync(fd, { bigint: true });
+  if (!stat.isFile()) throw new WorkspaceError(400, '目标不是文件');
+  const current = fs.statSync(checkedRealPath(realRoot, target), { bigint: true });
+  if (current.dev !== stat.dev || current.ino !== stat.ino) throw new WorkspaceError(409, '文件在读取时被替换，请重试');
+  return stat;
+}
+
+function statMtimeMs(stat: fs.BigIntStats): number {
+  return Number(stat.mtimeNs / 1_000_000n) + Number(stat.mtimeNs % 1_000_000n) / 1_000_000;
+}
+
+function readBoundedFile(fd: number, size: number): Buffer {
+  const data = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const read = fs.readSync(fd, data, offset, size - offset, offset);
+    if (!read) break;
+    offset += read;
+  }
+  return data.subarray(0, offset);
+}
 
 // Opens a whitelisted preview file inside the project. The descriptor is opened first and then matched (device + inode)
 // against the realpath-verified target, so a link swapped after the check cannot redirect the read; the size and every
@@ -700,19 +747,13 @@ export function openRawPreview(projectDir: string, rawRelPath: string): RawPrevi
     throw new WorkspaceError(403, '无法读取文件（可能被占用或没有权限）');
   }
   try {
-    const st = fs.fstatSync(fd, { bigint: true });
-    if (!st.isFile()) throw new WorkspaceError(400, '目标不是文件');
-    let real: string;
-    let realSt: fs.BigIntStats;
+    let st: fs.BigIntStats;
     try {
-      real = fs.realpathSync.native(absPath);
-      realSt = fs.statSync(real, { bigint: true });
-    } catch {
+      st = checkedFileHandle(realRoot, absPath, fd);
+    } catch (err) {
+      if (err instanceof WorkspaceError) throw err;
       throw new WorkspaceError(404, '文件不存在');
     }
-    if (!isInsideRoot(realRoot, real)) throw new WorkspaceError(403, '拒绝访问指向项目目录之外的符号链接');
-    if (hasGitSegment(path.relative(realRoot, real))) throw new WorkspaceError(403, '不允许通过符号链接访问 .git 内部文件');
-    if (realSt.dev !== st.dev || realSt.ino !== st.ino) throw new WorkspaceError(409, '文件在读取时被替换，请重试');
     const size = Number(st.size);
     if (preview.kind === 'image' && size > MAX_IMAGE_BYTES) throw new WorkspaceError(413, '图片体积过大');
     return { fd, absPath, mime: preview.mime, kind: preview.kind, size };
@@ -722,22 +763,42 @@ export function openRawPreview(projectDir: string, rawRelPath: string): RawPrevi
   }
 }
 
+function ensureWorkspaceParent(realRoot: string, dir: string): string {
+  try {
+    return checkedRealPath(realRoot, dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT' || dir === realRoot) throw err;
+    const ancestor = ensureWorkspaceParent(realRoot, path.dirname(dir));
+    try { fs.mkdirSync(path.join(ancestor, path.basename(dir))); } catch (mkdirError) {
+      if ((mkdirError as NodeJS.ErrnoException).code !== 'EEXIST') throw mkdirError;
+    }
+    return checkedRealPath(realRoot, dir);
+  }
+}
+
 export function writeFileEntry(projectDir: string, body: Partial<WriteFileBody>): WriteFileResult {
   if (typeof body.path !== 'string') throw new WorkspaceError(400, '缺少文件路径');
   if (typeof body.content !== 'string') throw new WorkspaceError(400, '文件内容必须是字符串');
   if (Buffer.byteLength(body.content, 'utf8') > MAX_TEXT_BYTES) throw new WorkspaceError(413, '文件内容超过 2 MB 上限');
 
-  const { absPath, relPosix } = resolveProjectPath(projectDir, body.path, { preserveSpaces: true });
-  let existingStat: fs.Stats | null = null;
+  const { realRoot, absPath, relPosix } = resolveProjectPath(projectDir, body.path, { preserveSpaces: true });
+  if (process.platform === 'win32' && relPosix.includes(':')) throw new WorkspaceError(400, '文件路径无效');
+  const parent = path.dirname(absPath);
+  let existingStat: fs.BigIntStats | null = null;
   let existingRaw: Buffer | null = null;
+  let target: string | undefined;
   try {
-    existingStat = fs.statSync(absPath);
-    if (existingStat.isDirectory()) throw new WorkspaceError(400, '不能覆盖同名目录');
-    if (existingStat.isFile() && existingStat.size <= MAX_TEXT_BYTES) {
-      existingRaw = fs.readFileSync(absPath);
+    target = checkedRealPath(realRoot, absPath);
+    if (fs.statSync(target).isDirectory()) throw new WorkspaceError(400, '不能覆盖同名目录');
+    const fd = fs.openSync(target, RAW_OPEN_FLAGS);
+    try {
+      existingStat = checkedFileHandle(realRoot, absPath, fd);
+      if (existingStat.size <= MAX_TEXT_BYTES) existingRaw = readBoundedFile(fd, Number(existingStat.size));
+    } finally {
+      fs.closeSync(fd);
     }
-  } catch (e) {
-    if (e instanceof WorkspaceError) throw e;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     existingStat = null;
   }
 
@@ -756,26 +817,48 @@ export function writeFileEntry(projectDir: string, body: Partial<WriteFileBody>)
       const sameText = existingRaw && !isBinaryBuffer(existingRaw)
         && existingRaw.toString('utf8').replace(/\r\n/g, '\n') === body.content.replace(/\r\n/g, '\n');
       if (!sameText) {
-        throw new WorkspaceError(409, '磁盘上已出现同名文件', 'conflict', { mtimeMs: existingStat.mtimeMs });
+        throw new WorkspaceError(409, '磁盘上已出现同名文件', 'conflict', { mtimeMs: statMtimeMs(existingStat) });
       }
     } else if (typeof body.expectedMtimeMs === 'number') {
       if (!existingStat) {
         throw new WorkspaceError(409, '磁盘上的文件已被外部删除', 'conflict', { mtimeMs: null });
       }
       // 2ms tolerance for filesystem float rounding
-      if (Math.abs(existingStat.mtimeMs - body.expectedMtimeMs) > 2) {
+      if (Math.abs(statMtimeMs(existingStat) - body.expectedMtimeMs) > 2) {
         const sameText = existingRaw && !isBinaryBuffer(existingRaw)
           && existingRaw.toString('utf8').replace(/\r\n/g, '\n') === body.content.replace(/\r\n/g, '\n');
         if (!sameText) {
-          throw new WorkspaceError(409, '磁盘上的文件已被外部修改', 'conflict', { mtimeMs: existingStat.mtimeMs });
+          throw new WorkspaceError(409, '磁盘上的文件已被外部修改', 'conflict', { mtimeMs: statMtimeMs(existingStat) });
         }
       }
     }
   }
 
-  fs.mkdirSync(path.dirname(absPath), { recursive: true });
-  fs.writeFileSync(absPath, buf);
-  const after = fs.statSync(absPath);
+  const realParent = ensureWorkspaceParent(realRoot, parent);
+  let fd: number;
+  try {
+    fd = existingStat && target
+      ? fs.openSync(target, fs.constants.O_WRONLY | (process.platform === 'win32' ? 0 : fs.constants.O_NONBLOCK))
+      : fs.openSync(path.join(realParent, path.basename(absPath)), 'wx');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (existingStat && code === 'ENOENT') throw new WorkspaceError(409, '磁盘上的文件已被外部删除', 'conflict', { mtimeMs: null });
+    if (!existingStat && code === 'EEXIST') throw new WorkspaceError(409, '磁盘上已出现同名文件', 'conflict');
+    throw err;
+  }
+  let after: fs.Stats;
+  try {
+    if (checkedRealPath(realRoot, parent) !== realParent) throw new WorkspaceError(409, '文件所在目录已被替换，请重试');
+    const current = checkedFileHandle(realRoot, absPath, fd);
+    if (existingStat && (current.dev !== existingStat.dev || current.ino !== existingStat.ino || current.mtimeNs !== existingStat.mtimeNs)) {
+      throw new WorkspaceError(409, '磁盘上的文件已被外部修改', 'conflict', { mtimeMs: statMtimeMs(current) });
+    }
+    fs.writeFileSync(fd, buf);
+    fs.ftruncateSync(fd, buf.length);
+    after = fs.fstatSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   invalidateProjectGitCache(projectDir);
   return { path: relPosix, size: after.size, mtimeMs: after.mtimeMs };
 }

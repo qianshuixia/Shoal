@@ -160,7 +160,7 @@ export function createFileStore(file: string): Store {
     }
     // Their processes died with the previous server; mark ones that were still live as interrupted so the UI can offer one-click resume.
     let markedInterrupted = false;
-    init.sessions = init.sessions.map(({ queued: _q, ...s }) => {
+    init.sessions = init.sessions.map(({ queued: _q, hasTerminalDraft: _d, terminalDraftSeq: _ds, ...s }) => {
       if (s.status === 'exited') return s;
       markedInterrupted = true;
       return { ...s, status: 'exited', exitCode: null, statusSince: Date.now(), interrupted: true }; // queues do not survive a restart
@@ -168,7 +168,8 @@ export function createFileStore(file: string): Store {
     if (markedInterrupted) migrated = true;
   }
   const flush = (store: Store) => {
-    const data: StateFile = { version: 1, projects: store.projects(), tasks: store.tasks(), sessions: store.sessions(), cards: store.cards(), settings: store.settings() };
+    const sessions = store.sessions().map(({ queued: _q, hasTerminalDraft: _d, terminalDraftSeq: _ds, ...s }) => s);
+    const data: StateFile = { version: 1, projects: store.projects(), tasks: store.tasks(), sessions, cards: store.cards(), settings: store.settings() };
     const tmp = `${file}.tmp`;
     try {
       fs.writeFileSync(tmp, JSON.stringify(data, null, 2));

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import type {
@@ -15,6 +15,7 @@ import {
   type ContextMenuEntry, type ContextMenuState, type FsClipboardItem, type FsMutationEvent,
 } from './ContextMenu.tsx';
 import { matchProjectFileLink } from './linkParse.ts';
+import { redactLocalPaths } from './stream/format.ts';
 import { setPrivacy, usePrivacy } from './privacy.ts';
 import { FeedbackDialog, ForwardDialog, ProjectDialog, SwitchDialog, TaskDialog, post } from './Dialogs.tsx';
 import { EditableTitle, PencilIcon, StatusTag, TelemetryPill } from './bits.tsx';
@@ -25,6 +26,9 @@ import { SettingsView } from './SettingsView.tsx';
 import { StatsView } from './Stats.tsx';
 import { TaskSearch } from './TaskSearch.tsx';
 import type { DelegateView } from './DelegationHud.tsx';
+import type { StreamSendOpts } from './StreamView.tsx';
+import { emitDraftActionResult } from './stream/draftActions.ts';
+import { sameDelegates } from './stream/delegates.ts';
 import { needsList, nestDelegated, reviewList, sortProjectTasks, taskActivityAt, taskBand } from './util.ts';
 
 // File kinds the Inspector Files panel can show; anything else (binary, too large, missing) opens externally.
@@ -173,6 +177,7 @@ export function App() {
   const [fsMutation, setFsMutation] = useState<FsMutationEvent | null>(null);
   const fsMutationSeqRef = useRef(0);
   const inspectorDirtyGuardRef = useRef<((pid: string, pathPrefix: string) => boolean) | null>(null);
+  const inspectorNavGuardRef = useRef<((pid: string, tab: InspectorTab, filePath?: string) => boolean) | null>(null);
   const [projectCtx, setProjectCtx] = useState<(ContextMenuState & { projectId: string }) | null>(null);
 
   const [paneViewMode, setPaneViewMode] = useState<PaneViewMode>(loadPaneViewMode);
@@ -425,6 +430,10 @@ export function App() {
       case 'stream':
         setStreamStates((prev) => ({ ...prev, [msg.state.sessionId]: msg.state }));
         break;
+      case 'draft-action-result':
+        // Not state: StreamView awaits the one reply it asked for via a module-level pub/sub.
+        emitDraftActionResult(msg);
+        break;
       case 'replay':
         replay(msg.id, msg.d);
         break;
@@ -471,6 +480,13 @@ export function App() {
   }, [showSession]);
 
   const openInspectorAt = useCallback((projectId: string, tab: InspectorTab, filePath?: string, line?: number, col?: number) => {
+    if (
+      live.current.layout === 'inspect' &&
+      inspectorNavGuardRef.current &&
+      !inspectorNavGuardRef.current(projectId, tab, filePath)
+    ) {
+      return;
+    }
     setView('work');
     setPinnedInspectProjectId(projectId);
     switchLayout('inspect', !line);
@@ -524,7 +540,7 @@ export function App() {
         if (res.ok) {
           const stat = (await res.json()) as FilePayload;
           if (INSPECTABLE_KINDS.has(stat.kind)) {
-            openInspectorAt(match.project.id, 'files', match.relPosix, match.line, match.col);
+            openInspectorAt(match.project.id, 'files', stat.path || match.relPosix, match.line, match.col);
             return;
           }
         }
@@ -538,6 +554,71 @@ export function App() {
       setNotice(`无法打开文件：${(e as Error).message}`);
     }
   }, [openInspectorAt]);
+
+  // Pane callbacks keep ONE identity per pane across the per-second `now` re-render (the memoized StreamView would
+  // otherwise re-render every tick). They read the latest panes/data from `live` and the latest actions from a ref
+  // that is refreshed in a layout effect.
+  const paneActionsRef = useRef({ showSession, openBeside, interruptSession, inspectActivityFile });
+  useLayoutEffect(() => {
+    paneActionsRef.current = { showSession, openBeside, interruptSession, inspectActivityFile };
+  });
+  const paneCallbacks = useMemo(() => {
+    const resolve = (i: number) => {
+      const s = live.current;
+      const id = s.panes[i] ?? null;
+      const session = id ? s.data.sessions.find((x) => x.id === id) : undefined;
+      const task = session ? s.data.tasks.find((t) => t.id === session.taskId) : undefined;
+      const project = task ? s.data.projects.find((p) => p.id === task.projectId) : undefined;
+      return { id, task, project };
+    };
+    return [0, 1].map((i) => ({
+      onSendMessage: async (text: string, attachments?: string[], opts?: StreamSendOpts): Promise<void> => {
+        const { id, task } = resolve(i);
+        // Throw (never silently return) so StreamView keeps the draft and shows the reason.
+        if (!task) throw new Error('任务不存在或已移除');
+        const sid = opts?.expectedSessionId ?? id ?? undefined;
+        const size = sizeOf(id) ?? { cols: 120, rows: 36 };
+        const res = await post<FeedbackResult>(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, {
+          text,
+          mode: 'same',
+          fromStream: true,
+          draftAction: opts?.draftAction ?? 'guard',
+          ...(opts?.draftSeq !== undefined ? { draftSeq: opts.draftSeq } : {}),
+          ...(attachments?.length ? { attachments } : {}),
+          ...(opts?.filePaths?.length ? { filePaths: opts.filePaths } : {}),
+          ...(sid ? { expectedSessionId: sid } : {}),
+          ...(opts?.clientMsgId ? { clientMsgId: opts.clientMsgId } : {}),
+          ...size,
+        });
+        // The old session may have exited and been replaced by a new one: drop it like sendFeedback does.
+        const replaced = !!sid && res.session.id !== sid;
+        setData((d) => ({
+          ...d,
+          tasks: upsert(d.tasks, res.task),
+          sessions: upsert(replaced ? d.sessions.filter((x) => x.id !== sid) : d.sessions, res.session),
+          cards: upsert(d.cards, res.card),
+        }));
+        if (res.session.id !== id) {
+          paneActionsRef.current.showSession(res.session.id, i);
+          if (replaced) dispose(sid);
+        }
+      },
+      onAnswerPrompt: async (fingerprint: string, waitSeq: number, answerData: string): Promise<void> => {
+        const { task } = resolve(i);
+        if (!task) throw new Error('任务不存在或已移除');
+        await post(`/api/tasks/${encodeURIComponent(task.id)}/prompt-answer`, { fingerprint, waitSeq, data: answerData });
+      },
+      onInterrupt: () => {
+        const { id } = resolve(i);
+        if (id) paneActionsRef.current.interruptSession(id);
+      },
+      onInspectFile: (fp: string) => {
+        const { project } = resolve(i);
+        void paneActionsRef.current.inspectActivityFile(fp, project);
+      },
+      onOpenDelegate: (sid: string) => paneActionsRef.current.openBeside(sid, i),
+    }));
+  }, []);
 
   useEffect(() => {
     window.__wbTermText = termText;
@@ -553,7 +634,7 @@ export function App() {
         if (!res.ok) return false;
         const stat = (await res.json()) as FilePayload;
         if (!INSPECTABLE_KINDS.has(stat.kind)) return false;
-        openInspectorAt(match.project.id, 'files', match.relPosix, match.line, match.col);
+        openInspectorAt(match.project.id, 'files', stat.path || match.relPosix, match.line, match.col);
         return true;
       } catch {
         return false;
@@ -841,7 +922,12 @@ export function App() {
     const pane = old ? s.panes.slice(0, paneCount(s.layout)).indexOf(old) : -1;
     const size = sizeOf(old) ?? sizeOf(focusedSessionOf(s)) ?? { cols: 120, rows: 36 };
     try {
-      const r = await post<FeedbackResult>(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, { text, mode, ...size });
+      const r = await post<FeedbackResult>(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, {
+        text,
+        mode,
+        ...size,
+        ...(old ? { expectedSessionId: old } : {}),
+      });
       const replaced = !!old && r.session.id !== old;
       setData((d) => ({
         ...d,
@@ -1106,10 +1192,38 @@ export function App() {
     return !!s && s.status === 'exited' && s.interrupted === true && canResume(s);
   }).length;
 
+  // Delegates are rebuilt each second (linger window depends on `now`); reuse the previous array while its items are
+  // unchanged so the memoized StreamView does not re-render. The cache is written in a layout effect.
+  const delegCacheRef = useRef<DelegateView[][]>([[], []]);
+  const stableDelegates: DelegateView[][] = [0, 1].map((i) => {
+    const id = panes[i];
+    const session = id ? sessionsById.get(id) : undefined;
+    const task = session ? tasksById.get(session.taskId) : undefined;
+    const next: DelegateView[] = task
+      ? data.tasks
+          .filter((t) => t.delegation?.parentTaskId === task.id
+            && (t.phase !== 'archived' || now - (t.delegation.settledAt ?? 0) < DELEGATION_LINGER_MS))
+          .sort((a, b) => a.delegation!.createdAt - b.delegation!.createdAt)
+          .map((t) => {
+            const ses = t.sessionId ? sessionsById.get(t.sessionId) : undefined;
+            return { task: t, session: ses, activity: ses ? data.activity?.[ses.id] : undefined, state: delegationState(t, ses)! };
+          })
+      : [];
+    const prev = delegCacheRef.current[i] ?? [];
+    return sameDelegates(prev, next) ? prev : next;
+  });
+  useLayoutEffect(() => {
+    delegCacheRef.current = stableDelegates;
+  });
+
   return (
     <div className={`app ${privacy ? 'privacy' : ''}`} style={{ '--side-w': `${sideW}rem` } as CSSProperties}>
       {!connected && <div className="banner" data-testid="conn-banner">连接断开，正在重连…</div>}
-      {connected && notice && <div className="banner" data-testid="notice" onClick={() => setNotice('')}>{notice}</div>}
+      {connected && notice && (
+        <div className="banner" data-testid="notice" onClick={() => setNotice('')}>
+          {privacy ? redactLocalPaths(notice) : notice}
+        </div>
+      )}
       {connected && !notice && interruptedCount > 0 && (
         <div className="banner resume-banner" data-testid="interrupted-banner">
           <span>上次服务停止前有 {interruptedCount} 个会话仍在运行</span>
@@ -1410,16 +1524,8 @@ export function App() {
           const project = task ? projectsById.get(task.projectId) : undefined;
           const paneAgent = task?.agent ?? session?.agent;
           const card = task ? data.cards.filter((c) => c.taskId === task.id && c.kind === 'result').at(-1) : undefined;
-          const delegates: DelegateView[] = task
-            ? data.tasks
-                .filter((t) => t.delegation?.parentTaskId === task.id
-                  && (t.phase !== 'archived' || now - (t.delegation.settledAt ?? 0) < DELEGATION_LINGER_MS))
-                .sort((a, b) => a.delegation!.createdAt - b.delegation!.createdAt)
-                .map((t) => {
-                  const ses = t.sessionId ? sessionsById.get(t.sessionId) : undefined;
-                  return { task: t, session: ses, activity: ses ? data.activity?.[ses.id] : undefined, state: delegationState(t, ses)! };
-                })
-            : [];
+          const delegates = stableDelegates[i];
+          const cbs = paneCallbacks[i];
           const parentTask = task?.delegation ? tasksById.get(task.delegation.parentTaskId) : undefined;
           return (
             <Pane
@@ -1436,31 +1542,8 @@ export function App() {
               viewMode={paneViewMode}
               onViewModeChange={setPaneViewMode}
               streamState={id ? streamStates[id] ?? null : null}
-              onSendMessage={async (text, attachments) => {
-                if (!task) return;
-                const size = sizeOf(id) ?? { cols: 120, rows: 36 };
-                const res = await post<FeedbackResult>(`/api/tasks/${encodeURIComponent(task.id)}/feedback`, {
-                  text,
-                  mode: 'same',
-                  ...(attachments?.length ? { attachments } : {}),
-                  ...size,
-                });
-                setData((d) => ({
-                  ...d,
-                  tasks: upsert(d.tasks, res.task),
-                  sessions: upsert(d.sessions, res.session),
-                  cards: upsert(d.cards, res.card),
-                }));
-                if (res.session.id !== id) showSession(res.session.id, i);
-              }}
-              onAnswerPrompt={async (fingerprint, waitSeq, answerData) => {
-                if (!task) return;
-                await post(`/api/tasks/${encodeURIComponent(task.id)}/prompt-answer`, {
-                  fingerprint,
-                  waitSeq,
-                  data: answerData,
-                });
-              }}
+              onSendMessage={cbs.onSendMessage}
+              onAnswerPrompt={cbs.onAnswerPrompt}
               quota={paneAgent ? resolveQuotaForAgent(paneAgent, data.quota, now, data.cliTools).quota : undefined}
               quotaMode={quotaMode}
               onOpenQuotaPopover={() => setQuotaPopoverOpen((v) => !v)}
@@ -1468,8 +1551,8 @@ export function App() {
               onOpenOverview={project ? () => openInspectorAt(project.id, 'overview') : undefined}
               metrics={task ? data.telemetry?.byTask[task.id] : undefined}
               activity={id ? data.activity?.[id] : undefined}
-              onInterrupt={id ? () => interruptSession(id) : undefined}
-              onInspectFile={(fp) => void inspectActivityFile(fp, project)}
+              onInterrupt={id ? cbs.onInterrupt : undefined}
+              onInspectFile={cbs.onInspectFile}
               onFocus={() => {
                 if (layout === 2 && focusedPane !== i) setFocusedPane(i);
               }}
@@ -1495,7 +1578,7 @@ export function App() {
               handoff={task ? data.cards.filter((c) => c.taskId === task.id && c.kind === 'handoff').at(-1) : undefined}
               onDropSession={layout === 2 ? (sid) => showSession(sid, i) : undefined}
               delegates={delegates}
-              onOpenDelegate={(sid) => openBeside(sid, i)}
+              onOpenDelegate={cbs.onOpenDelegate}
               parentTask={parentTask}
               onOpenParent={parentTask?.sessionId ? () => showSession(parentTask.sessionId!) : undefined}
               onOpenPath={(p) => void post('/api/open', { target: p }).catch((e: Error) => setNotice(`无法打开对话记录：${e.message}`))}
@@ -1542,6 +1625,7 @@ export function App() {
               onSetFsClipboard={setFsClipboard}
               fsMutation={fsMutation}
               dirtyGuardRef={inspectorDirtyGuardRef}
+              navDirtyGuardRef={inspectorNavGuardRef}
               canSendToTerminal={canSendToTerminal}
               onSendPathToTerminal={sendPathToTerminal}
               onSelectProject={(pid) => setPinnedInspectProjectId(pid)}

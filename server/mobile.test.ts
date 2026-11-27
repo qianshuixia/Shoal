@@ -8,8 +8,9 @@ import path from 'node:path';
 import { WebSocket } from 'ws';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { MobileAdminStatus, MobilePairClaimResult, ServerMsg, Snapshot, TaskConversationResponse } from '../shared/protocol.ts';
-import { createApp } from './http.ts';
-import { sanitizeTaskForMobile, scrubErrorForMobile, scrubStatePaths } from './mobile.ts';
+import { createApp, pruneAttachments } from './http.ts';
+import { sanitizeActivityForMobile, sanitizeSessionForMobile, sanitizeTaskForMobile, scrubErrorForMobile, scrubStatePaths } from './mobile.ts';
+import * as handoff from './handoff.ts';
 import { SessionManager } from './sessions.ts';
 import { createFileStore } from './store.ts';
 import { createUsage } from './usage.ts';
@@ -87,6 +88,143 @@ describe('mobile gateway & security integration', () => {
 
     return { tmp, repo, mainPort, sessions, store, app };
   }
+
+  it('sets production static security headers and returns 400 for malformed path parameters', async () => {
+    const { mainPort } = await bootApp();
+    const page = await rawHttp(mainPort, 'HEAD', '/');
+    expect(page.headers['content-security-policy']).toContain("script-src 'self';");
+    expect(page.headers['content-security-policy']).toContain("frame-ancestors 'none'");
+    expect(page.headers['x-content-type-options']).toBe('nosniff');
+    expect(page.headers['x-frame-options']).toBe('DENY');
+    expect(page.headers['referrer-policy']).toBe('no-referrer');
+    for (const [method, pathname] of [
+      ['GET', '/bad%ZZ'], ['GET', '/api/projects/%ZZ/changes'], ['POST', '/api/projects/%ZZ/archive-stopped'],
+      ['DELETE', '/api/mobile/admin/devices/%ZZ'], ['POST', '/api/tasks/%ZZ/feedback'],
+    ]) {
+      const headers = method === 'POST' ? { 'content-type': 'application/json' } : {} as Record<string, string>;
+      expect((await rawHttp(mainPort, method, pathname, headers, method === 'POST' ? '{}' : undefined)).status, pathname).toBe(400);
+    }
+  });
+
+  it('streams desktop attachments, rejects invalid headers and cleans up oversized chunked uploads', async () => {
+    const { tmp, mainPort } = await bootApp();
+    const origin = `http://127.0.0.1:${mainPort}`;
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR42mMAAQAABQABoIJXOQAAAABJRU5ErkJggg==', 'base64');
+    const image = await fetch(`${origin}/api/attachments/image`, { method: 'POST', headers: { 'content-type': 'image/png' }, body: png });
+    expect(image.status).toBe(200);
+    const saved = await image.json() as { path: string; name: string };
+    expect(fs.readFileSync(saved.path)).toEqual(png);
+    const invalid = await fetch(`${origin}/api/attachments`, { method: 'POST', headers: { 'content-type': 'image/png' }, body: 'not an image' });
+    expect(invalid.status).toBe(415);
+    const file = await fetch(`${origin}/api/attachments/file`, {
+      method: 'POST', headers: { 'x-file-name': encodeURIComponent('测试 附件.txt') }, body: '附件正文',
+    });
+    expect(file.status).toBe(200);
+    const attachment = await file.json() as { path: string; name: string; originalName: string; size: number };
+    expect(attachment).toMatchObject({ originalName: '测试 附件.txt', size: Buffer.byteLength('附件正文') });
+    expect(fs.readFileSync(attachment.path, 'utf8')).toBe('附件正文');
+    const over = await rawHttp(mainPort, 'POST', '/api/attachments/file', {
+      'x-file-name': 'large.txt', 'content-length': String(101 * 1024 * 1024), connection: 'close',
+    });
+    expect(over.status).toBe(413);
+    expect(over.body).toContain('100 MB');
+
+    const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request(`${origin}/api/attachments/image`, { method: 'POST', headers: { 'content-type': 'image/png' } }, res => {
+        let body = '';
+        res.setEncoding('utf8').on('data', chunk => { body += chunk; });
+        res.on('end', () => resolve({ status: res.statusCode!, body }));
+      });
+      req.on('error', reject);
+      req.setTimeout(3_000, () => req.destroy(new Error('chunked upload timed out')));
+      const chunk = Buffer.alloc(1024 * 1024);
+      let count = 0;
+      const pump = () => {
+        while (count++ < 21) if (!req.write(chunk)) { req.once('drain', pump); return; }
+        req.end();
+      };
+      pump();
+    });
+    expect(response.status).toBe(413);
+    expect(response.body).toContain('20 MB');
+    expect(fs.readdirSync(path.join(tmp, 'attachments')).sort()).toEqual([saved.name, attachment.name].sort());
+  });
+
+  it('prunes stale managed attachments while preserving current task references and unrelated files', async () => {
+    const { tmp } = await bootApp();
+    const directory = path.join(tmp, 'attachments');
+    fs.mkdirSync(directory);
+    const expired = Date.now() / 1000 - 8 * 24 * 60 * 60;
+    const active = '1-12345678-诊断.txt';
+    for (const name of [active, '2-12345678.png', '3-12345678.pdf.tmp', 'unmanaged.txt']) {
+      const file = path.join(directory, name);
+      fs.writeFileSync(file, name);
+      fs.utimesSync(file, expired, expired);
+    }
+    fs.writeFileSync(path.join(directory, '4-12345678.png'), 'just uploaded');
+    await pruneAttachments(tmp, () => new Set([active]));
+    expect(fs.readdirSync(directory).sort()).toEqual([active, '4-12345678.png', 'unmanaged.txt']);
+  });
+
+  it('scrubs Unicode attachment names and activity fields and hides draft versions', () => {
+    const state = path.join(os.tmpdir(), 'state has spaces');
+    const project = path.join(os.tmpdir(), 'project has spaces');
+    const image = path.join(state, 'attachments', '1-12345678-截图.png');
+    const file = path.join(state, 'attachments', '2-12345678-日志.txt');
+    const privatePath = path.join(project, 'src', 'index.ts');
+    const activity = sanitizeActivityForMobile({
+      sessionId: 's', turnStartedAt: 1, lastProgressAt: 1, phase: 'tool', summary: `读取 ${privatePath}`,
+      stepCount: 1, thinkingSnippet: `分析 ${image}`,
+      recentSteps: [{ at: 1, kind: 'tool', summary: `处理 ${file}`, detail: `项目 ${privatePath}` }],
+      filesRead: [privatePath], filesWritten: [],
+    }, state, [project]);
+    expect(activity).toMatchObject({ summary: '读取 [本机路径]', thinkingSnippet: '分析 [图片附件: 1-12345678-截图.png]',
+      recentSteps: [{ summary: '处理 [文件附件: 2-12345678-日志.txt]', detail: '项目 [本机路径]' }], filesRead: ['index.ts'] });
+    expect(sanitizeSessionForMobile({ id: 's', taskId: 't', agent: 'fake', nativeSessionId: null, status: 'idle',
+      statusSince: 1, startedAt: 1, cols: 100, rows: 30, exitCode: null,
+      transcriptPath: privatePath, terminalDraftSeq: 9, hasTerminalDraft: true,
+    })).toEqual({ id: 's', taskId: 't', agent: 'fake', nativeSessionId: null, status: 'idle',
+      statusSince: 1, startedAt: 1, cols: 100, rows: 30, exitCode: null, hasTerminalDraft: true });
+  });
+
+  it('guards feedback during session replacement and replays accepted desktop messages once', async () => {
+    const { repo, mainPort, sessions, store } = await bootApp();
+    const origin = `http://127.0.0.1:${mainPort}`;
+    const post = (pathname: string, body: unknown) => fetch(`${origin}${pathname}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const project = await (await post('/api/projects', { name: 'P', path: repo })).json() as { id: string };
+    const created = await (await post('/api/tasks', { projectId: project.id, agent: 'fake', title: 'Task' })).json() as { task: { id: string }; session: { id: string } };
+    const feedbackPath = `/api/tasks/${created.task.id}/feedback`;
+    const enqueue = vi.spyOn(sessions, 'enqueue');
+    const body = { text: 'only once', mode: 'same', expectedSessionId: created.session.id, clientMsgId: 'one-message' };
+    const first = await post(feedbackPath, body);
+    expect(first.status).toBe(200);
+    const accepted = await first.json();
+    expect(await (await post(feedbackPath, body)).json()).toEqual(accepted);
+    expect(enqueue).toHaveBeenCalledTimes(1);
+    expect(store.cards().filter(card => card.kind === 'feedback')).toHaveLength(1);
+
+    let finish!: (value: string | null) => void;
+    const generate = vi.spyOn(handoff, 'generateCard').mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const switching = post(`/api/tasks/${created.task.id}/switch`, { agent: 'fake' });
+    await vi.waitFor(() => expect(generate).toHaveBeenCalled());
+    try {
+      const rejected = await post(feedbackPath, { ...body, clientMsgId: 'second-message' });
+      expect(rejected.status).toBe(409);
+      expect(await rejected.json()).toMatchObject({ code: 'switching' });
+    } finally {
+      finish(null);
+    }
+    const swRes = await switching;
+    expect(swRes.status).toBe(200);
+    const swJson = await swRes.json() as { card?: { body?: string } };
+    expect(swJson.card?.body ?? '').toContain('only once');
+    const stale = await post(feedbackPath, { ...body, clientMsgId: 'second-message' });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ code: 'session-changed' });
+    expect(enqueue).toHaveBeenCalledTimes(1);
+  });
 
   it('enforces pairing security, anti-brute-force, zero-loopback auth bypass, route cropping, zero resize, and instant WS revocation', async () => {
     const { tmp, repo, mainPort, sessions, store, app } = await bootApp();
@@ -272,6 +410,8 @@ describe('mobile gateway & security integration', () => {
       ['POST', '/api/shutdown'],
       ['POST', '/api/open'],
       ['POST', '/api/clipboard/files'],
+      ['POST', '/api/clipboard/image'],
+      ['POST', '/api/attachments/file'],
       ['GET', `/api/projects/${project.id}/files`],
       ['GET', `/api/projects/${project.id}/ignored-files?q=env`],
       ['PUT', `/api/projects/${project.id}/file`],
@@ -301,6 +441,14 @@ describe('mobile gateway & security integration', () => {
     const upJson = (await uploadRes.json()) as { name?: string; path?: string };
     expect(upJson.name).toMatch(/^\d+-[0-9a-f]{8}\.png$/);
     expect(upJson.path).toBeUndefined();
+
+    // Mobile feedback MUST reject desktop-only local filePaths with 403!
+    const badPathFb = await fetch(`${mobOrigin}/api/tasks/${createdTask.task.id}/feedback`, {
+      method: 'POST',
+      headers: { cookie: cookiePair, 'content-type': 'application/json', 'x-shoal-mobile': '1' },
+      body: JSON.stringify({ text: 'probe', mode: 'same', filePaths: [tmp] }),
+    });
+    expect(badPathFb.status).toBe(403);
 
     // Send mobile feedback with attachment -> desktop PTY cols/rows stay intact, disk paths are scrubbed
     const fbRes = await fetch(`${mobOrigin}/api/tasks/${createdTask.task.id}/feedback`, {
@@ -370,6 +518,7 @@ describe('mobile gateway & security integration', () => {
 
     // 5) WebSocket connection: no replays on connect, resize ignored, watch-term works, revoke disconnects immediately!
     const resizeSpy = vi.spyOn(sessions, 'resize');
+    const inputSpy = vi.spyOn(sessions, 'input').mockImplementation(() => {});
     const msgs: ServerMsg[] = [];
     let clientWs!: WebSocket;
     const wsClosed = new Promise<{ code: number }>((resolve) => {
@@ -393,11 +542,17 @@ describe('mobile gateway & security integration', () => {
     expect(msgs.filter(m => m.t === 'replay')).toHaveLength(0);
 
     clientWs.send(JSON.stringify({ t: 'resize', id: createdTask.session.id, cols: 38, rows: 20 }));
-    clientWs.send(JSON.stringify({ t: 'ping', ts: 12345 }));
+    const termKey = (id: string, data: string) => clientWs.send(JSON.stringify({ t: 'term-key', id, d: data }));
+    termKey(createdTask.session.id, 'y');
     clientWs.send(JSON.stringify({ t: 'watch-term', id: createdTask.session.id }));
+    termKey('other-session', 'y');
+    termKey(createdTask.session.id, 'yn');
+    termKey(createdTask.session.id, '\x1b[A');
+    clientWs.send(JSON.stringify({ t: 'ping', ts: 12345 }));
     await vi.waitFor(() => expect(msgs.some(m => m.t === 'pong')).toBe(true));
     await new Promise(r => setTimeout(r, 60));
     expect(resizeSpy).not.toHaveBeenCalled();
+    expect(inputSpy.mock.calls).toEqual([[createdTask.session.id, '\x1b[A', { fromMobile: true }]]);
 
     // Revoke device on desktop -> mobile WS gets 'revoked' and closes cleanly
     const devices = (await (await fetch(`${baseMain}/api/mobile/admin/status`)).json()) as MobileAdminStatus;
@@ -444,6 +599,25 @@ describe('mobile gateway & security integration', () => {
     });
     return { call };
   }
+
+  it('archives a task and cancels its delegated child through the mobile route', async () => {
+    const { repo, mainPort, sessions, store } = await bootApp();
+    const now = Date.now();
+    store.addProject({ id: 'p', name: 'P', path: repo, createdAt: now });
+    const base = { projectId: 'p', title: 'Task', prompt: '', titleAuto: false, color: '#fff', agent: 'fake' as const,
+      createdAt: now, phase: 'active' as const, phaseSince: now };
+    store.addTask({ ...base, id: 'parent', sessionId: 'parent-session' });
+    store.addTask({ ...base, id: 'child', sessionId: 'child-session', delegation: {
+      parentTaskId: 'parent', brief: 'A delegated task', round: 1, createdAt: now,
+    } });
+    const kill = vi.spyOn(sessions, 'kill');
+    const { call } = await pairPhone(`http://127.0.0.1:${mainPort}`);
+    const response = await call('POST', '/api/tasks/parent/archive', {});
+    expect(response.status).toBe(200);
+    expect(store.getTask('parent')?.phase).toBe('archived');
+    expect(store.getTask('child')).toMatchObject({ phase: 'archived', delegation: { outcome: 'canceled' } });
+    expect(kill.mock.calls).toEqual([['parent-session'], ['child-session']]);
+  });
 
   async function waitFor<T>(fn: () => T | undefined | false, ms = 8000): Promise<T> {
     const until = Date.now() + ms;

@@ -1,6 +1,8 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { marked, type Token, type Tokens } from 'marked';
+import { ImageLightbox } from './ImageViewer.tsx';
+import { usePrivacy } from './privacy.ts';
 
 export interface MarkdownPreviewProps {
   projectId: string;
@@ -44,27 +46,68 @@ function isSafeExternalUrl(href: string): boolean {
   }
 }
 
+// External images are not requested until the user clicks, so previewing a file never silently pings third parties.
+function ExternalImage({ src, alt, privacy, onZoom }: { src: string; alt: string; privacy: boolean; onZoom?: () => void }) {
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="md-muted">[图片加载失败：{alt || src}]</span>;
+  if (!loaded) {
+    return (
+      <button
+        type="button"
+        className="md-img-placeholder"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setLoaded(true);
+        }}
+        title="将向外部服务器请求该图片"
+      >
+        点击加载外部图片{alt ? `（${alt}）` : ''}
+      </button>
+    );
+  }
+  const imgNode = (
+    <img
+      className="md-img"
+      src={src}
+      alt={alt}
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      onError={() => setFailed(true)}
+    />
+  );
+  if (!onZoom) return imgNode;
+  return (
+    <button type="button" className="md-img-zoom-btn" onClick={onZoom} title={privacy ? '点击放大' : (alt ? `点击放大：${alt}` : '点击放大')}>
+      {imgNode}
+    </button>
+  );
+}
+
 export function MarkdownPreview({ projectId, filePath, content, onOpenRelPath }: MarkdownPreviewProps) {
   const tokens = useMemo(() => marked.lexer(content, { gfm: true }), [content]);
+  const [zoomImg, setZoomImg] = useState<{ src: string; alt: string; title: string; external?: boolean } | null>(null);
+  const privacy = usePrivacy();
 
-  const renderInline = (list: Token[] | undefined, keyPrefix: string): ReactNode => {
+  const renderInline = (list: Token[] | undefined, keyPrefix: string, insideLink = false): ReactNode => {
     if (!list || list.length === 0) return null;
     return list.map((tok, idx) => {
       const k = `${keyPrefix}-${idx}`;
       switch (tok.type) {
         case 'text': {
           const t = tok as Tokens.Text;
-          if (t.tokens && t.tokens.length > 0) return <span key={k}>{renderInline(t.tokens, k)}</span>;
+          if (t.tokens && t.tokens.length > 0) return <span key={k}>{renderInline(t.tokens, k, insideLink)}</span>;
           return t.text;
         }
         case 'escape':
           return (tok as Tokens.Escape).text;
         case 'strong':
-          return <strong key={k}>{renderInline((tok as Tokens.Strong).tokens, k)}</strong>;
+          return <strong key={k}>{renderInline((tok as Tokens.Strong).tokens, k, insideLink)}</strong>;
         case 'em':
-          return <em key={k}>{renderInline((tok as Tokens.Em).tokens, k)}</em>;
+          return <em key={k}>{renderInline((tok as Tokens.Em).tokens, k, insideLink)}</em>;
         case 'del':
-          return <del key={k}>{renderInline((tok as Tokens.Del).tokens, k)}</del>;
+          return <del key={k}>{renderInline((tok as Tokens.Del).tokens, k, insideLink)}</del>;
         case 'codespan':
           return <code key={k} className="md-inline-code">{(tok as Tokens.Codespan).text}</code>;
         case 'br':
@@ -72,7 +115,7 @@ export function MarkdownPreview({ projectId, filePath, content, onOpenRelPath }:
         case 'link': {
           const l = tok as Tokens.Link;
           const href = (l.href ?? '').trim();
-          const children = renderInline(l.tokens, k) || l.text;
+          const children = renderInline(l.tokens, k, true) || l.text;
           if (href.startsWith('#')) {
             return <span key={k} className="md-anchor-link">{children}</span>;
           }
@@ -110,15 +153,42 @@ export function MarkdownPreview({ projectId, filePath, content, onOpenRelPath }:
         case 'image': {
           const img = tok as Tokens.Image;
           const href = (img.href ?? '').trim();
+          const alt = img.text || '';
           let src: string | null = null;
+          let title = alt;
           if (/^https?:\/\//i.test(href)) {
-            src = href;
+            return (
+              <ExternalImage
+                key={k}
+                src={href}
+                alt={alt}
+                privacy={privacy}
+                onZoom={insideLink ? undefined : () => setZoomImg({ src: href, alt, title: alt || href, external: true })}
+              />
+            );
           } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
             const rel = resolveRelativePosix(filePath, safeDecodeURIComponent(href.split('#')[0].split('?')[0]));
-            if (rel) src = `/api/projects/${encodeURIComponent(projectId)}/raw?path=${encodeURIComponent(rel)}`;
+            if (rel) {
+              src = `/api/projects/${encodeURIComponent(projectId)}/raw?path=${encodeURIComponent(rel)}`;
+              title = alt || rel;
+            }
           }
-          if (!src) return <span key={k} className="md-muted">[图片：{img.text || href}]</span>;
-          return <img key={k} className="md-img" src={src} alt={img.text || ''} loading="lazy" />;
+          if (!src) return <span key={k} className="md-muted">[图片：{alt || href}]</span>;
+          const imgSrc = src;
+          const imgTitle = title;
+          const imgNode = <img className="md-img" src={imgSrc} alt={alt} loading="lazy" />;
+          if (insideLink) return <span key={k}>{imgNode}</span>;
+          return (
+            <button
+              key={k}
+              type="button"
+              className="md-img-zoom-btn"
+              title={privacy ? '点击放大' : (alt ? `点击放大：${alt}` : '点击放大')}
+              onClick={() => setZoomImg({ src: imgSrc, alt, title: imgTitle })}
+            >
+              {imgNode}
+            </button>
+          );
         }
         case 'html':
           // Never execute raw HTML tags inside Markdown: render literal text safely.
@@ -216,6 +286,15 @@ export function MarkdownPreview({ projectId, filePath, content, onOpenRelPath }:
   return (
     <article className="md-preview" data-testid="markdown-preview">
       {renderBlocks(tokens, 'md')}
+      {zoomImg && (
+        <ImageLightbox
+          src={zoomImg.src}
+          alt={zoomImg.alt}
+          title={zoomImg.title}
+          referrerPolicy={zoomImg.external ? 'no-referrer' : undefined}
+          onClose={() => setZoomImg(null)}
+        />
+      )}
     </article>
   );
 }

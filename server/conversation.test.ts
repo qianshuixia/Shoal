@@ -68,6 +68,19 @@ describe('conversation builder', () => {
     const res = buildTaskConversation({ task, session, cards, activity: null });
     expect(res.items.map(i => i.kind)).toEqual(['card', 'user', 'assistant', 'user']);
     expect(res.items[3]).toEqual({ id: 'card-c2', kind: 'user', text: '补充看下日志' });
+
+    // Once c2 is already in the transcript followed by another terminal/forward turn, c2 must NOT reappear at the bottom!
+    fs.writeFileSync(tp, [
+      JSON.stringify({ role: 'user', text: '第一句需求' }),
+      JSON.stringify({ role: 'assistant', text: '第一轮答复' }),
+      JSON.stringify({ role: 'user', text: '补充看下日志' }),
+      JSON.stringify({ role: 'assistant', text: '已看完日志' }),
+      JSON.stringify({ role: 'user', text: '评审者回传结论' }),
+      JSON.stringify({ role: 'assistant', text: '已处理评审意见' }),
+    ].join('\n'));
+    const resAfter = buildTaskConversation({ task, session: { ...session, status: 'needs_you' }, cards, activity: null });
+    expect(resAfter.items.at(-1)).toMatchObject({ kind: 'assistant', text: '已处理评审意见' });
+    expect(resAfter.items.filter(i => i.kind === 'user' && i.text === '补充看下日志')).toHaveLength(1);
   });
 
   it('falls back cleanly to task prompt and cards when no transcript exists', () => {

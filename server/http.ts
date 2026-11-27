@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { pipeline } from 'node:stream';
+import { pipeline, Readable } from 'node:stream';
+import { pipeline as pipelineAsync } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
@@ -14,10 +15,10 @@ import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeSessi
 import { createActivityTracker } from './activity.ts';
 import { readPrompt } from './prompt.ts';
 import { createStreamWatcher } from './stream.ts';
-import { clipboardFiles, writeClipboardFiles } from './clipboard.ts';
+import { clipboardFiles, clipboardImagePng, writeClipboardFiles } from './clipboard.ts';
 import { autoArchiveInactiveMs, autoArchiveMs, staleTasks } from './autoarchive.ts';
 import { capBody, lastReply } from './cards.ts';
-import { agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
+import { agyConversationState, agyResumeId, agyTranscriptFile, claudeResumeId, ROOT } from './agents.ts';
 import {
   buildCliTools, delegatableAgentsFrom, effectivePermissionMode, enabledAgentsFrom, getCachedCliScan, getCliTool,
   resolveCustomCodexHomes, scanCliTools, validateCliPrefsPatch, validateCustomClis,
@@ -50,6 +51,19 @@ const MIME: Record<string, string> = {
   '.woff': 'font/woff', '.woff2': 'font/woff2', '.map': 'application/json', '.txt': 'text/plain; charset=utf-8',
 };
 
+const staticHeaders = {
+  'Content-Security-Policy': [
+    "default-src 'self'",
+    process.env.WORKBENCH_DEV === '1' ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'" : "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:", "font-src 'self' data:",
+    "connect-src 'self' ws://127.0.0.1:* ws://localhost:*" + (process.env.WORKBENCH_DEV === '1' ? ' http://127.0.0.1:* http://localhost:*' : ''),
+    "worker-src 'self' blob:", "media-src 'self' blob:", "object-src 'none'", "base-uri 'none'", "frame-ancestors 'none'",
+  ].join('; '),
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+};
+
 class HttpError extends Error {
   status: number;
   code?: string;
@@ -60,6 +74,10 @@ class HttpError extends Error {
     this.code = code;
     this.extra = extra;
   }
+}
+
+function safeDecode(value: string, message = '路径参数编码无效'): string {
+  try { return decodeURIComponent(value); } catch { throw new HttpError(400, message); }
 }
 
 export interface AppConfig {
@@ -93,20 +111,99 @@ function readBody(req: http.IncomingMessage, max = MAX_BODY): Promise<string> {
 }
 
 const MAX_ATTACHMENT = 20 * 1024 * 1024;
+const MAX_FILE_ATTACHMENT = 100 * 1024 * 1024;
 const IMAGE_EXT: Record<string, string> = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+const ALLOWED_FILE_EXTS = new Set([
+  // Documents & Markdown
+  'md', 'markdown', 'mdx', 'txt', 'pdf', 'doc', 'docx', 'rtf', 'csv', 'tsv', 'xls', 'xlsx', 'ppt', 'pptx', 'epub', 'log',
+  // Images
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif', 'heic', 'tif', 'tiff',
+  // Video
+  'mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v', 'ogv', 'wmv', 'flv',
+  // Audio
+  'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'opus', 'wma',
+  // Code, Config & Data
+  'json', 'jsonl', 'yaml', 'yml', 'toml', 'xml', 'html', 'htm', 'css', 'scss', 'less',
+  'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'py', 'go', 'rs', 'java', 'kt', 'c', 'h', 'cpp', 'hpp', 'cs', 'rb', 'php',
+  'sh', 'bash', 'zsh', 'ps1', 'sql', 'graphql', 'proto', 'ini', 'conf', 'env', 'diff', 'patch',
+  // Archives
+  'zip', 'tar', 'gz', 'tgz', '7z', 'rar', 'bz2', 'xz',
+]);
+const IMAGE_ATTACHMENT_RE = /^\d+-[0-9a-f]{8}\.(png|jpg|gif|webp)$/i;
+const GENERAL_ATTACHMENT_RE = /^\d+-[0-9a-f]{8}(?:-[^\\/:*?"<>|\x00-\x1f]{1,64})?\.[a-z0-9]{1,12}$/i;
 
-function readBuffer(req: http.IncomingMessage, max: number): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks: Buffer[] = [];
-    // Past the cap the rest is drained, not stored, so the 413 reaches the client instead of a reset connection.
-    req.on('data', (c: Buffer) => {
-      size += c.length;
-      if (size <= max) chunks.push(c);
-    });
-    req.on('end', () => (size > max ? reject(new HttpError(413, '图片过大（上限 20 MB）')) : resolve(Buffer.concat(chunks))));
-    req.on('error', reject);
-  });
+const ATTACHMENT_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+const ATTACHMENT_BUDGET = 512 * 1024 * 1024;
+const ATTACHMENT_GC_INTERVAL_MS = 60 * 60_000;
+const ATTACHMENT_UPLOAD_GRACE_MS = 60 * 60_000;
+const FEEDBACK_REPLAY_MS = 5 * 60_000;
+const FEEDBACK_REPLAY_LIMIT = 512;
+
+async function streamToTempAttachment(req: http.IncomingMessage, maxBytes: number, label: string, target: string, imageExt?: string): Promise<number> {
+  const temp = `${target}.tmp`;
+  const limitError = () => new HttpError(413, `${label}过大（上限 ${Math.round(maxBytes / (1024 * 1024))} MB）`);
+  let size = 0;
+  const header = Buffer.alloc(12);
+  async function* chunks() {
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      if (imageExt && size < header.length) chunk.copy(header, size, 0, header.length - size);
+      size += chunk.length;
+      if (size > maxBytes) throw limitError();
+      yield chunk;
+    }
+  }
+  try {
+    if (Number(req.headers['content-length']) > maxBytes) throw limitError();
+    await fs.promises.mkdir(path.dirname(target), { recursive: true });
+    await pipelineAsync(Readable.from(chunks(), { objectMode: false }), fs.createWriteStream(temp, { flags: 'wx' }));
+    if (!size) throw new HttpError(400, `${label}内容为空`);
+    if (imageExt && !validImageHeader(imageExt, header.subarray(0, size))) throw new HttpError(415, '图片文件头与格式不符');
+    await fs.promises.rename(temp, target);
+    return size;
+  } catch (err) {
+    req.resume();
+    await fs.promises.rm(temp, { force: true });
+    throw err;
+  }
+}
+
+function validImageHeader(ext: string, header: Buffer): boolean {
+  if (ext === 'png') return header.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'));
+  if (ext === 'jpg') return header.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'));
+  if (ext === 'gif') return ['GIF87a', 'GIF89a'].includes(header.toString('ascii', 0, 6));
+  return header.toString('ascii', 0, 4) === 'RIFF' && header.toString('ascii', 8, 12) === 'WEBP';
+}
+
+export async function pruneAttachments(stateDir: string, getReferences: () => Set<string>): Promise<void> {
+  const dir = path.join(stateDir, 'attachments');
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+  const files: Array<{ name: string; size: number; mtime: number }> = [];
+  for (const entry of entries) {
+    const name = entry.name.endsWith('.tmp') ? entry.name.slice(0, -4) : entry.name;
+    if (!entry.isFile() || !GENERAL_ATTACHMENT_RE.test(name) || !ALLOWED_FILE_EXTS.has(path.extname(name).slice(1).toLowerCase())) continue;
+    try {
+      const stat = await fs.promises.lstat(path.join(dir, entry.name));
+      if (stat.isFile()) files.push({ name: entry.name, size: stat.size, mtime: stat.mtimeMs });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  }
+  let total = files.reduce((sum, file) => sum + file.size, 0);
+  const now = Date.now();
+  const referenced = getReferences();
+  for (const file of files.sort((a, b) => a.mtime - b.mtime)) {
+    const age = now - file.mtime;
+    if (referenced.has(file.name) || age < ATTACHMENT_UPLOAD_GRACE_MS) continue;
+    if (age <= ATTACHMENT_MAX_AGE_MS && (total <= ATTACHMENT_BUDGET || file.name.endsWith('.tmp'))) continue;
+    await fs.promises.rm(path.join(dir, file.name), { force: true });
+    total -= file.size;
+  }
 }
 
 const parseJson =(raw: string): Record<string, unknown> => {
@@ -340,8 +437,9 @@ export function createApp(cfg: AppConfig) {
     broadcastContextUpdates();
   }
 
-  const sizeOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
-    !!saved && JSON.stringify({ ...saved, cols: next.cols, rows: next.rows }) === JSON.stringify(next);
+  const stripTransient = ({ cols: _c, rows: _r, hasTerminalDraft: _d, terminalDraftSeq: _ds, queued: _q, ...rest }: SessionInfo) => rest;
+  const transientOnly = (saved: SessionInfo | undefined, next: SessionInfo) =>
+    !!saved && JSON.stringify(stripTransient(saved)) === JSON.stringify(stripTransient(next));
 
   let mobile: ReturnType<typeof createMobileController> | null = null;
   const clients = new Set<WebSocket>();
@@ -356,6 +454,7 @@ export function createApp(cfg: AppConfig) {
     getCards: () => store.cards(),
     getActivity: id => activity.get(id) ?? null,
     getPromptWait: id => sessions.promptWait(id),
+    getPendingInputs: id => sessions.getPendingInputs(id),
   });
   const desktopPromptLocks = new Map<string, Promise<void>>();
 
@@ -396,9 +495,9 @@ export function createApp(cfg: AppConfig) {
 
   sessions.subscribe(m => {
     if (m.t === 'session') {
-      // A terminal resize changes only cols/rows: not worth rewriting state.json for (the next real change saves them too).
+      // Skip rewriting state.json for volatile runtime-only fields (cols/rows, queued count, terminal draft seq).
       const saved = store.getSession(m.session.id);
-      if (!sizeOnly(saved, m.session)) store.saveSession(m.session);
+      if (!transientOnly(saved, m.session)) store.saveSession(m.session);
       activity.onSessionChange(m.session);
       streamWatcher.onSessionChange(m.session);
       broadcast(m);
@@ -448,22 +547,75 @@ export function createApp(cfg: AppConfig) {
     return { path: path.resolve(file), name };
   }
 
-  function resolveAttachments(list: unknown): string[] {
+  function fileAttachmentName(base: string, ext: string): string {
+    const stemRaw = base.slice(0, Math.max(0, base.length - ext.length - 1));
+    const safeStem = stemRaw
+      .replace(/[\\/:*?"<>|\x00-\x1f\s]+/g, '_')
+      .replace(/\.{2,}/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 48);
+    return safeStem
+      ? `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${safeStem}.${ext}`
+      : `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`;
+  }
+
+  function attachmentReferences(): Set<string> {
+    const cutoff = Date.now() - ATTACHMENT_MAX_AGE_MS;
+    const live = new Set(sessions.list().filter(s => s.status !== 'exited').map(s => s.id));
+    const tasks = store.tasks().filter(t => (t.phase !== 'archived' && t.sessionId && live.has(t.sessionId))
+      || Math.max(t.lastActiveAt ?? 0, t.phaseSince, t.createdAt) >= cutoff);
+    const taskIds = new Set(tasks.map(task => task.id));
+    const refs = new Set<string>();
+    const scan = (text: string) => {
+      for (const match of text.matchAll(/\b\d+-[0-9a-f]{8}(?:-[^\\/:*?"<>|\x00-\x20]{1,48})?\.[a-z0-9]{1,12}\b/gi)) refs.add(match[0]);
+    };
+    for (const t of tasks) {
+      scan(t.prompt);
+      if (t.lastPrompt) scan(t.lastPrompt);
+      if (t.sessionId) for (const item of sessions.getPendingInputs(t.sessionId)) scan(item.text);
+    }
+    for (const c of store.cards()) if (taskIds.has(c.taskId)) scan(c.body);
+    return refs;
+  }
+
+  function resolveAttachments(list: unknown, opts?: { allowGeneral?: boolean }): string[] {
     if (list === undefined) return [];
     if (!Array.isArray(list)) throw new HttpError(400, '附件列表无效');
+    if (list.length > 32) throw new HttpError(400, '单次最多附带 32 个附件');
     const dir = path.resolve(cfg.stateDir, 'attachments');
+    const pattern = opts?.allowGeneral ? GENERAL_ATTACHMENT_RE : IMAGE_ATTACHMENT_RE;
     const out: string[] = [];
     for (const raw of list) {
       if (typeof raw !== 'string') throw new HttpError(400, '附件文件名无效');
-      const name = path.basename(raw.trim());
-      if (!/^\d+-[0-9a-f]{8}\.(png|jpg|gif|webp)$/i.test(name)) {
+      const trimmed = raw.trim();
+      const name = path.basename(trimmed);
+      if (name !== trimmed || name.includes('..') || !pattern.test(name)) {
         throw new HttpError(400, '附件文件名无效');
       }
       const full = path.resolve(dir, name);
       if (!full.startsWith(dir + path.sep) || !fs.existsSync(full)) {
-        throw new HttpError(400, '附件图片不存在');
+        throw new HttpError(400, '附件文件不存在');
       }
       out.push(/\s/.test(full) ? `"${full}"` : full);
+    }
+    return out;
+  }
+
+  function resolveLocalFilePaths(list: unknown): string[] {
+    if (list === undefined) return [];
+    if (!Array.isArray(list)) throw new HttpError(400, '本地文件列表无效');
+    if (list.length > 32) throw new HttpError(400, '单次最多附带 32 个文件');
+    const out: string[] = [];
+    for (const raw of list) {
+      if (typeof raw !== 'string') throw new HttpError(400, '本地文件路径无效');
+      const p = raw.trim();
+      if (!p || /[\r\n\0]/.test(p) || /^(?:\\\\|\/\/)/.test(p) || !path.isAbsolute(p)) {
+        throw new HttpError(400, '本地文件路径无效');
+      }
+      if (!fs.existsSync(p)) {
+        throw new HttpError(400, `本地文件不存在：${path.basename(p) || p}`);
+      }
+      out.push(/\s/.test(p) ? `"${p}"` : p);
     }
     return out;
   }
@@ -597,6 +749,20 @@ export function createApp(cfg: AppConfig) {
     for (const t of [...store.tasks()]) {
       if (t.delegation && t.phase !== 'archived' && parentIds.has(t.delegation.parentTaskId)) closeDelegation(t, 'canceled');
     }
+  }
+
+  function archiveTask(id: string): Task {
+    const task = store.getTask(id);
+    if (!task) throw new HttpError(404, '任务不存在');
+    let archived: Task;
+    if (task.delegation && task.phase !== 'archived') {
+      archived = closeDelegation(task, 'canceled');
+    } else {
+      if (task.sessionId) sessions.kill(task.sessionId);
+      archived = setPhase(task, 'archived');
+    }
+    cancelChildrenOf(new Set([task.id]));
+    return archived;
   }
 
   // Approved tasks left alone past the limit (default 1 day), or unapproved active exited tasks untouched for 14 days,
@@ -777,15 +943,45 @@ export function createApp(cfg: AppConfig) {
     return r;
   }
 
-  function feedback(id: string, b: Record<string, unknown>): FeedbackResult {
+  const feedbackReplays = new Map<string, { expires: number; result: FeedbackResult }>();
+  const switching = new Set<string>();
+
+  function feedback(
+    id: string,
+    b: Record<string, unknown>,
+    opts?: { allowImmediate?: boolean; allowLocalPaths?: boolean; allowGeneralAttachments?: boolean; allowDraftIgnore?: boolean },
+  ): FeedbackResult {
+    if (switching.has(id)) throw new HttpError(409, '正在切换智能体，请稍候再发送', 'switching');
     const body = b as Partial<FeedbackBody>;
+    const task = store.getTask(id);
+    if (!task) throw new HttpError(404, '任务不存在');
+    if (body.clientMsgId !== undefined && (typeof body.clientMsgId !== 'string' || !/^[\w-]{1,64}$/.test(body.clientMsgId))) {
+      throw new HttpError(400, 'clientMsgId 格式无效');
+    }
+    const replayKey = body.clientMsgId ? `${task.id}:${body.clientMsgId}` : undefined;
+    const now = Date.now();
+    if (replayKey) {
+      for (const [key, entry] of feedbackReplays) {
+        if (entry.expires > now) break;
+        feedbackReplays.delete(key);
+      }
+      const prior = feedbackReplays.get(replayKey);
+      if (prior) return prior.result;
+    }
+    if (typeof body.expectedSessionId === 'string' && body.expectedSessionId && task.sessionId && body.expectedSessionId !== task.sessionId) {
+      throw new HttpError(409, '会话已切换，请刷新后重试', 'session-changed');
+    }
     const rawText = typeof body.text === 'string' ? body.text.trim() : '';
-    const files = resolveAttachments(body.attachments);
+    if (body.filePaths !== undefined && !opts?.allowLocalPaths) {
+      throw new HttpError(403, '当前入口不支持附加本地路径');
+    }
+    const files = [
+      ...resolveAttachments(body.attachments, { allowGeneral: opts?.allowGeneralAttachments }),
+      ...(opts?.allowLocalPaths ? resolveLocalFilePaths(body.filePaths) : []),
+    ];
     if (!rawText && !files.length) throw new HttpError(400, '反馈不能为空');
     const text = files.length ? (rawText ? `${rawText}\n${files.join(' ')}` : files.join(' ')) : rawText;
     if (body.mode !== 'new' && body.mode !== 'same') throw new HttpError(400, '反馈方式无效');
-    const task = store.getTask(id);
-    if (!task) throw new HttpError(404, '任务不存在');
     const project = store.getProject(task.projectId);
     if (!project) throw new HttpError(400, '项目不存在');
     if (!currentAgents().includes(task.agent)) throw new HttpError(400, `智能体不可用：${task.agent}`);
@@ -798,15 +994,26 @@ export function createApp(cfg: AppConfig) {
       const lastResult = store.cards().filter(c => c.taskId === task.id && c.kind === 'result').at(-1);
       ({ task: next, session } = replaceSession(task, project, prev, { prompt: feedbackPrompt(task, lastResult?.body, text), ...size }, active));
     } else {
+      const immediate = opts?.allowImmediate === true && body.fromStream === true;
+      const draftAction = opts?.allowDraftIgnore === true && body.draftAction === 'ignore' ? 'ignore' : 'guard';
+      const draftSeq = typeof body.draftSeq === 'number' && Number.isInteger(body.draftSeq) && body.draftSeq >= 0
+        ? body.draftSeq
+        : undefined;
       ({ task: next, session } = pasteIntoTask(task, project, prev, text, size, active, {
         noSession: '任务没有会话，请用新会话继续', noConversation: '原会话没有对话记录，请用新会话继续',
-      }));
+      }, { immediate, draftAction, draftSeq }));
     }
     const card = addCard(next, session.id, 'feedback', text);
-    return { task: next, session, card };
+    const result = { task: next, session, card };
+    if (replayKey) {
+      feedbackReplays.set(replayKey, { expires: now + FEEDBACK_REPLAY_MS, result: { ...result, session: { ...session } } });
+      if (feedbackReplays.size > FEEDBACK_REPLAY_LIMIT) {
+        const oldest = feedbackReplays.keys().next().value;
+        if (oldest !== undefined) feedbackReplays.delete(oldest);
+      }
+    }
+    return result;
   }
-
-  const switching = new Set<string>(); // task ids whose handoff card is being made
 
   // Makes a handoff card with the target agent (an excerpt of the transcript if that fails) and starts the target on the task.
   async function switchAgent(id: string, b: Record<string, unknown>): Promise<SwitchResult> {
@@ -819,10 +1026,26 @@ export function createApp(cfg: AppConfig) {
     if (!project) throw new HttpError(400, '项目不存在');
     if (switching.has(id)) throw new HttpError(409, '正在换 agent');
     switching.add(id);
+    let frozenSessionId: string | undefined;
     try {
-      const note = typeof body.note === 'string' ? body.note.trim() || undefined : undefined;
       const current = (t: Task) => (t.sessionId ? sessions.list().find(s => s.id === t.sessionId) : undefined);
       const before = current(first);
+      if (before) {
+        // Freeze the old session's queue BEFORE snapshotting so queued items cannot simultaneously drain into
+        // the old CLI AND be carried into the new agent (unfrozen in `finally` if switching fails).
+        sessions.setQueuePaused(before.id, true);
+        frozenSessionId = before.id;
+      }
+      // Carry any already-queued human messages into the handoff note so replacing the old session never drops them
+      // while still letting the user switch away from a rate-limited or wedged session.
+      const queuedTexts = before
+        ? sessions.getPendingInputs(before.id).filter(p => p.state === 'queued').map(p => p.text.trim()).filter(Boolean)
+        : [];
+      const rawNote = typeof body.note === 'string' ? body.note.trim() || undefined : undefined;
+      const queuedNote = queuedTexts.length
+        ? `原会话尚未送达的排队消息（请一并处理）：\n${queuedTexts.map((t, i) => `${i + 1}. ${t}`).join('\n')}`
+        : undefined;
+      const note = [rawNote, queuedNote].filter(Boolean).join('\n\n') || undefined;
       const from = before?.agent ?? first.agent;
       const healedAgyId = from === 'agy' && before ? agyResumeId(before.nativeSessionId, before.transcriptPath) : undefined;
       const tp = (healedAgyId ? agyTranscriptFile(healedAgyId) : undefined) ?? before?.transcriptPath;
@@ -844,6 +1067,7 @@ export function createApp(cfg: AppConfig) {
       const saved = addCard(next, session.id, 'handoff', card, { from, to: agent, generated: generated !== null });
       return { task: next, session, card: saved, generated: generated !== null };
     } finally {
+      if (frozenSessionId) sessions.setQueuePaused(frozenSessionId, false);
       switching.delete(id);
     }
   }
@@ -872,6 +1096,7 @@ export function createApp(cfg: AppConfig) {
       const target = store.getTask(to.taskId);
       if (!target) throw new HttpError(404, '目标任务不存在');
       if (target.id === source.id) throw new HttpError(400, '不能转发给同一个任务');
+      if (switching.has(target.id)) throw new HttpError(409, '目标任务正在切换智能体，请稍候重试', 'switching');
       const project = store.getProject(target.projectId);
       if (!project) throw new HttpError(400, '项目不存在');
       if (!currentAgents().includes(target.agent)) throw new HttpError(400, `智能体不可用：${target.agent}`);
@@ -1086,15 +1311,45 @@ export function createApp(cfg: AppConfig) {
   async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, pathname: string) {
     const origin = req.headers.origin;
     if (origin !== undefined && !allowed.has(origin)) throw new HttpError(403, 'Origin 不被允许');
+    if (pathname.includes('%')) safeDecode(pathname);
     const method = req.method ?? 'GET';
     if (method !== 'GET' && method !== 'HEAD') sessions.markDesktopActive();
-    if (method === 'POST' && pathname === '/api/attachments') {
+    if (method === 'POST' && (pathname === '/api/attachments' || pathname === '/api/attachments/image')) {
       const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
-      const ext = IMAGE_EXT[type];
+      const ext = Object.hasOwn(IMAGE_EXT, type) ? IMAGE_EXT[type] : undefined;
       if (!ext) throw new HttpError(415, '只支持 PNG、JPEG、GIF、WebP 图片');
-      const data = await readBuffer(req, MAX_ATTACHMENT);
-      if (data.length === 0) throw new HttpError(400, '图片内容为空');
-      return send(res, 200, saveAttachment(ext, data));
+      const dir = path.join(cfg.stateDir, 'attachments');
+      const name = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`;
+      const target = path.join(dir, name);
+      await streamToTempAttachment(req, MAX_ATTACHMENT, '图片', target, ext);
+      return send(res, 200, { path: path.resolve(target), name });
+    }
+    if (method === 'POST' && pathname === '/api/attachments/file') {
+      const rawNameHeader = req.headers['x-file-name'];
+      const rawHeaderStr = typeof rawNameHeader === 'string' ? rawNameHeader.trim() : '';
+      const decodedName = safeDecode(rawHeaderStr, '附件文件名编码无效');
+      const baseName = path.basename(decodedName.trim());
+      if (!baseName || /[\r\n\0]/.test(baseName)) throw new HttpError(400, '缺少有效的文件名');
+      const ext = path.extname(baseName).replace(/^\./, '').toLowerCase();
+      if (!ext || !ALLOWED_FILE_EXTS.has(ext)) {
+        throw new HttpError(415, `暂不支持拖入上传此类型文件（.${ext || '未知'}），可改用 Ctrl+C / Ctrl+V 直接粘贴本地路径`);
+      }
+      const dir = path.join(cfg.stateDir, 'attachments');
+      const name = fileAttachmentName(baseName, ext);
+      const target = path.join(dir, name);
+      const size = await streamToTempAttachment(req, MAX_FILE_ATTACHMENT, '文件', target);
+      return send(res, 200, { path: path.resolve(target), name, originalName: baseName, size });
+    }
+    if (method === 'POST' && pathname === '/api/clipboard/image') {
+      try {
+        const png = await clipboardImagePng();
+        if (!png || png.length === 0) return send(res, 200, { path: null, name: null });
+        if (png.length > MAX_ATTACHMENT) throw new HttpError(413, `剪贴板图片过大（上限 ${Math.round(MAX_ATTACHMENT / (1024 * 1024))} MB）`);
+        return send(res, 200, saveAttachment('png', png));
+      } catch (e) {
+        if (e instanceof HttpError) throw e;
+        throw new HttpError(500, (e as Error).message);
+      }
     }
     let body: Record<string, unknown> = {};
     if (method === 'POST' || method === 'PATCH' || method === 'PUT') {
@@ -1109,7 +1364,7 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/mobile/admin/devices/revoke-all') return send(res, 200, mobile!.revokeAllDevices());
     if (method === 'POST' && pathname === '/api/mobile/admin/notify/test') return send(res, 200, await mobile!.sendTestNotification());
     const mobDev = pathname.match(/^\/api\/mobile\/admin\/devices\/([^/]+)$/);
-    if (method === 'DELETE' && mobDev) return send(res, 200, mobile!.revokeDevice(decodeURIComponent(mobDev[1])));
+    if (method === 'DELETE' && mobDev) return send(res, 200, mobile!.revokeDevice(safeDecode(mobDev[1])));
     if (method === 'GET' && pathname === '/api/state') return send(res, 200, snapshot());
     if (method === 'POST' && pathname === '/api/shutdown' && cfg.onShutdown) {
       send(res, 202, { pid: process.pid });
@@ -1241,10 +1496,7 @@ export function createApp(cfg: AppConfig) {
     if (method === 'POST' && pathname === '/api/sessions/resume-interrupted') return send(res, 200, resumeInterrupted(body));
     if (method === 'POST' && pathname === '/api/sessions/dismiss-interrupted') return send(res, 200, dismissInterrupted());
     const pas = pathname.match(/^\/api\/projects\/([^/]+)\/archive-stopped$/);
-    if (method === 'POST' && pas) return send(res, 200, archiveStoppedTasks(decodeURIComponent(pas[1])));
-    const safeDecode = (seg: string) => {
-      try { return decodeURIComponent(seg); } catch { throw new HttpError(400, '路径参数编码无效'); }
-    };
+    if (method === 'POST' && pas) return send(res, 200, archiveStoppedTasks(safeDecode(pas[1])));
     const st = pathname.match(/^\/api\/tasks\/([^/]+)\/stream$/);
     if (method === 'GET' && st) {
       const task = store.getTask(safeDecode(st[1]));
@@ -1294,35 +1546,31 @@ export function createApp(cfg: AppConfig) {
       return send(res, 200, { ok: true });
     }
     const r = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
-    if (method === 'POST' && r) return send(res, 200, resumeTask(r[1], body));
+    if (method === 'POST' && r) return send(res, 200, resumeTask(safeDecode(r[1]), body));
     const sw = pathname.match(/^\/api\/tasks\/([^/]+)\/switch$/);
-    if (method === 'POST' && sw) return send(res, 200, await switchAgent(sw[1], body));
+    if (method === 'POST' && sw) return send(res, 200, await switchAgent(safeDecode(sw[1]), body));
     const fw = pathname.match(/^\/api\/cards\/([^/]+)\/forward$/);
-    if (method === 'POST' && fw) return send(res, 200, forward(fw[1], body));
+    if (method === 'POST' && fw) return send(res, 200, forward(safeDecode(fw[1]), body));
     const act = pathname.match(/^\/api\/tasks\/([^/]+)\/(approve|archive|unarchive|feedback)$/);
     if (method === 'POST' && act) {
-      if (act[2] === 'feedback') return send(res, 200, feedback(act[1], body));
-      const task = store.getTask(act[1]);
-      if (!task) throw new HttpError(404, '任务不存在');
-      if (act[2] === 'archive' && task.delegation && task.phase !== 'archived') {
-        const closed = closeDelegation(task, 'canceled');
-        cancelChildrenOf(new Set([task.id]));
-        return send(res, 200, closed);
+      if (act[2] === 'feedback') {
+        return send(res, 200, feedback(safeDecode(act[1]), body, { allowImmediate: true, allowLocalPaths: true, allowGeneralAttachments: true, allowDraftIgnore: true }));
       }
-      if (act[2] === 'archive' && task.sessionId) sessions.kill(task.sessionId);
+      const task = store.getTask(safeDecode(act[1]));
+      if (!task) throw new HttpError(404, '任务不存在');
+      if (act[2] === 'archive') return send(res, 200, archiveTask(task.id));
       let base = task;
       if (act[2] === 'unarchive' && task.delegation) {
         const { outcome: _o, settledAt: _s, ...open } = task.delegation;
         base = { ...task, delegation: open };
       }
-      const moved = setPhase(base, act[2] === 'approve' ? 'approved' : act[2] === 'archive' ? 'archived' : 'active');
-      if (act[2] === 'archive') cancelChildrenOf(new Set([task.id]));
+      const moved = setPhase(base, act[2] === 'approve' ? 'approved' : 'active');
       return send(res, 200, moved);
     }
     const m = pathname.match(/^\/api\/tasks\/([^/]+)$/);
-    if (method === 'PATCH' && m) return send(res, 200, renameTask(m[1], body));
+    if (method === 'PATCH' && m) return send(res, 200, renameTask(safeDecode(m[1]), body));
     if (method === 'DELETE' && m) {
-      const task = store.getTask(m[1]);
+      const task = store.getTask(safeDecode(m[1]));
       if (!task) throw new HttpError(404, '任务不存在');
       cfg.usage.scan(); // records which task its sessions belonged to before they are dropped
       cancelChildrenOf(new Set([task.id]));
@@ -1339,7 +1587,7 @@ export function createApp(cfg: AppConfig) {
     }
     const pw = pathname.match(/^\/api\/projects\/([^/]+)\/(changes|diff|tree|files|ignored-files|file|raw|discard)$/);
     if (pw) {
-      const project = store.getProject(decodeURIComponent(pw[1]));
+      const project = store.getProject(safeDecode(pw[1]));
       if (!project) throw new HttpError(404, '项目不存在');
       const sub = pw[2];
       const q = new URL(req.url ?? '/', 'http://x').searchParams;
@@ -1378,7 +1626,7 @@ export function createApp(cfg: AppConfig) {
     const pfs = pathname.match(/^\/api\/projects\/([^/]+)\/fs\/(create|rename|delete|paste)$/);
     if (pfs) {
       if (method !== 'POST') throw new HttpError(405, '请求方法不支持');
-      const project = store.getProject(decodeURIComponent(pfs[1]));
+      const project = store.getProject(safeDecode(pfs[1]));
       if (!project) throw new HttpError(404, '项目不存在');
       const op = pfs[2];
       if (op === 'create') {
@@ -1405,7 +1653,7 @@ export function createApp(cfg: AppConfig) {
     }
     const pm = pathname.match(/^\/api\/projects\/([^/]+)$/);
     if (method === 'DELETE' && pm) {
-      const project = store.getProject(pm[1]);
+      const project = store.getProject(safeDecode(pm[1]));
       if (!project) throw new HttpError(404, '项目不存在');
       cfg.usage.scan(); // records which project / task its sessions belonged to before they are dropped
       const mine = store.tasks().filter(t => t.projectId === project.id);
@@ -1474,6 +1722,22 @@ export function createApp(cfg: AppConfig) {
     const hookBody = b as HookBody;
     const hookRes = sessions.hook(hookBody);
     let needTelemetry = false;
+    if (!hookRes && hookBody.agent === 'agy') {
+      // Forward verified agy background subagent hooks exclusively to StreamWatcher so Dialog mode reflects
+      // real-time subagent progress without ever mutating parent session status, nativeSessionId, or cards.
+      const p = (hookBody.payload ?? {}) as Record<string, unknown>;
+      const conv = typeof p.conversationId === 'string' ? p.conversationId.trim() : '';
+      const parent = conv ? sessions.list().find(s => s.id === hookBody.sessionId && s.status !== 'exited') : undefined;
+      if (parent && parent.nativeSessionId && conv.toLowerCase() !== parent.nativeSessionId.toLowerCase()) {
+        const known = streamWatcher.knowsSubagent(parent.id, conv);
+        let isChild = known;
+        if (!isChild) {
+          const st = agyConversationState(conv);
+          isChild = st.kind === 'subagent' && st.parentIds.some(id => id.toLowerCase() === parent.nativeSessionId!.toLowerCase());
+        }
+        if (isChild) streamWatcher.onSubagentHook(parent.id, hookBody.event, p, hookBody.at);
+      }
+    }
     if (hookRes) { // unknown sessions are logged and ignored
       const latest = sessions.list().find(s => s.id === hookBody.sessionId);
       if (latest) {
@@ -1506,14 +1770,16 @@ export function createApp(cfg: AppConfig) {
   }
 
   function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string) {
+    const decodedPath = safeDecode(pathname);
+    if (decodedPath.includes('\0')) throw new HttpError(400, '路径参数无效');
     if (!fs.existsSync(path.join(DIST, 'index.html'))) {
-      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }).end('web/dist 不存在，请先运行 npm run build');
+      res.writeHead(404, { ...staticHeaders, 'content-type': 'text/plain; charset=utf-8' }).end('web/dist 不存在，请先运行 npm run build');
       return;
     }
-    let file = path.join(DIST, decodeURIComponent(pathname));
+    let file = path.join(DIST, decodedPath);
     const inside = file === DIST || file.startsWith(DIST + path.sep);
     if (!inside || !fs.existsSync(file) || !fs.statSync(file).isFile()) file = path.join(DIST, 'index.html'); // SPA fallback
-    res.writeHead(200, { 'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream' });
+    res.writeHead(200, { ...staticHeaders, 'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream' });
     if (req.method === 'HEAD') res.end();
     // pipeline: a read error (file replaced by a rebuild mid-request) ends this response instead of crashing the server.
     else pipeline(fs.createReadStream(file), res, e => { if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.warn('[static]', file, e.message); });
@@ -1537,6 +1803,7 @@ export function createApp(cfg: AppConfig) {
     switchAgent,
     forward,
     setTaskPhase: (task, phase) => setPhase(task, phase),
+    archiveTask,
     saveAttachment,
     async listChanges(projectId) {
       const project = store.getProject(projectId);
@@ -1622,11 +1889,25 @@ export function createApp(cfg: AppConfig) {
     if (clients.size && activity.hasActive()) activity.tick();
   }, 750);
   activityTimer.unref();
+  let pruningAttachments = false;
+  const runAttachmentGc = () => {
+    if (pruningAttachments) return;
+    pruningAttachments = true;
+    void pruneAttachments(cfg.stateDir, attachmentReferences)
+      .catch(e => console.warn('[attachments]', e))
+      .finally(() => { pruningAttachments = false; });
+  };
+  const attachmentGcTimer = setInterval(runAttachmentGc, ATTACHMENT_GC_INTERVAL_MS);
+  attachmentGcTimer.unref();
+  const initialAttachmentGc = setTimeout(runAttachmentGc, 5_000);
+  initialAttachmentGc.unref();
   server.on('close', () => {
     clearInterval(archiveTimer);
     clearInterval(gitTimer);
     clearInterval(usageTimer);
     clearInterval(activityTimer);
+    clearInterval(attachmentGcTimer);
+    clearTimeout(initialAttachmentGc);
     streamWatcher.close();
     void mobile?.close();
   });
@@ -1669,8 +1950,25 @@ export function createApp(cfg: AppConfig) {
       try { m = JSON.parse(raw.toString()) as ClientMsg; } catch { return; }
       if (!m || typeof m !== 'object') return;
       if (m.t === 'in' && typeof m.id === 'string' && typeof m.d === 'string') sessions.input(m.id, m.d);
+      else if (m.t === 'clear-input' && typeof m.id === 'string' && typeof m.d === 'string') {
+        const result = sessions.clearInput(m.id, m.d, m.draftSeq, true);
+        ws.send(JSON.stringify({ t: 'draft-action-result', id: m.id, action: 'clear', ...result } satisfies ServerMsg));
+      }
+      else if (m.t === 'confirm-clear-input' && typeof m.id === 'string') {
+        sessions.confirmClearInput(m.id, typeof m.draftSeq === 'number' ? m.draftSeq : undefined);
+      }
+      else if (m.t === 'confirm-empty-draft' && typeof m.id === 'string' && typeof m.draftSeq === 'number') sessions.confirmEmptyDraft(m.id, m.draftSeq);
+      else if (m.t === 'send-draft' && typeof m.id === 'string') {
+        const result = sessions.sendDraft(m.id, m.draftSeq, true);
+        ws.send(JSON.stringify({ t: 'draft-action-result', id: m.id, action: 'send', ...result } satisfies ServerMsg));
+      }
+      else if (m.t === 'cancel-pending-input' && typeof m.id === 'string' && typeof m.pendingId === 'string') sessions.cancelPendingInput(m.id, m.pendingId);
+      else if (m.t === 'retry-pending-input' && typeof m.id === 'string' && typeof m.pendingId === 'string') sessions.retryPendingInput(m.id, m.pendingId);
       else if (m.t === 'resize' && typeof m.id === 'string') sessions.resize(m.id, Number(m.cols), Number(m.rows));
-      else if (m.t === 'watch-stream' && typeof m.id === 'string') streamWatcher.watch(ws, m.id);
+      else if (m.t === 'watch-stream' && typeof m.id === 'string') {
+        sessions.flushDraft(m.id);
+        streamWatcher.watch(ws, m.id);
+      }
       else if (m.t === 'unwatch-stream' && typeof m.id === 'string') streamWatcher.unwatch(ws, m.id);
       else if (m.t === 'want-replay' && typeof m.id === 'string' && !sessions.hasLiveBuffer(m.id)) {
         ws.send(JSON.stringify({ t: 'replay', id: m.id, d: sessions.replayOf(m.id) ?? '' } satisfies ServerMsg));

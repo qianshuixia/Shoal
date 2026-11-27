@@ -99,6 +99,113 @@ describe('deliverable', () => {
 });
 
 describe('PTY input guards & env Path normalization', () => {
+  async function withFakePty(run: (mgr: SessionManager, session: ReturnType<SessionManager['spawn']>, writes: ReturnType<typeof vi.fn<(data: string) => void>>) => Promise<void>) {
+    vi.useFakeTimers();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-draft-'));
+    const writes = vi.fn<(data: string) => void>();
+    vi.spyOn(pty, 'spawn').mockImplementation((() => ({
+      pid: 9001, write: writes, onData() { return { dispose() {} }; },
+      onExit() { return { dispose() {} }; }, kill() {},
+    })) as unknown as typeof pty.spawn);
+    const mgr = new SessionManager({ port: 47899, token: 't', stateDir: tmp });
+    try {
+      const session = mgr.spawn({ taskId: 't1', projectId: 'p1', agent: 'fake', cwd: tmp, prompt: '' });
+      mgr.hook({ sessionId: session.id, agent: 'fake', event: 'SessionStart', at: Date.now(), payload: { session_id: 'native' } });
+      await run(mgr, session, writes);
+    } finally {
+      const closing = mgr.killAll();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await closing;
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
+  it('releases a simple Backspace-cleared draft and debounces version-only events', async () => {
+    await withFakePty(async (mgr, session, write) => {
+      const broadcast = vi.fn();
+      mgr.subscribe(broadcast);
+      mgr.input(session.id, '草稿a');
+      const seq = session.terminalDraftSeq!;
+      mgr.input(session.id, '\x7f');
+      mgr.input(session.id, '\x08');
+      expect(session.terminalDraftSeq).toBe(seq + 2);
+      expect(broadcast).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(broadcast).toHaveBeenCalledTimes(2);
+      mgr.enqueue(session.id, 'wait for the draft');
+      expect(mgr.getPendingInputs(session.id)).toMatchObject([{ state: 'queued', reason: 'terminal-draft' }]);
+      mgr.input(session.id, '\x7f');
+      expect(session.hasTerminalDraft).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(write).toHaveBeenCalledWith('wait for the draft');
+    });
+  });
+
+  it('rejects stale edits before PTY writes and requires proof for a complex empty draft', async () => {
+    await withFakePty(async (mgr, session, write) => {
+      mgr.input(session.id, 'a');
+      const stale = session.terminalDraftSeq!;
+      mgr.input(session.id, '\x1b[D');
+      mgr.input(session.id, '\x7f');
+      const current = session.terminalDraftSeq!;
+      expect(session.hasTerminalDraft).toBe(true);
+      write.mockClear();
+      expect(mgr.clearInput(session.id, '\x05\x15', stale)).toEqual({ ok: false, reason: 'stale', draftSeq: current });
+      expect(mgr.clearInput(session.id, '\x05\x15', undefined, true)).toEqual({ ok: false, reason: 'stale', draftSeq: current });
+      expect(mgr.sendDraft(session.id, stale)).toEqual({ ok: false, reason: 'stale', draftSeq: current });
+      expect(mgr.sendDraft(session.id, undefined, true)).toEqual({ ok: false, reason: 'stale', draftSeq: current });
+      expect(write).not.toHaveBeenCalled();
+      expect(mgr.confirmEmptyDraft(session.id, stale)).toBe(false);
+      expect(mgr.confirmEmptyDraft(session.id, current)).toBe(true);
+      mgr.input(session.id, 'new draft');
+      const next = session.terminalDraftSeq!;
+      expect(mgr.sendDraft(session.id, next)).toMatchObject({ ok: true });
+      expect(write.mock.calls).toEqual([['new draft'], ['\r']]);
+      expect(session.hasTerminalDraft).toBeUndefined();
+    });
+  });
+
+  it('stops on paste failure and retains interrupted inputs until cancellation', async () => {
+    await withFakePty(async (mgr, session, write) => {
+      write.mockImplementationOnce(() => { throw new Error('synthetic PTY write failure'); });
+      const delivered = vi.fn();
+      mgr.enqueue(session.id, 'failed first', { onDelivered: delivered });
+      await vi.advanceTimersByTimeAsync(3_500);
+      expect(write.mock.calls).toEqual([['failed first']]);
+      expect(delivered).not.toHaveBeenCalled();
+      const [failed] = mgr.getPendingInputs(session.id);
+      expect(failed).toMatchObject({ state: 'failed', reason: 'write-error', text: 'failed first' });
+      expect(session.queued).toBe(0);
+      mgr.enqueue(session.id, 'next to paste');
+      await vi.advanceTimersByTimeAsync(250);
+      expect(write).toHaveBeenCalledWith('next to paste');
+      mgr.input(session.id, 'x');
+      await vi.advanceTimersByTimeAsync(16_000);
+      const [, interrupted] = mgr.getPendingInputs(session.id);
+      expect(interrupted).toMatchObject({ state: 'uncertain', reason: 'interrupted', text: 'next to paste' });
+      expect(write).not.toHaveBeenCalledWith('\r');
+      expect(mgr.cancelPendingInput(session.id, failed.id)).toBe(true);
+      expect(mgr.cancelPendingInput(session.id, interrupted.id)).toBe(true);
+      expect(mgr.getPendingInputs(session.id)).toEqual([]);
+
+      // Lossless server-side retry preserves full >64KB payload + attachment paths and only removes failed entry after re-enqueue.
+      const hugePayload = `${'A'.repeat(70_000)}\nC:\\work\\attachments\\demo.png`;
+      write.mockImplementationOnce(() => { throw new Error('synthetic PTY write failure'); });
+      mgr.enqueue(session.id, hugePayload, { draftAction: 'ignore', draftSeq: session.terminalDraftSeq });
+      await vi.advanceTimersByTimeAsync(3_500);
+      const [hugeFailed] = mgr.getPendingInputs(session.id);
+      expect(hugeFailed).toMatchObject({ state: 'failed', reason: 'write-error' });
+      expect(hugeFailed.text).toBe(hugePayload);
+      write.mockClear();
+      expect(mgr.retryPendingInput(session.id, hugeFailed.id)).toBe(true);
+      const pendingAfterRetry = mgr.getPendingInputs(session.id);
+      expect(pendingAfterRetry).toHaveLength(1);
+      expect(pendingAfterRetry[0]).toMatchObject({ state: 'queued', text: hugePayload });
+    });
+  });
+
   it('filters xterm focus, mouse, CPR, DA, and OSC responses while keeping real keys', () => {
     for (const seq of ['', '\x1b[I', '\x1b[O', '\x1b[I\x1b[O', '\x1b[<35;12;8M', '\x1b[<0;10;5m', '\x1b[12;40R', '\x1b[?62;22c', '\x1b]11;rgb:1111/1111/1111\x1b\\']) {
       expect(isTerminalReportSequence(seq)).toBe(true);
@@ -183,6 +290,59 @@ describe('PTY input guards & env Path normalization', () => {
       expect(delivered).toBe(true);
       const hk = mgr.hook({ sessionId: s.id, agent: 'fake', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'n1', prompt: 'clean-system' } });
       expect(hk).toEqual({ userTurn: false, systemInjected: true });
+
+      // StreamView terminal draft collision guard: hasTerminalDraft + terminalDraftSeq track uncommitted typing,
+      // `draftAction: 'guard'` refuses to stomp on it, stale draftSeq is rejected, and two-phase `clearInput` ->
+      // `confirmClearInput` keeps hasDraft locked on write error or unverified clear!
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'Stop', at: Date.now(), payload: { session_id: 'n1' } });
+      await vi.advanceTimersByTimeAsync(2000);
+      mgr.input(s.id, 'partial-draft');
+      const draftInfo = mgr.list().find(x => x.id === s.id);
+      expect(draftInfo?.hasTerminalDraft).toBe(true);
+      expect(typeof draftInfo?.terminalDraftSeq).toBe('number');
+      const seq1 = draftInfo!.terminalDraftSeq!;
+
+      expect(mgr.enqueue(s.id, 'must-wait-for-draft', { draftAction: 'guard', immediate: true })).toBe(true);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(writes).not.toContain('must-wait-for-draft');
+
+      // Unsafe clearInput payloads (Enter, Ctrl+C, printable text) are rejected.
+      expect(mgr.clearInput(s.id, '\r')).toBe(false);
+      expect(mgr.clearInput(s.id, '\x03')).toBe(false);
+      expect(mgr.clearInput(s.id, 'rm -rf')).toBe(false);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBe(true);
+
+      // Phase 2 cannot unlock without a prior matching clearInput() or without an explicit draftSeq.
+      expect(mgr.confirmClearInput(s.id)).toBe(false);
+      expect(mgr.confirmClearInput(s.id, seq1)).toBe(false);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBe(true);
+
+      // Enqueue without draftAction or with unversioned/stale ignore must NOT unlock a live draft!
+      expect(mgr.enqueue(s.id, 'default-still-guarded')).toBe(true);
+      expect(mgr.enqueue(s.id, 'unversioned-ignore', { draftAction: 'ignore' })).toBe(true);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBe(true);
+
+      // Phase 1 clearInput writes control sequence ONLY and does NOT unlock hasDraft until verified!
+      expect(mgr.clearInput(s.id, '\x05\x15')).toBe(true);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBe(true);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(writes).not.toContain('must-wait-for-draft');
+
+      // Newer user typing invalidates both the prior clearInput() and seq1: confirmClearInput must reject seq1 AND seq2!
+      mgr.input(s.id, '2');
+      const seq2 = mgr.list().find(x => x.id === s.id)!.terminalDraftSeq!;
+      expect(seq2).toBeGreaterThan(seq1);
+      expect(mgr.confirmClearInput(s.id, seq1)).toBe(false);
+      expect(mgr.confirmClearInput(s.id, seq2)).toBe(false);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBe(true);
+
+      // Fresh Phase 1 clearInput + matching seq2 in Phase 2 unlocks hasTerminalDraft and drains immediately!
+      expect(mgr.clearInput(s.id, '\x05\x15')).toBe(true);
+      expect(mgr.confirmClearInput(s.id, seq2)).toBe(true);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBeUndefined();
+      expect(mgr.list().find(x => x.id === s.id)?.terminalDraftSeq).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(400);
+      expect(writes).toContain('must-wait-for-draft');
     } finally {
       await mgr.killAll();
       vi.useRealTimers();

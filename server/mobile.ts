@@ -157,7 +157,8 @@ export interface MobileHandlers {
   feedback(id: string, body: Record<string, unknown>): { task: Task; session: SessionInfo; card: Card };
   switchAgent(id: string, body: Record<string, unknown>): Promise<SwitchResult>;
   forward(cardId: string, body: Record<string, unknown>): ForwardResult;
-  setTaskPhase(task: Task, phase: 'approved' | 'archived' | 'active'): Task;
+  setTaskPhase(task: Task, phase: 'approved' | 'active'): Task;
+  archiveTask(id: string): Task;
   saveAttachment(ext: string, data: Buffer): { path: string; name: string };
   listChanges(projectId: string): Promise<ProjectChanges>;
   readDiff(projectId: string, relPath: string): Promise<DiffPayload>;
@@ -167,6 +168,7 @@ export interface MobileHandlers {
 }
 
 const VIRTUAL_IFACE_RE = /(vethernet|wsl|hyper-v|vmware|virtualbox|loopback|teredo|isatap|utun|tun|tap|zerotier|docker|br-)/i;
+const TERM_KEYS = new Set(['y', 'n', '\r', '\x1b', '\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D', '\t', ...'123456789', ' ', '\x7f', '\x03']);
 
 export function detectLanIps(): string[] {
   const ifaces = os.networkInterfaces();
@@ -322,8 +324,8 @@ export function scrubStatePaths(text: string, stateDir?: string, extraDirs?: Ite
       if (parts.length === 0) continue;
       const prefix = norm.startsWith('/') ? sep : '';
       const dirPattern = prefix + parts.map(escapeRegExp).join(sep);
-      const attachRe = new RegExp(`(?:file:\\/\\/\\/?)?${dirPattern}${sep}attachments${sep}([0-9a-zA-Z._-]+)`, flags);
-      out = out.replace(attachRe, (_m, name: string) => `[图片附件: ${name}]`);
+      const attachRe = new RegExp(String.raw`(?:file:\/\/\/?)?${dirPattern}${sep}attachments${sep}([^\\/:*?"<>|\x00-\x1f\s]+\.[a-zA-Z0-9]{1,12})(?=$|[${TRAILING_PATH_DELIM}])`, flags);
+      out = out.replace(attachRe, (_match, name: string) => `[${/\.(?:png|jpe?g|gif|webp|bmp|svg|ico|avif|heic|tiff?)$/i.test(name) ? '图片' : '文件'}附件: ${name}]`);
     }
   }
   for (const norm of collectScrubDirs(stateDir, extraDirs)) {
@@ -372,12 +374,19 @@ export function sanitizeConversationItemForMobile(item: ConversationItem, stateD
 export function sanitizeSessionForMobile(s: SessionInfo): SessionInfo {
   const copy = { ...s };
   delete copy.transcriptPath;
+  delete copy.terminalDraftSeq;
   return copy;
 }
 
-export function sanitizeActivityForMobile(a: SessionActivity): SessionActivity {
+export function sanitizeActivityForMobile(a: SessionActivity, stateDir?: string, extraDirs?: Iterable<string>): SessionActivity {
+  const scrub = (text: string) => scrubStatePaths(text, stateDir, extraDirs);
   return {
     ...a,
+    summary: scrub(a.summary),
+    ...(a.thinkingSnippet !== undefined && { thinkingSnippet: scrub(a.thinkingSnippet) }),
+    recentSteps: a.recentSteps.map(step => ({
+      ...step, summary: scrub(step.summary), ...(step.detail !== undefined && { detail: scrub(step.detail) }),
+    })),
     filesRead: a.filesRead.map(baseOfPath),
     filesWritten: a.filesWritten.map(baseOfPath),
   };
@@ -409,7 +418,7 @@ export function sanitizeCliToolForMobile(t: CliToolInfo, stateDir?: string, extr
 
 export function sanitizeSnapshotForMobile(s: Snapshot, stateDir?: string, extraDirs?: Iterable<string>): Snapshot {
   const activity: Record<string, SessionActivity> | undefined = s.activity
-    ? Object.fromEntries(Object.entries(s.activity).map(([k, v]) => [k, sanitizeActivityForMobile(v)]))
+    ? Object.fromEntries(Object.entries(s.activity).map(([k, v]) => [k, sanitizeActivityForMobile(v, stateDir, extraDirs)]))
     : undefined;
   return {
     ...s,
@@ -440,7 +449,7 @@ export function sanitizeServerMsgForMobile(m: ServerMsg, stateDir?: string, extr
     case 'clis':
       return { t: 'clis', agents: m.agents, cliTools: m.cliTools.map(t => sanitizeCliToolForMobile(t, stateDir, extraDirs)) };
     case 'activity':
-      return { t: 'activity', sessionId: m.sessionId, activity: m.activity ? sanitizeActivityForMobile(m.activity) : null };
+      return { t: 'activity', sessionId: m.sessionId, activity: m.activity ? sanitizeActivityForMobile(m.activity, stateDir, extraDirs) : null };
     default:
       return m;
   }
@@ -636,6 +645,7 @@ export function createMobileController(handlers: MobileHandlers) {
   const wsByDevice = new Map<string, Set<WebSocket>>();
   // Feedback retries carry the same clientMsgId; the first result is replayed instead of queueing the text twice.
   const FEEDBACK_REPLAY_MS = 10 * 60_000;
+  const FEEDBACK_REPLAY_LIMIT = 1024;
   const feedbackReplays = new Map<string, { at: number; body: unknown }>();
   // Prompt answers for one session run one at a time, so a double tap cannot pass the fingerprint check twice.
   const promptLocks = new Map<string, Promise<unknown>>();
@@ -1076,6 +1086,8 @@ export function createMobileController(handlers: MobileHandlers) {
       pathname === '/api/open' ||
       pathname === '/api/dirs' ||
       pathname === '/api/clipboard/files' ||
+      pathname === '/api/clipboard/image' ||
+      pathname === '/api/attachments/file' ||
       pathname === '/api/usage' ||
       pathname === '/api/settings' ||
       pathname === '/api/clis' ||
@@ -1099,7 +1111,7 @@ export function createMobileController(handlers: MobileHandlers) {
 
     if (method === 'POST' && pathname === '/api/attachments') {
       const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
-      const ext = IMAGE_EXT[type];
+      const ext = Object.hasOwn(IMAGE_EXT, type) ? IMAGE_EXT[type] : undefined;
       if (!ext) throw new MobileGatewayError(415, '只支持 PNG、JPEG、GIF、WebP 图片');
       const data = await readReqBuffer(req, MAX_MOBILE_ATTACHMENT);
       if (data.length === 0) throw new MobileGatewayError(400, '图片内容为空');
@@ -1147,7 +1159,7 @@ export function createMobileController(handlers: MobileHandlers) {
         task,
         session,
         cards: handlers.store.cards(),
-        activity: act ? sanitizeActivityForMobile(act) : null,
+        activity: act ? sanitizeActivityForMobile(act, handlers.stateDir, extraDirs) : null,
       });
       const payload: TaskConversationResponse = {
         ...built,
@@ -1266,7 +1278,10 @@ export function createMobileController(handlers: MobileHandlers) {
         }
         const replayKey = typeof rawId === 'string' ? `${device.id}:${taskId}:${rawId}` : null;
         const now = Date.now();
-        for (const [k, v] of feedbackReplays) if (now - v.at > FEEDBACK_REPLAY_MS) feedbackReplays.delete(k);
+        if (replayKey) for (const [k, v] of feedbackReplays) {
+          if (now - v.at <= FEEDBACK_REPLAY_MS) break;
+          feedbackReplays.delete(k);
+        }
         const prior = replayKey ? feedbackReplays.get(replayKey) : undefined;
         if (prior) return sendJson(res, 200, prior.body);
         const { clientMsgId: _drop, ...feedbackBody } = body;
@@ -1277,7 +1292,13 @@ export function createMobileController(handlers: MobileHandlers) {
           session: sanitizeSessionForMobile(r.session),
           card: sanitizeCardForMobile(r.card, handlers.stateDir, extraDirs),
         };
-        if (replayKey) feedbackReplays.set(replayKey, { at: now, body: payload });
+        if (replayKey) {
+          feedbackReplays.set(replayKey, { at: now, body: payload });
+          if (feedbackReplays.size > FEEDBACK_REPLAY_LIMIT) {
+            const oldest = feedbackReplays.keys().next().value;
+            if (oldest !== undefined) feedbackReplays.delete(oldest);
+          }
+        }
         return sendJson(res, 200, payload);
       }
       const task = handlers.store.getTask(taskId);
@@ -1286,8 +1307,8 @@ export function createMobileController(handlers: MobileHandlers) {
       if (action === 'approve' && (task.phase !== 'review' || body.phaseSince !== task.phaseSince)) {
         throw new MobileGatewayError(409, '这一轮验收已变化，请看最新结果后再操作', 'stale-round');
       }
-      if (action === 'archive' && task.sessionId) handlers.sessions.kill(task.sessionId);
-      return sendJson(res, 200, sanitizeTaskForMobile(handlers.setTaskPhase(task, action === 'approve' ? 'approved' : action === 'archive' ? 'archived' : 'active'), handlers.stateDir, extraDirs));
+      const moved = action === 'archive' ? handlers.archiveTask(task.id) : handlers.setTaskPhase(task, action === 'approve' ? 'approved' : 'active');
+      return sendJson(res, 200, sanitizeTaskForMobile(moved, handlers.stateDir, extraDirs));
     }
 
     const projMatch = pathname.match(/^\/api\/projects\/([^/]+)\/(changes|diff|raw)$/);
@@ -1466,7 +1487,7 @@ export function createMobileController(handlers: MobileHandlers) {
           meta.watchedSessionId = null;
           return;
         }
-        if (m.t === 'term-key' && typeof m.id === 'string' && typeof m.d === 'string' && m.d.length > 0 && m.d.length <= 64) {
+        if (m.t === 'term-key' && typeof m.id === 'string' && m.id === meta.watchedSessionId && TERM_KEYS.has(m.d)) {
           handlers.sessions.input(m.id, m.d, { fromMobile: true });
           return;
         }

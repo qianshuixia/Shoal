@@ -425,6 +425,10 @@ export interface SessionInfo {
   limit?: { message: string; resetsAt: number | null; at: number };
   // Set while paused at an interactive CLI permission or startup folder-trust prompt.
   blocked?: 'startup' | 'permission';
+  // Live runtime indicator: user typed uncommitted characters at the PTY prompt (never persisted).
+  hasTerminalDraft?: boolean;
+  // Server inputSeq snapshot tied to hasTerminalDraft so clear/ignore confirmations never race newer typing.
+  terminalDraftSeq?: number;
   // Permission mode this session was spawned with ('full' = skip approvals, 'normal' = CLI defaults).
   permissionMode?: PermissionMode;
 }
@@ -680,6 +684,8 @@ export const TASK_COLORS = [
 //                                                missing from/to = unbounded; rescans the CLI transcripts first)
 // POST   /api/attachments  Content-Type image/png|jpeg|gif|webp, raw body -> { path }  (saves to <stateDir>/attachments, path is absolute;
 //                                                415 other types, 413 over 20 MB, 400 empty body)
+// POST   /api/attachments/file  desktop-only common file upload (x-file-name header, raw body up to 100 MB) -> { path, name, originalName, size }
+// POST   /api/clipboard/image   desktop-only clipboard bitmap fallback -> { path, name } | { path: null, name: null }
 // POST   /api/open  { target } -> { action, path }  (a terminal link: file: URI or X:\ path, optional #L12 / :12:3 suffix; opens it in VS Code,
 //                                                Explorer or the default viewer, never executes it; 400 UNC / remote host / relative / other
 //                                                scheme, 404 missing file)
@@ -824,8 +830,14 @@ export interface FeedbackBody {
   text: string;
   mode: 'new' | 'same';
   attachments?: string[]; // basename-only attachment filenames stored in <stateDir>/attachments
+  filePaths?: string[]; // desktop-only existing local file paths (e.g. copied in Explorer/Finder)
   cols?: number;
   rows?: number;
+  fromStream?: boolean; // explicit desktop StreamView submit: skip stale terminal typing-quiet wait
+  draftAction?: 'guard' | 'ignore'; // 'guard' preserves server hasDraft collision lock; 'ignore' releases it after verification
+  draftSeq?: number; // terminalDraftSeq observed by client when requesting draftAction: 'ignore'
+  expectedSessionId?: string; // 409 conflict guard against concurrent agent switch / session replacement
+  clientMsgId?: string; // optional client-generated idempotency key for safe retries
 }
 
 export interface FeedbackResult {
@@ -1328,7 +1340,35 @@ export interface StreamToolEntry {
   detail?: string;
   status: 'running' | 'done' | 'error';
   files?: string[];
+  subagentId?: string; // links invoke_subagent / swarm / Agent / Task tool calls to StreamSubagent.id
 }
+
+export type StreamSubagentStatus = 'running' | 'done' | 'error';
+
+export interface StreamSubagentStep {
+  summary: string;
+  status: 'running' | 'done' | 'error';
+  detail?: string;
+  files?: string[];
+}
+
+export interface StreamSubagent {
+  id: string;
+  kind: 'subagent' | 'swarm';
+  name: string;
+  role?: string;
+  model?: string;
+  status: StreamSubagentStatus;
+  startedAt?: number;
+  updatedAt?: number;
+  summary?: string;
+  stepCount?: number;
+  recentSteps?: StreamSubagentStep[];
+  files?: string[];
+}
+
+export type PendingInputState = 'queued' | 'sending' | 'failed' | 'uncertain';
+export type PendingInputReason = 'terminal-draft' | 'working' | 'blocked' | 'write-error' | 'interrupted';
 
 export type StreamBlock =
   | {
@@ -1336,6 +1376,9 @@ export type StreamBlock =
       kind: 'user';
       text: string;
       at?: number;
+      pending?: PendingInputState;
+      pendingId?: string;
+      pendingReason?: PendingInputReason;
     }
   | {
       id: string;
@@ -1361,7 +1404,7 @@ export type StreamBlock =
     };
 
 export interface LiveStreamTail {
-  phase: 'preparing' | 'thinking' | 'tool' | 'answering';
+  phase: 'preparing' | 'thinking' | 'tool' | 'subagent' | 'answering';
   thinkingText?: string;
   answerText?: string;
   toolSummary?: string;
@@ -1377,8 +1420,10 @@ export interface SessionStreamState {
   rev: number;
   blocks: StreamBlock[];
   todos?: StreamTodoItem[];
+  subagents?: StreamSubagent[];
   live: LiveStreamTail | null;
   prompt: PromptView | null;
+  truncated?: boolean; // true when large transcript head+tail slicing omitted middle turns
 }
 
 export type ConversationItem =
@@ -1411,6 +1456,7 @@ export type ServerMsg =
   | { t: 'context'; sessionId: string; context: SessionContext | null } // live session context window update
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
   | { t: 'stream'; state: SessionStreamState } // dual-source rich streaming conversation view update
+  | { t: 'draft-action-result'; id: string; action: 'clear' | 'send'; ok: boolean; reason?: 'stale' | 'blocked' | 'busy' | 'error'; draftSeq?: number }
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per running session right after snapshot, or on 'want-replay'
   | { t: 'out'; id: string; d: string }
@@ -1419,6 +1465,12 @@ export type ServerMsg =
 
 export type ClientMsg =
   | { t: 'in'; id: string; d: string }
+  | { t: 'clear-input'; id: string; d: string; draftSeq?: number }
+  | { t: 'confirm-clear-input'; id: string; draftSeq?: number }
+  | { t: 'send-draft'; id: string; draftSeq?: number }
+  | { t: 'confirm-empty-draft'; id: string; draftSeq: number }
+  | { t: 'cancel-pending-input'; id: string; pendingId: string }
+  | { t: 'retry-pending-input'; id: string; pendingId: string }
   | { t: 'resize'; id: string; cols: number; rows: number }
   | { t: 'watch-term'; id: string }
   | { t: 'unwatch-term' }

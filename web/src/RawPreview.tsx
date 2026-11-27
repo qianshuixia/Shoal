@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { RawPreviewKind } from '../../shared/protocol.ts';
+import { ImageLightbox, ImageZoomViewer } from './ImageViewer.tsx';
 
 export const formatBytes = (n: number): string => {
   if (n < 1024) return `${n} B`;
@@ -23,6 +24,7 @@ export function RawPreview({ kind, src, path, size, onOpenExternal }: RawPreview
   const [failure, setFailure] = useState<string | null>(null);
   // An iframe gives no load-error signal for a broken PDF (the viewer just shows its own blank page), so check the header first.
   const [pdfChecked, setPdfChecked] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const mediaRef = useRef<HTMLMediaElement | null>(null);
   const sizeText = formatBytes(size);
 
@@ -90,13 +92,35 @@ export function RawPreview({ kind, src, path, size, onOpenExternal }: RawPreview
     );
   }
 
+  if (kind === 'image') {
+    return (
+      <div className="insp-image-wrap is-image-viewer" data-testid="image-preview">
+        <ImageZoomViewer
+          key={src}
+          src={src}
+          alt={path}
+          sizeText={sizeText}
+          onError={() => setFailure(`无法预览此图片（${sizeText}）。`)}
+          onOpenFullscreen={() => setFullscreen(true)}
+        />
+        {fullscreen && (
+          <ImageLightbox
+            src={src}
+            alt={path}
+            title={path}
+            sizeText={sizeText}
+            onClose={() => setFullscreen(false)}
+          />
+        )}
+      </div>
+    );
+  }
+
   const ext = /\.([A-Za-z0-9]+)$/.exec(path)?.[1].toUpperCase() ?? '未知';
   const onMediaError = () => setFailure(`内置播放器无法播放此文件（${ext}，${sizeText}），可能是编码格式不受支持。`);
   return (
     <div className="insp-image-wrap" data-testid={`${kind}-preview`}>
-      {kind === 'image' ? (
-        <img src={src} alt={path} onError={() => setFailure(`无法预览此图片（${sizeText}）。`)} />
-      ) : kind === 'video' ? (
+      {kind === 'video' ? (
         <video ref={(el) => { mediaRef.current = el; }} className="insp-video" controls preload="metadata" src={src} onError={onMediaError} />
       ) : (
         <audio ref={(el) => { mediaRef.current = el; }} className="insp-audio" controls preload="metadata" src={src} onError={onMediaError} />

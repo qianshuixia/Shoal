@@ -1,6 +1,26 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Tokens } from 'marked';
+import { sanitizeEChartsOption, sanitizeSvgMarkup } from './streamRichSanitize.ts';
+
+// Copy-success flag that auto-resets and never fires after unmount (clears its timer on cleanup).
+function useCopyFlag<T = true>(ms = 1600): [T | null, (v: T) => void] {
+  const [flag, setFlag] = useState<T | null>(null);
+  const timerRef = useRef<number | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timerRef.current), []);
+  const mark = useCallback((v: T) => {
+    setFlag(v);
+    clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => setFlag(null), ms);
+  }, [ms]);
+  return [flag, mark];
+}
+
+// useId contains ':' (and '«»' in React 19.1+); keep only characters that are valid inside an SVG id / CSS selector.
+function useSvgUid(tag: string): string {
+  const raw = useId();
+  return `${tag}-${raw.replace(/[^A-Za-z0-9_-]/g, '')}`;
+}
 
 // ---- Synchronous Fallback Highlighter (instant paint while Shiki grammar loads) ----
 
@@ -223,24 +243,24 @@ export const CodeBlockCard = memo(function CodeBlockCard({
   lang,
   text,
   notice,
+  streaming = false,
 }: {
   lang?: string;
   text: string;
   notice?: string;
+  // Content still growing: render cheap monospace text only (no fallback tokenizer, no Shiki).
+  streaming?: boolean;
 }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, markCopied] = useCopyFlag();
   const [wrapped, setWrapped] = useState(false);
   const [shikiLines, setShikiLines] = useState<ShikiTokenLine[] | null>(null);
-  const timerRef = useRef<number | undefined>(undefined);
 
   const normalizedLang = useMemo(() => resolveShikiLang(lang), [lang]);
   const isDiff = normalizedLang === 'diff';
-  const fallbackSpans = useMemo(() => highlightCodeFallback(text, lang), [text, lang]);
-
-  useEffect(() => () => clearTimeout(timerRef.current), []);
+  const fallbackSpans = useMemo(() => (streaming ? [] : highlightCodeFallback(text, lang)), [text, lang, streaming]);
 
   useEffect(() => {
-    if (!normalizedLang || isDiff || text.length > 48_000) {
+    if (streaming || !normalizedLang || isDiff || text.length > 48_000) {
       setShikiLines(null);
       return;
     }
@@ -255,14 +275,12 @@ export const CodeBlockCard = memo(function CodeBlockCard({
     return () => {
       cancelled = true;
     };
-  }, [text, normalizedLang, isDiff]);
+  }, [text, normalizedLang, isDiff, streaming]);
 
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text);
-      setCopied(true);
-      clearTimeout(timerRef.current);
-      timerRef.current = window.setTimeout(() => setCopied(false), 1600);
+      markCopied(true);
     } catch {
       /* ignore clipboard denial */
     }
@@ -299,7 +317,9 @@ export const CodeBlockCard = memo(function CodeBlockCard({
       </div>
       <pre className={`sv-code-pre ${wrapped ? 'is-wrap' : ''}`} data-shiki={shikiLines ? '1' : undefined}>
         <code>
-          {shikiLines
+          {streaming
+            ? text
+            : shikiLines
             ? shikiLines.map((line, li) => (
                 <span key={li} className="sv-code-line">
                   {line.map((tok, ti) => (
@@ -326,7 +346,7 @@ export const CodeBlockCard = memo(function CodeBlockCard({
 
 // ---- Lightbox Modal (Fullscreen Zoom / Pan for Diagrams & Charts) ----
 
-function DiagramLightbox({
+export function DiagramLightbox({
   title,
   onClose,
   children,
@@ -335,13 +355,50 @@ function DiagramLightbox({
   onClose: () => void;
   children: ReactNode;
 }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
+    // Remember the trigger so focus goes back to it on close.
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        onCloseRef.current();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusables = Array.from(
+        panel.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+      );
+      if (focusables.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (!panel.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      } else if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      if (trigger && trigger.isConnected) trigger.focus();
+    };
+  }, []);
 
   return (
     <div
@@ -352,10 +409,10 @@ function DiagramLightbox({
       aria-label={title}
       onClick={onClose}
     >
-      <div className="sv-lightbox-panel" onClick={(e) => e.stopPropagation()}>
+      <div ref={panelRef} className="sv-lightbox-panel" onClick={(e) => e.stopPropagation()}>
         <div className="sv-lightbox-head">
           <span className="sv-lightbox-title">{title}</span>
-          <button type="button" className="sv-card-btn" onClick={onClose}>
+          <button ref={closeRef} type="button" className="sv-card-btn" onClick={onClose}>
             关闭 (Esc)
           </button>
         </div>
@@ -367,6 +424,8 @@ function DiagramLightbox({
 
 // ---- Mermaid Diagram Renderer (beautiful-mermaid primary + official mermaid v11 fallback) ----
 
+const TERM_FONT_FAMILY = '"Maple Mono NF CN", "Cascadia Mono", Consolas, "Microsoft YaHei Mono", monospace';
+
 const SHOAL_MERMAID_COLORS = {
   bg: '#13161d',
   fg: '#dce2ec',
@@ -375,18 +434,12 @@ const SHOAL_MERMAID_COLORS = {
   muted: '#94a0b8',
   surface: '#1b202b',
   border: '#303a4c',
-  font: '"Inter Variable", "Inter", "PingFang SC", "Noto Sans SC", sans-serif',
+  font: 'Maple Mono NF CN',
   transparent: true,
 };
 
 let officialMermaidInit = false;
 let officialMermaidSeq = 0;
-
-function sanitizeSvgMarkup(svg: string): string {
-  return svg
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-}
 
 function detectMermaidLabel(code: string): string {
   const first = code.trim().split(/\r?\n/).find((l) => l.trim() && !l.trim().startsWith('%%'))?.trim().toLowerCase() ?? '';
@@ -406,12 +459,13 @@ function detectMermaidLabel(code: string): string {
   return 'Mermaid 图表';
 }
 
+// Returns RAW engine output: each card instance sanitizes it with its own id prefix (card vs lightbox).
 async function renderMermaidDualEngine(code: string): Promise<{ svg: string; engine: 'beautiful' | 'mermaid' }> {
   try {
     const bm = await import('beautiful-mermaid');
     const rawSvg = await bm.renderMermaidSVGAsync(code, SHOAL_MERMAID_COLORS);
     if (rawSvg && rawSvg.includes('<svg')) {
-      return { svg: sanitizeSvgMarkup(rawSvg), engine: 'beautiful' };
+      return { svg: rawSvg, engine: 'beautiful' };
     }
   } catch {
     // Fall back to official mermaid v11 for diagram types not yet covered by beautiful-mermaid (gantt, mindmap, pie, etc.)
@@ -424,7 +478,10 @@ async function renderMermaidDualEngine(code: string): Promise<{ svg: string; eng
       startOnLoad: false,
       theme: 'base',
       securityLevel: 'strict',
-      fontFamily: '"Inter Variable", "Inter", "PingFang SC", "Noto Sans SC", sans-serif',
+      // SVG <text> labels instead of <foreignObject> HTML, which the SVG sanitizer strips.
+      htmlLabels: false,
+      flowchart: { htmlLabels: false },
+      fontFamily: TERM_FONT_FAMILY,
       themeVariables: {
         darkMode: true,
         background: '#13161d',
@@ -454,7 +511,7 @@ async function renderMermaidDualEngine(code: string): Promise<{ svg: string; eng
   }
   const id = `sv-mmd-${++officialMermaidSeq}`;
   const res = await mermaid.render(id, code);
-  return { svg: sanitizeSvgMarkup(res.svg), engine: 'mermaid' };
+  return { svg: res.svg, engine: 'mermaid' };
 }
 
 function downloadDataUrl(url: string, filename: string) {
@@ -469,22 +526,29 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
   streaming = false,
 }: {
   code: string;
+  // Unclosed fence still growing: show a fixed-height skeleton instead of rebuilding SVG per frame.
   streaming?: boolean;
 }) {
-  const [svg, setSvg] = useState<string | null>(null);
+  const [rawSvg, setRawSvg] = useState<string | null>(null);
   const [engine, setEngine] = useState<'beautiful' | 'mermaid' | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [showSource, setShowSource] = useState(false);
   const [zoomed, setZoomed] = useState(false);
   const [scale, setScale] = useState(1);
-  const [copiedSvg, setCopiedSvg] = useState(false);
+  const [copiedSvg, markCopiedSvg] = useCopyFlag();
+  const [copiedSrc, markCopiedSrc] = useCopyFlag();
+  const cardUid = useSvgUid('mc');
+  const boxUid = useSvgUid('mb');
 
   const label = useMemo(() => detectMermaidLabel(code), [code]);
+  // Each instance gets its own id namespace so arrowheads/gradients never collide between cards or with the lightbox copy.
+  const svg = useMemo(() => (rawSvg ? sanitizeSvgMarkup(rawSvg, cardUid) || null : null), [rawSvg, cardUid]);
+  const zoomSvg = useMemo(() => (zoomed && rawSvg ? sanitizeSvgMarkup(rawSvg, boxUid) || null : null), [zoomed, rawSvg, boxUid]);
 
   useEffect(() => {
     const trimmed = code.trim();
     if (!trimmed) {
-      setSvg(null);
+      setRawSvg(null);
       setErr(null);
       return;
     }
@@ -494,14 +558,14 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
     void renderMermaidDualEngine(trimmed)
       .then((res) => {
         if (!cancelled) {
-          setSvg(res.svg);
+          setRawSvg(res.svg);
           setEngine(res.engine);
           setErr(null);
         }
       })
       .catch((e) => {
         if (!cancelled) {
-          setSvg(null);
+          setRawSvg(null);
           setErr((e as Error)?.message || '图表语法无法解析');
         }
       });
@@ -514,8 +578,16 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
     if (!svg) return;
     try {
       await navigator.clipboard.writeText(svg);
-      setCopiedSvg(true);
-      window.setTimeout(() => setCopiedSvg(false), 1600);
+      markCopiedSvg(true);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const copySource = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      markCopiedSrc(true);
     } catch {
       /* ignore */
     }
@@ -546,8 +618,11 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
     img.src = url;
   };
 
-  if (err && !streaming) {
-    return <CodeBlockCard lang="mermaid" text={code} notice="图表语法无法解析，已显示源码" />;
+  // Engine failure or the SVG was entirely rejected by the sanitizer: show reason + source + copy (never blank).
+  const failed = !streaming && (err !== null || (rawSvg !== null && svg === null));
+  if (failed) {
+    const reason = (err ?? '图表内容未通过安全检查').replace(/\s+/g, ' ').slice(0, 120);
+    return <CodeBlockCard lang="mermaid" text={code} notice={`图表语法无法解析，已显示源码 · ${reason}`} />;
   }
 
   return (
@@ -571,6 +646,9 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
             onClick={() => setShowSource((v) => !v)}
           >
             {showSource ? '预览图表' : '源码'}
+          </button>
+          <button type="button" className="sv-card-btn" onClick={() => void copySource()}>
+            {copiedSrc ? '✓ 已复制' : '复制源码'}
           </button>
           {svg && !showSource && (
             <>
@@ -607,13 +685,13 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
           dangerouslySetInnerHTML={{ __html: svg }}
         />
       ) : (
-        <div className="sv-viz-loading">
+        <div className={`sv-viz-loading ${streaming ? 'is-skeleton' : ''}`}>
           <span className="sv-pulse-dot" aria-hidden="true" />
-          <span>{streaming ? '正在接收图表定义…' : '正在渲染矢量图表…'}</span>
+          <span>{streaming ? '图表绘制中…' : '正在渲染矢量图表…'}</span>
         </div>
       )}
 
-      {zoomed && svg && (
+      {zoomed && zoomSvg && (
         <DiagramLightbox title={`${label} · Mermaid`} onClose={() => setZoomed(false)}>
           <div className="sv-lightbox-toolbar">
             <button type="button" className="sv-card-btn" onClick={() => setScale((s) => Math.max(0.5, +(s - 0.2).toFixed(2)))}>
@@ -631,7 +709,7 @@ export const MermaidDiagramCard = memo(function MermaidDiagramCard({
             <div
               className="sv-mermaid-canvas is-zoomed"
               style={{ transform: `scale(${scale})`, transformOrigin: 'center top' }}
-              dangerouslySetInnerHTML={{ __html: svg }}
+              dangerouslySetInnerHTML={{ __html: zoomSvg }}
             />
           </div>
         </DiagramLightbox>
@@ -691,7 +769,7 @@ function applyShoalEChartsTheme(raw: Record<string, unknown>): Record<string, un
     animationDuration: 360,
     textStyle: {
       color: '#cfd6e3',
-      fontFamily: '"Inter Variable", "Inter", "PingFang SC", "Noto Sans SC", sans-serif',
+      fontFamily: TERM_FONT_FAMILY,
       fontSize: 12,
       ...(typeof raw.textStyle === 'object' && raw.textStyle ? (raw.textStyle as object) : {}),
     },
@@ -717,15 +795,27 @@ function applyShoalEChartsTheme(raw: Record<string, unknown>): Record<string, un
   }
 
   if (raw.tooltip === undefined || (typeof raw.tooltip === 'object' && raw.tooltip !== null)) {
-    const tt = (raw.tooltip && typeof raw.tooltip === 'object' ? raw.tooltip : {}) as Record<string, unknown>;
-    opt.tooltip = {
+    const baseTooltip = {
       trigger: raw.xAxis || raw.yAxis ? 'axis' : 'item',
       backgroundColor: '#191d26',
       borderColor: 'rgba(255, 255, 255, 0.14)',
       borderWidth: 1,
       textStyle: { color: '#eef2f8', fontSize: 12 },
-      ...tt,
     };
+    if (Array.isArray(raw.tooltip)) {
+      opt.tooltip = raw.tooltip.map((item) => ({
+        ...baseTooltip,
+        ...(item && typeof item === 'object' ? (item as Record<string, unknown>) : {}),
+        renderMode: 'richText',
+      }));
+    } else {
+      const tt = (raw.tooltip && typeof raw.tooltip === 'object' ? raw.tooltip : {}) as Record<string, unknown>;
+      opt.tooltip = {
+        ...baseTooltip,
+        ...tt,
+        renderMode: 'richText',
+      };
+    }
   }
 
   if (raw.xAxis !== undefined) opt.xAxis = styleAxis(raw.xAxis);
@@ -747,10 +837,12 @@ function EChartsCanvas({
   option,
   height,
   onChartReady,
+  onError,
 }: {
   option: Record<string, unknown>;
   height: number;
   onChartReady?: (inst: import('echarts').ECharts | null) => void;
+  onError?: (message: string) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
 
@@ -761,16 +853,20 @@ function EChartsCanvas({
     let chart: import('echarts').ECharts | null = null;
     let ro: ResizeObserver | null = null;
 
-    void import('echarts').then((echarts) => {
-      if (disposed || !hostRef.current) return;
-      chart = echarts.init(hostRef.current, undefined, { renderer: 'canvas' });
-      chart.setOption(option, true);
-      onChartReady?.(chart);
-      ro = new ResizeObserver(() => {
-        if (!disposed && chart) chart.resize();
+    void import('echarts')
+      .then((echarts) => {
+        if (disposed || !hostRef.current) return;
+        chart = echarts.init(hostRef.current, undefined, { renderer: 'canvas' });
+        chart.setOption(option, true);
+        onChartReady?.(chart);
+        ro = new ResizeObserver(() => {
+          if (!disposed && chart) chart.resize();
+        });
+        ro.observe(hostRef.current);
+      })
+      .catch((e) => {
+        if (!disposed) onError?.((e as Error)?.message || '图表初始化失败');
       });
-      ro.observe(hostRef.current);
-    });
 
     return () => {
       disposed = true;
@@ -778,7 +874,7 @@ function EChartsCanvas({
       onChartReady?.(null);
       chart?.dispose();
     };
-  }, [option, onChartReady]);
+  }, [option, onChartReady, onError]);
 
   return <div ref={hostRef} className="sv-echarts-canvas" style={{ height: `${height}px` }} data-testid="sv-echarts-canvas" />;
 }
@@ -792,17 +888,27 @@ export const EChartsDiagramCard = memo(function EChartsDiagramCard({
 }) {
   const [showSource, setShowSource] = useState(false);
   const [zoomed, setZoomed] = useState(false);
+  const [renderErr, setRenderErr] = useState<string | null>(null);
+  const [exportErr, setExportErr] = useState(false);
+  const [copiedSrc, markCopiedSrc] = useCopyFlag();
   const chartRef = useRef<import('echarts').ECharts | null>(null);
 
   const parsed = useMemo(() => parseChartJson(code), [code]);
-  const themedOption = useMemo(() => (parsed ? applyShoalEChartsTheme(parsed) : null), [parsed]);
+  // Sanitize model output first, then merge the Shoal theme (the theme adds no formatters of its own).
+  const sanitized = useMemo(() => (parsed ? sanitizeEChartsOption(parsed) : null), [parsed]);
+  const themedOption = useMemo(() => (sanitized ? applyShoalEChartsTheme(sanitized.option) : null), [sanitized]);
+  const truncated = sanitized?.truncated ?? false;
+  useEffect(() => {
+    setRenderErr(null);
+    setExportErr(false);
+  }, [code]);
   const chartTitle = useMemo(() => {
-    const t = parsed?.title;
+    const t = sanitized?.option.title;
     if (t && typeof t === 'object' && !Array.isArray(t) && typeof (t as Record<string, unknown>).text === 'string') {
       return ((t as Record<string, unknown>).text as string).trim();
     }
     return '';
-  }, [parsed]);
+  }, [sanitized]);
 
   const handleReady = useCallback((inst: import('echarts').ECharts | null) => {
     chartRef.current = inst;
@@ -814,6 +920,16 @@ export const EChartsDiagramCard = memo(function EChartsDiagramCard({
     try {
       const url = inst.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#13161d' });
       downloadDataUrl(url, 'shoal-chart.png');
+      setExportErr(false);
+    } catch {
+      setExportErr(true);
+    }
+  };
+
+  const copySource = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      markCopiedSrc(true);
     } catch {
       /* ignore */
     }
@@ -821,6 +937,9 @@ export const EChartsDiagramCard = memo(function EChartsDiagramCard({
 
   if (!themedOption && !streaming) {
     return <CodeBlockCard lang="echarts" text={code} notice="图表 JSON 无法解析，已显示源码" />;
+  }
+  if (renderErr && !streaming) {
+    return <CodeBlockCard lang="echarts" text={code} notice={`图表渲染失败，已显示源码 · ${renderErr.replace(/\s+/g, ' ').slice(0, 120)}`} />;
   }
 
   return (
@@ -832,6 +951,8 @@ export const EChartsDiagramCard = memo(function EChartsDiagramCard({
           </svg>
           <span>{chartTitle || '数据图表'}</span>
           <span className="sv-viz-tag">ECharts</span>
+          {truncated && <span className="sv-viz-note" title="单系列数据超过 5000 点，已截断显示">数据已截断显示</span>}
+          {exportErr && <span className="sv-viz-note is-err">导出失败</span>}
         </span>
         <div className="sv-card-actions">
           <button
@@ -841,6 +962,9 @@ export const EChartsDiagramCard = memo(function EChartsDiagramCard({
             onClick={() => setShowSource((v) => !v)}
           >
             {showSource ? '预览图表' : '源码'}
+          </button>
+          <button type="button" className="sv-card-btn" onClick={() => void copySource()}>
+            {copiedSrc ? '✓ 已复制' : '复制源码'}
           </button>
           {themedOption && !showSource && (
             <>
@@ -860,18 +984,25 @@ export const EChartsDiagramCard = memo(function EChartsDiagramCard({
           <code>{code}</code>
         </pre>
       ) : themedOption ? (
-        <EChartsCanvas option={themedOption} height={310} onChartReady={handleReady} />
+        streaming ? (
+          <div className="sv-viz-loading is-skeleton">
+            <span className="sv-pulse-dot" aria-hidden="true" />
+            <span>图表绘制中…</span>
+          </div>
+        ) : (
+          <EChartsCanvas option={themedOption} height={310} onChartReady={handleReady} onError={setRenderErr} />
+        )
       ) : (
-        <div className="sv-viz-loading">
+        <div className="sv-viz-loading is-skeleton">
           <span className="sv-pulse-dot" aria-hidden="true" />
-          <span>正在接收图表配置…</span>
+          <span>图表绘制中…</span>
         </div>
       )}
 
       {zoomed && themedOption && (
         <DiagramLightbox title={chartTitle ? `${chartTitle} · ECharts` : '数据图表 · ECharts'} onClose={() => setZoomed(false)}>
           <div className="sv-lightbox-chart">
-            <EChartsCanvas option={themedOption} height={520} />
+            <EChartsCanvas option={themedOption} height={520} onError={setRenderErr} />
           </div>
         </DiagramLightbox>
       )}
@@ -948,7 +1079,7 @@ function cellPlainText(cell: Tokens.TableCell): string {
   return (cell.text ?? '').replace(/[`*_~]/g, '').trim();
 }
 
-export const RichTableCard = memo(function RichTableCard({
+function RichTableCardImpl({
   table,
   keyPrefix,
   renderInline,
@@ -957,7 +1088,7 @@ export const RichTableCard = memo(function RichTableCard({
   keyPrefix: string;
   renderInline: (tokens: Tokens.TableCell['tokens'], key: string) => ReactNode;
 }) {
-  const [copiedMode, setCopiedMode] = useState<'md' | 'tsv' | null>(null);
+  const [copiedMode, markCopiedMode] = useCopyFlag<'md' | 'tsv'>();
 
   // Detect short/label columns (like "结果", "状态", "通过") so long descriptions in sibling columns never squish them vertically.
   const colCompact = useMemo(() => {
@@ -989,8 +1120,7 @@ export const RichTableCard = memo(function RichTableCard({
         ].join('\n');
     try {
       await navigator.clipboard.writeText(text);
-      setCopiedMode(mode);
-      window.setTimeout(() => setCopiedMode(null), 1600);
+      markCopiedMode(mode);
     } catch {
       /* ignore */
     }
@@ -999,7 +1129,9 @@ export const RichTableCard = memo(function RichTableCard({
   return (
     <div className="sv-table-card" data-testid="sv-table-card">
       <div className="sv-table-bar">
-        <span className="sv-table-meta">{table.rows.length} 行 × {table.header.length} 列</span>
+        <span className="sv-table-meta">
+          <span className="sv-viz-tag">表格</span> {table.rows.length} 行 × {table.header.length} 列
+        </span>
         <div className="sv-card-actions">
           <button type="button" className="sv-card-btn" onClick={() => void copyTable('md')}>
             {copiedMode === 'md' ? '✓ 已复制 MD' : '复制 MD'}
@@ -1054,4 +1186,11 @@ export const RichTableCard = memo(function RichTableCard({
       </div>
     </div>
   );
-});
+}
+
+// The lexer rebuilds token objects on every content change; compare by source text so settled tables keep their DOM.
+// `renderInline` must be a stable callback from the parent (module-level renderer + memoized context).
+export const RichTableCard = memo(
+  RichTableCardImpl,
+  (a, b) => a.table.raw === b.table.raw && a.keyPrefix === b.keyPrefix && a.renderInline === b.renderInline,
+);

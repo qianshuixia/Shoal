@@ -4,6 +4,7 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import type { TermLineSample } from '../../shared/ptyLive.ts';
 import { send } from './ws.ts';
 import { pinIme } from './ime.ts';
+import { clearStreamDraft } from './streamDrafts.ts';
 
 // One xterm per session, kept outside React state and alive while the session exists.
 interface Entry {
@@ -54,6 +55,10 @@ export function subscribeTermOutput(id: string, fn: () => void): () => void {
   };
 }
 
+export function getTermContentSeq(id: string): number {
+  return registry.get(id)?.contentSeq ?? 0;
+}
+
 // Reads ONLY the clean active viewport (baseY..baseY+rows) from the live browser xterm.js buffer.
 // Deliberately avoids scrollback rows (< baseY) where Windows ConPTY accumulates repeated inline redraw lines.
 export function readTermLiveSnapshot(id: string): { lines: TermLineSample[]; isAlternate: boolean } | null {
@@ -68,6 +73,22 @@ export function readTermLiveSnapshot(id: string): { lines: TermLineSample[]; isA
   const lines: TermLineSample[] = [];
   const probe = b.getNullCell();
 
+  const isCellMuted = (cell: NonNullable<ReturnType<typeof b.getNullCell>>): boolean => {
+    if (cell.isDim() || cell.isItalic()) return true;
+    if (cell.isFgRGB()) {
+      const c = cell.getFgColor();
+      const r = (c >> 16) & 0xff;
+      const g = (c >> 8) & 0xff;
+      const bl = c & 0xff;
+      const sat = Math.max(r, g, bl) - Math.min(r, g, bl);
+      const lum = 0.299 * r + 0.587 * g + 0.114 * bl;
+      // Classify low-saturation gray (dark #9aa0a6 or Tokyo Night #565f89/#7e86ad) as muted,
+      // without misclassifying colored Tokyo Night headings (#bb9af7) or code (#7aa2f7).
+      if (sat < 48 && lum < 172) return true;
+    }
+    return false;
+  };
+
   for (let i = start; i < end; i++) {
     const line = b.getLine(i);
     if (!line) continue;
@@ -78,28 +99,51 @@ export function readTermLiveSnapshot(id: string): { lines: TermLineSample[]; isA
       continue;
     }
     let muted = false;
-    const len = Math.min(line.length, 40);
+    let promptTextMuted: boolean | undefined;
+    const len = Math.min(line.length, 64);
+    let firstX = -1;
+    let firstCh = '';
     for (let x = 0; x < len; x++) {
       const cell = line.getCell(x, probe);
       if (!cell) continue;
       const ch = cell.getChars();
-      if (!ch || ch === ' ') continue;
-      if (cell.isDim() || cell.isItalic()) {
-        muted = true;
-      } else if (cell.isFgRGB()) {
-        const c = cell.getFgColor();
-        const r = (c >> 16) & 0xff;
-        const g = (c >> 8) & 0xff;
-        const bl = c & 0xff;
-        const sat = Math.max(r, g, bl) - Math.min(r, g, bl);
-        const lum = 0.299 * r + 0.587 * g + 0.114 * bl;
-        // Classify low-saturation gray (dark #9aa0a6 or Tokyo Night #565f89/#7e86ad) as muted,
-        // without misclassifying colored Tokyo Night headings (#bb9af7) or code (#7aa2f7).
-        if (sat < 48 && lum < 172) muted = true;
-      }
+      if (!ch || ch === ' ' || ch === '\u00a0') continue;
+      firstX = x;
+      firstCh = ch;
+      muted = isCellMuted(cell);
       break;
     }
-    lines.push({ startRow: i, text, muted });
+    // For CLI prompt rows (`>`, `❯`, `›`), inspect text cells AFTER the prompt glyph (skipping any single
+    // inverse-video cursor cell when followed by further text) so bright glyphs + dim placeholders are detected accurately.
+    if (firstX >= 0 && (firstCh === '>' || firstCh === '❯' || firstCh === '›')) {
+      let seenFirstAfter = false;
+      let firstAfterMuted = false;
+      let firstAfterInverse = false;
+      for (let x = firstX + 1; x < len; x++) {
+        const cell = line.getCell(x, probe);
+        if (!cell) continue;
+        const ch = cell.getChars();
+        if (!ch || ch === ' ' || ch === '\u00a0') continue;
+        const cellMuted = isCellMuted(cell);
+        if (!seenFirstAfter) {
+          seenFirstAfter = true;
+          firstAfterMuted = cellMuted;
+          firstAfterInverse = cell.isInverse() !== 0;
+          if (!firstAfterInverse) {
+            promptTextMuted = firstAfterMuted;
+            break;
+          }
+        } else {
+          // Second non-space char after an inverse cursor cell reveals whether the placeholder text is dim.
+          promptTextMuted = cellMuted;
+          break;
+        }
+      }
+      if (seenFirstAfter && promptTextMuted === undefined) {
+        promptTextMuted = firstAfterMuted;
+      }
+    }
+    lines.push({ startRow: i, text, muted, ...(promptTextMuted !== undefined ? { promptTextMuted } : {}) });
   }
   while (lines.length > 0 && !lines[lines.length - 1].text.trim()) lines.pop();
   return { lines, isAlternate: false };
@@ -392,6 +436,7 @@ export function replay(id: string, d: string): void {
 }
 
 export function dispose(id: string): void {
+  clearStreamDraft(id);
   const entry = registry.get(id);
   if (!entry) return;
   clearTimeout(entry.resizeTimer);

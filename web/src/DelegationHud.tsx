@@ -41,9 +41,10 @@ export function hudVisibleBox(el: HTMLElement, rowSel: string, popSel: string): 
 
 // Floating HUD for a main task's delegated children, overlaid inside .pane-stage: position:absolute so .pane-body never
 // resizes (a height change makes xterm + ConPTY resize the PTY and redraw the screen).
-export function DelegationHud({ delegates, now, onOpen, onRestoreFocus, onVacate }: {
+export function DelegationHud({ delegates, now, suspended = false, onOpen, onRestoreFocus, onVacate }: {
   delegates: DelegateView[];
   now: number;
+  suspended?: boolean;
   onOpen(sessionId: string): void;
   onRestoreFocus?(): void;
   onVacate?(): void;
@@ -55,6 +56,10 @@ export function DelegationHud({ delegates, now, onOpen, onRestoreFocus, onVacate
   const onVacateRef = useRef(onVacate);
   onVacateRef.current = onVacate;
   const privacy = usePrivacy();
+
+  useEffect(() => {
+    if (suspended) setOpen(false);
+  }, [suspended]);
 
   // Every render, before paint: the pill text can change on any render.
   useLayoutEffect(() => {
@@ -79,7 +84,7 @@ export function DelegationHud({ delegates, now, onOpen, onRestoreFocus, onVacate
   }, []);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || suspended) return;
     const away = (e: MouseEvent) => {
       if (!ref.current?.contains(e.target as Node)) setOpen(false);
     };
@@ -97,7 +102,7 @@ export function DelegationHud({ delegates, now, onOpen, onRestoreFocus, onVacate
       document.removeEventListener('mousedown', away);
       window.removeEventListener('keydown', onKey, true);
     };
-  }, [open, onRestoreFocus]);
+  }, [open, suspended, onRestoreFocus]);
 
   const level = LEVELS.find((l) => delegates.some((d) => levelOf(d.state) === l)) ?? 'closed';
   const only = delegates.length === 1 ? delegates[0] : null;

@@ -1,4 +1,5 @@
 import type { Card, ConversationItem, SessionActivity, SessionInfo, Task, TaskConversationResponse } from '../shared/protocol.ts';
+import { feedbackMatchesUserText } from '../shared/textMatch.ts';
 import { agyResumeId, agyTranscriptFile } from './agents.ts';
 import { readTranscript } from './transcript.ts';
 import type { Turn } from './transcript.ts';
@@ -15,8 +16,6 @@ const singleLine = (s: string, max: number): string => {
   const cps = [...clean];
   return cps.length > max ? cps.slice(0, max).join('') + '…' : clean;
 };
-
-const normCmp = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
 function resolveTranscriptPath(session: SessionInfo | undefined): string | undefined {
   if (!session) return undefined;
@@ -91,11 +90,36 @@ export function buildTaskConversation(opts: {
     }
     items.push(...collapseTurns(turns, session?.id ?? 'turn'));
 
-    // If a newly queued feedback card has not yet been submitted into the CLI transcript, show it optimistically.
-    const lastTranscriptUser = [...turns].reverse().find(t => t.role === 'user')?.text ?? '';
-    const lastFeedback = [...taskCards].reverse().find(c => c.kind === 'feedback');
-    if (lastFeedback && (!lastTranscriptUser || !normCmp(lastTranscriptUser).includes(normCmp(lastFeedback.body).slice(0, 80)))) {
-      items.push({ id: `card-${lastFeedback.id}`, kind: 'user', text: capText(lastFeedback.body) });
+    // Optimistically show only genuinely pending feedback cards for the active session.
+    // Walk session feedback cards monotonically against ALL transcript user turns so an earlier feedback
+    // never resurrects at the bottom after a later Terminal message or delegation forward.
+    if (session?.status !== 'exited') {
+      const sessionFeedbacks = taskCards.filter(
+        c => c.kind === 'feedback' && (!session || c.sessionId === session.id),
+      );
+      const userTurns = turns.filter(t => t.role === 'user');
+      let uCursor = 0;
+      let lastMatchedFbIdx = -1;
+      for (let i = 0; i < sessionFeedbacks.length; i++) {
+        const fb = sessionFeedbacks[i];
+        let matchedIdx = -1;
+        for (let j = uCursor; j < userTurns.length; j++) {
+          if (feedbackMatchesUserText(fb.body, userTurns[j].text)) {
+            matchedIdx = j;
+            break;
+          }
+        }
+        if (matchedIdx >= 0) {
+          uCursor = matchedIdx + 1;
+          lastMatchedFbIdx = i;
+        } else if (uCursor > 0 && feedbackMatchesUserText(fb.body, userTurns[uCursor - 1].text)) {
+          lastMatchedFbIdx = i;
+        }
+      }
+      const pending = sessionFeedbacks.slice(lastMatchedFbIdx + 1);
+      for (const fb of pending) {
+        items.push({ id: `card-${fb.id}`, kind: 'user', text: capText(fb.body) });
+      }
     }
   } else {
     if (task.prompt.trim()) {

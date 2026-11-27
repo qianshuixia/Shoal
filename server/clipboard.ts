@@ -73,3 +73,59 @@ export function writeClipboardFiles(paths: string[]): Promise<void> {
     });
   });
 }
+
+const IMAGE_SCRIPT_WIN = [
+  'Add-Type -AssemblyName System.Windows.Forms;',
+  'Add-Type -AssemblyName System.Drawing;',
+  'if ([System.Windows.Forms.Clipboard]::ContainsImage()) {',
+  '  $img = [System.Windows.Forms.Clipboard]::GetImage();',
+  '  if ($img) {',
+  '    $ms = New-Object System.IO.MemoryStream;',
+  '    $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png);',
+  '    [Console]::Out.Write([Convert]::ToBase64String($ms.ToArray()));',
+  '    $ms.Dispose();',
+  '    $img.Dispose();',
+  '  }',
+  '}',
+].join(' ');
+
+const IMAGE_SCRIPT_MAC = [
+  "ObjC.import('AppKit');",
+  'var pb = $.NSPasteboard.generalPasteboard;',
+  'var data = pb.dataForType($.NSPasteboardTypePNG);',
+  'if (!data) {',
+  '  var tiff = pb.dataForType($.NSPasteboardTypeTIFF);',
+  '  if (tiff) {',
+  '    var rep = $.NSBitmapImageRep.imageRepWithData(tiff);',
+  '    if (rep) data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));',
+  '  }',
+  '}',
+  'data ? data.base64EncodedStringWithOptions(0).js : "";',
+].join('\n');
+
+// Reads a bitmap image directly from the local OS clipboard as PNG bytes (returns null if no image is present).
+// Used by desktop StreamView as a fallback when Chrome omits image data from ClipboardEvent.clipboardData.files.
+export function clipboardImagePng(): Promise<Buffer | null> {
+  if (process.env.WORKBENCH_OPEN_LOG || process.env.WORKBENCH_FAKE_AGENT === '1') return Promise.resolve(null);
+  if (process.platform === 'darwin') {
+    return new Promise((resolve, reject) => {
+      execFile('osascript', ['-l', 'JavaScript', '-e', IMAGE_SCRIPT_MAC], { timeout: 5000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+        if (err) reject(new Error(`读取剪贴板图片失败：${err.message}`));
+        else {
+          const b64 = stdout.trim();
+          resolve(b64 ? Buffer.from(b64, 'base64') : null);
+        }
+      });
+    });
+  }
+  if (process.platform !== 'win32') return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', IMAGE_SCRIPT_WIN], { windowsHide: true, timeout: 5000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(new Error(`读取剪贴板图片失败：${err.message}`));
+      else {
+        const b64 = stdout.trim();
+        resolve(b64 ? Buffer.from(b64, 'base64') : null);
+      }
+    });
+  });
+}

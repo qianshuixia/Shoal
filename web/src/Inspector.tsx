@@ -34,6 +34,7 @@ export interface InspectorProps {
   onSetFsClipboard: (item: FsClipboardItem | null) => void;
   fsMutation: FsMutationEvent | null;
   dirtyGuardRef?: React.MutableRefObject<((pid: string, pathPrefix: string) => boolean) | null>;
+  navDirtyGuardRef?: React.MutableRefObject<((pid: string, tab: InspectorTab, filePath?: string) => boolean) | null>;
   canSendToTerminal: boolean;
   onSendPathToTerminal: (rawPath: string) => void;
   onSelectProject: (projectId: string) => void;
@@ -175,7 +176,7 @@ function useVirtualContainer(ref: React.RefObject<HTMLDivElement | null>, enable
 }
 
 export function Inspector({
-  project, projects, git, watchRev, openRequest, fsClipboard, onSetFsClipboard, fsMutation, dirtyGuardRef, canSendToTerminal, onSendPathToTerminal, onSelectProject, onClose, onNotice,
+  project, projects, git, watchRev, openRequest, fsClipboard, onSetFsClipboard, fsMutation, dirtyGuardRef, navDirtyGuardRef, canSendToTerminal, onSendPathToTerminal, onSelectProject, onClose, onNotice,
   focusedTask, focusedSession, focusedContext, focusedMetrics, allQuota, agents, cliTools, now, quotaMode, refreshingQuota, onRefreshQuota, onCompact, onSwitchAgent, onOpenStats,
 }: InspectorProps) {
   const memRef = useRef<Map<string, ProjectViewMem>>(new Map());
@@ -219,6 +220,9 @@ export function Inspector({
   const [ctxMenu, setCtxMenu] = useState<(ContextMenuState & { targetKey: string }) | null>(null);
   const [namePrompt, setNamePrompt] = useState<NamePromptConfig | null>(null);
   const pendingScrollPathRef = useRef<string | null>(null);
+  const [treeLocateSeq, setTreeLocateSeq] = useState(0);
+  const [locatedPath, setLocatedPath] = useState<string | null>(null);
+  const locateTimerRef = useRef<number | undefined>(undefined);
   const handledFsMutationSeqRef = useRef(0);
 
   // Ctrl+P quick file finder
@@ -269,6 +273,7 @@ export function Inspector({
 
   useEffect(() => () => {
     changesReqRef.current.ctrl?.abort();
+    window.clearTimeout(locateTimerRef.current);
   }, []);
 
   const confirmDiscardDraft = useCallback((): boolean => {
@@ -290,6 +295,21 @@ export function Inspector({
       dirtyGuardRef.current = null;
     };
   }, [dirtyGuardRef, confirmDiscardDraft]);
+
+  useEffect(() => {
+    if (!navDirtyGuardRef) return;
+    navDirtyGuardRef.current = (targetPid: string, targetTab: InspectorTab, targetFilePath?: string) => {
+      const s = liveRef.current;
+      if (!s.isDirty) return true;
+      if (targetPid === s.projectId && targetTab === s.tab && (!targetFilePath || targetFilePath === s.activePath)) {
+        return true;
+      }
+      return confirmDiscardDraft();
+    };
+    return () => {
+      navDirtyGuardRef.current = null;
+    };
+  }, [navDirtyGuardRef, confirmDiscardDraft]);
 
   // Fetch changes list for a project with single-flight abort & race protection
   const fetchChanges = useCallback(async (pid: string, autoPick = false, force = false) => {
@@ -468,6 +488,9 @@ export function Inspector({
     setLoadedMtime(null);
     setConflict(false);
     setTreeMap({});
+    if (!reqMatches) pendingScrollPathRef.current = null;
+    setLocatedPath(null);
+    window.clearTimeout(locateTimerRef.current);
     setFinderOpen(false);
     finderReqRef.current?.abort();
     finderReqRef.current = null;
@@ -534,17 +557,20 @@ export function Inspector({
         setChangeMode(openRequest.line ? 'edit' : 'diff');
       }
     } else {
-      if (!sameCommitInit && (treeStaleRef.current || treeLoadedRootForRef.current !== projectId)) {
-        void fetchTreeDir(projectId, '');
-      }
       if (openRequest.filePath) {
         const rel = openRequest.filePath;
+        setSideOpen(true);
         setFilePath(rel);
+        pendingScrollPathRef.current = rel;
+        setTreeLocateSeq((n) => n + 1);
         if (isMarkdownPath(rel) && openRequest.line) {
           setMdMode('source');
         } else if (isMarkdownPath(rel)) {
           setMdMode('preview');
         }
+        // Always refresh the root listing on explicit file locate (unless project init just fetched it)
+        // so newly created top-level files or dot-folders like `.studio` appear immediately in the tree.
+        if (!sameCommitInit) void fetchTreeDir(projectId, '');
         const dirs = ancestorDirs(rel);
         if (dirs.length > 0) {
           setExpanded((prev) => {
@@ -554,6 +580,8 @@ export function Inspector({
           });
           for (const d of dirs) void fetchTreeDir(projectId, d);
         }
+      } else if (!sameCommitInit && (treeStaleRef.current || treeLoadedRootForRef.current !== projectId)) {
+        void fetchTreeDir(projectId, '');
       }
     }
     if (openRequest.line) {
@@ -1127,13 +1155,18 @@ export function Inspector({
   const pickFileFromTreeOrFinder = useCallback((relPosix: string, line?: number, scrollIntoView = false) => {
     if (relPosix !== filePath && !confirmDiscardDraft()) return;
     setFinderOpen(false);
-    if (scrollIntoView) pendingScrollPathRef.current = relPosix;
+    if (scrollIntoView) {
+      setSideOpen(true);
+      pendingScrollPathRef.current = relPosix;
+      setTreeLocateSeq((n) => n + 1);
+    }
     setTab('files');
     setFilePath(relPosix);
     if (isMarkdownPath(relPosix)) {
       setMdMode(line ? 'source' : 'preview');
     }
     const dirs = ancestorDirs(relPosix);
+    if (scrollIntoView && projectId) void fetchTreeDir(projectId, '');
     if (dirs.length > 0 && projectId) {
       setExpanded((prev) => {
         const next = new Set(prev);
@@ -1423,17 +1456,22 @@ export function Inspector({
   // Scroll the file tree to bring a located/created entry into view (works for both plain and virtualized trees).
   useEffect(() => {
     const target = pendingScrollPathRef.current;
-    if (!target || tab !== 'files') return;
+    if (!target || tab !== 'files' || !sideOpen) return;
     const idx = flatTreeRows.findIndex((r) => r.entry.path === target);
     if (idx === -1) return;
-    pendingScrollPathRef.current = null;
     const scroller = treeScrollRef.current;
     if (!scroller) return;
+    pendingScrollPathRef.current = null;
     const rowPx = TREE_ROW_REM * (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16);
     const desiredTop = Math.max(0, idx * rowPx - Math.max(0, scroller.clientHeight - rowPx) / 2);
     scroller.scrollTop = desiredTop;
     setTreeScrollTop(desiredTop);
-  }, [tab, flatTreeRows, setTreeScrollTop]);
+    setLocatedPath(target);
+    window.clearTimeout(locateTimerRef.current);
+    locateTimerRef.current = window.setTimeout(() => {
+      setLocatedPath((cur) => (cur === target ? null : cur));
+    }, 1400);
+  }, [tab, sideOpen, flatTreeRows, treeLocateSeq, setTreeScrollTop]);
 
   const treeSlice = useMemo(
     () => (isVirtualTree
@@ -1777,17 +1815,19 @@ export function Inspector({
                       {visibleTreeRows.map(({ entry, depth }) => {
                         const isOpen = entry.kind === 'dir' && expanded.has(entry.path);
                         const isSelected = entry.kind === 'file' && filePath === entry.path;
+                        const isLocated = locatedPath === entry.path;
                         const isCut = fsClipboard?.mode === 'cut' && fsClipboard.projectId === projectId && fsClipboard.path === entry.path;
                         const isCtx = ctxMenu?.targetKey === `tree:${entry.path}`;
                         return (
                           <button
                             key={entry.path}
                             type="button"
-                            className={`tree-row ${entry.kind} ${isSelected ? 'on' : ''} ${entry.ignored ? 'ignored' : ''} ${isCut ? 'is-cut' : ''} ${isCtx ? 'ctx-active' : ''}`}
+                            className={`tree-row ${entry.kind} ${isSelected ? 'on' : ''} ${isLocated ? 'is-located' : ''} ${entry.ignored ? 'ignored' : ''} ${isCut ? 'is-cut' : ''} ${isCtx ? 'ctx-active' : ''}`}
                             style={{ paddingLeft: `${0.5 + depth * 0.8125}rem` }}
                             data-testid="tree-entry"
                             data-path={entry.path}
                             data-kind={entry.kind}
+                            data-located={isLocated ? 'true' : undefined}
                             onContextMenu={(e) => openTreeEntryMenu(e, entry)}
                             onKeyDown={(e) => {
                               if (isContextMenuKey(e)) {

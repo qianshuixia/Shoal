@@ -51,6 +51,26 @@ afterAll(() => {
   for (const d of tempDirs) fs.rmSync(d, { recursive: true, force: true });
 });
 
+it('rechecks the workspace target after opening its file handle', () => {
+  const root = makeTempDir('handle-check');
+  const first = path.join(root, 'first.txt');
+  const second = path.join(root, 'second.txt');
+  fs.writeFileSync(first, 'first original');
+  fs.writeFileSync(second, 'second original');
+  const open = fs.openSync.bind(fs);
+  const realFirst = fs.realpathSync.native(first);
+  const spy = vi.spyOn(fs, 'openSync').mockImplementation((file, flags, mode) => {
+    return open(file === realFirst && flags === (process.platform === 'win32' ? fs.constants.O_WRONLY : fs.constants.O_WRONLY | fs.constants.O_NONBLOCK) ? second : file, flags, mode);
+  });
+  try {
+    expect(() => writeFileEntry(root, { path: 'first.txt', content: 'new content' })).toThrow(WorkspaceError);
+  } finally {
+    spy.mockRestore();
+  }
+  expect(fs.readFileSync(first, 'utf8')).toBe('first original');
+  expect(fs.readFileSync(second, 'utf8')).toBe('second original');
+});
+
 describe('resolveProjectPath security boundaries', () => {
   it('resolves valid relative paths and blocks traversal, UNC, absolute paths, .git, and external junctions', () => {
     const root = makeTempDir('sec');

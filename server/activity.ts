@@ -166,8 +166,9 @@ export function summarizeToolCall(rawName: string, rawArgs: unknown): ParsedTool
     }
     case 'invoke_subagent':
     case 'Agent':
-    case 'Task': {
-      const role = str(args.Role || args.description || args.TypeName || args.subagent_type);
+    case 'Task':
+    case 'spawn_agent': {
+      const role = str(args.Role || args.description || args.nickname || args.TypeName || args.subagent_type || args.agent_type);
       return { summary: role ? `子代理：${cut(role, 32)}` : '调用子代理', detail: rawName, subagent: true, filesRead, filesWritten };
     }
     case 'swarm':

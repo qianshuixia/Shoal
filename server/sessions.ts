@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import pty from 'node-pty';
-import type { AgentKind, HookBody, PermissionMode, ServerMsg, SessionInfo } from '../shared/protocol.ts';
+import type { AgentKind, HookBody, PendingInputReason, PendingInputState, PermissionMode, ServerMsg, SessionInfo } from '../shared/protocol.ts';
 import { isDeepAgent } from '../shared/protocol.ts';
 import { agyConversationState, agyUserStatusLine, buildLaunch, userStatusLine } from './agents.ts';
 import type { LaunchCliMeta } from './agents.ts';
@@ -76,13 +76,35 @@ export function prependEnvPath(env: Record<string, string>, dir: string): void {
 
 export interface EnqueueOptions {
   system?: boolean;
+  immediate?: boolean; // explicit desktop StreamView submit: skip stale terminal TYPING_QUIET_MS wait
+  draftAction?: 'guard' | 'ignore'; // 'guard' keeps server hasDraft collision lock active instead of clearing it
+  draftSeq?: number; // inputSeq observed when client verified empty / confirmed ignore; mismatch keeps lock intact
   onDelivered?: () => void;
 }
 
+export interface PendingUserInput {
+  id: string;
+  text: string;
+  at: number; // queuedAt for 'queued', deliveredAt for 'sending'
+  state: PendingInputState;
+  reason?: PendingInputReason;
+}
+
+type DraftActionResult = Pick<Extract<ServerMsg, { t: 'draft-action-result' }>, 'ok' | 'reason' | 'draftSeq'>;
+
 interface QueuedMessage {
+  id: string;
   text: string;
   system: boolean;
+  queuedAt: number;
   onDelivered?: () => void;
+}
+
+const RECENT_DELIVERY_TTL_MS = 15_000;
+const INCOMPLETE_DELIVERY_TTL_MS = 30 * 60_000;
+
+function deliveryIsRecent(item: PendingUserInput, now: number): boolean {
+  return now - item.at <= (item.state === 'sending' ? RECENT_DELIVERY_TTL_MS : INCOMPLETE_DELIVERY_TTL_MS);
 }
 
 interface Live {
@@ -96,6 +118,8 @@ interface Live {
   removed: boolean;
   exitWaiters: (() => void)[];
   queue: QueuedMessage[]; // messages waiting to be pasted (FIFO)
+  recentDeliveries: PendingUserInput[]; // recently delivered human messages waiting for CLI transcript flush
+  pendingSeq: number;
   permBlocked: boolean; // a permission prompt is open, so typed text would answer it
   startupBlocked: boolean; // a trust / hooks-review startup prompt was detected before first turn
   firstTurnSeen: boolean;
@@ -103,11 +127,16 @@ interface Live {
   codexTail: string;
   inputDisabledUntil: number; // Codex composer disabled while `Setting up sandbox...` runs
   hasDraft: boolean; // user typed/pasted uncommitted characters at the prompt
+  draftLen: number;
+  draftComplex: boolean;
+  draftTimer: NodeJS.Timeout | null;
   interruptedByUser: boolean; // user pressed Ctrl+C while messages were queued
+  queuePaused?: boolean; // frozen while switching agents so snapshotted queued messages cannot drain twice
   lastInputAt: number; // last keystroke from the user (injected writes & terminal reports do not count)
   lastDeliveryAt: number;
   deliveringUntil: number;
   inputSeq: number;
+  pendingClearSeq: number | null; // inputSeq snapshot when clearInput() last wrote control bytes; confirmClearInput requires an exact match
   // Bumped by anything that can answer or replace an on-screen prompt (input, delivery, a new permission request,
   // a detected startup prompt). A phone answer carries the value it saw, so it only lands on that same wait.
   waitSeq: number;
@@ -115,6 +144,7 @@ interface Live {
   outSeq: number;
   enterTimer: NodeJS.Timeout | null;
   enterWasSystem: boolean;
+  enteringInput: PendingUserInput | null;
   systemInjectedPending: number;
   systemInjectedUntil: number;
   subagentWait: boolean; // true while agy main conversation waits for async subagents (intermediate-stop)
@@ -279,6 +309,7 @@ export interface DeliveryState {
   enterPending?: boolean;
   hasDraft?: boolean;
   interruptedByUser?: boolean;
+  queuePaused?: boolean;
 }
 
 export function enterReady(opts: {
@@ -313,6 +344,7 @@ export function deliverable(s: DeliveryState, now: number): boolean {
     && !s.enterPending
     && !s.hasDraft
     && !s.interruptedByUser
+    && !s.queuePaused
     && now >= (s.deliveringUntil ?? 0)
     && now >= (s.inputDisabledUntil ?? 0)
     && now - s.lastInputAt >= TYPING_QUIET_MS
@@ -360,7 +392,11 @@ export class SessionManager {
   private armScrollSave() {
     if (this.scrollTimer) return;
     this.scrollTimer = setInterval(() => {
-      for (const s of this.live.values()) if (s.scrollDirty && !s.removed) this.saveScrollback(s);
+      const now = Date.now();
+      for (const s of this.live.values()) {
+        if (s.scrollDirty && !s.removed) this.saveScrollback(s);
+        this.pruneDeliveries(s, now);
+      }
     }, SCROLL_SAVE_MS);
     this.scrollTimer.unref?.();
   }
@@ -379,6 +415,49 @@ export class SessionManager {
     if (next) s.info.blocked = next;
     else delete s.info.blocked;
     return true;
+  }
+
+  private resetDraft(s: Live) {
+    s.hasDraft = false;
+    s.draftLen = 0;
+    s.draftComplex = false;
+    s.pendingClearSeq = null;
+  }
+
+  private clearDraftTimer(s: Live) {
+    if (s.draftTimer) clearTimeout(s.draftTimer);
+    s.draftTimer = null;
+  }
+
+  private syncDraft(s: Live, debounceSeq = false): boolean {
+    const next = s.hasDraft ? true : undefined;
+    const nextSeq = s.hasDraft ? s.inputSeq : undefined;
+    if (s.info.hasTerminalDraft === next && s.info.terminalDraftSeq === nextSeq) return false;
+    const seqOnly = s.info.hasTerminalDraft === next;
+    this.clearDraftTimer(s);
+    if (next) {
+      s.info.hasTerminalDraft = true;
+      s.info.terminalDraftSeq = nextSeq;
+    } else {
+      delete s.info.hasTerminalDraft;
+      delete s.info.terminalDraftSeq;
+    }
+    if (debounceSeq && seqOnly) {
+      s.draftTimer = setTimeout(() => {
+        s.draftTimer = null;
+        this.emit({ t: 'session', session: s.info });
+      }, 35);
+      s.draftTimer.unref();
+      return false;
+    }
+    return true;
+  }
+
+  flushDraft(id: string): void {
+    const s = this.live.get(id);
+    if (!s || !s.draftTimer) return;
+    this.clearDraftTimer(s);
+    this.emit({ t: 'session', session: s.info });
   }
 
   subscribe(fn: (m: ServerMsg) => void): () => void {
@@ -528,9 +607,11 @@ export class SessionManager {
         status: 'starting', statusSince: now, startedAt: now, exitCode: null, cols, rows,
       },
       cwd: o.cwd, collabDir, peerToken, proc, buf: '', quiet: null, removed: false, exitWaiters: [],
-      queue: [], permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '', codexTail: '', inputDisabledUntil: 0,
-      hasDraft: false, interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
-      inputSeq: 0, waitSeq: 0, outSeq: 0, enterTimer: null, enterWasSystem: false, systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
+      queue: [], recentDeliveries: [], pendingSeq: 0, permBlocked: false, startupBlocked: false, firstTurnSeen: false, startupTail: '', codexTail: '', inputDisabledUntil: 0,
+      hasDraft: false, draftLen: 0, draftComplex: false, draftTimer: null,
+      interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
+      inputSeq: 0, pendingClearSeq: null, waitSeq: 0, outSeq: 0, enterTimer: null, enterWasSystem: false, enteringInput: null,
+      systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
       modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0, lastOutAt: 0,
       initialPromptPending: deep && Boolean(o.prompt && !o.resume),
     };
@@ -589,6 +670,9 @@ export class SessionManager {
         s.enterTimer = null;
       }
       s.deliveringUntil = 0;
+      this.clearDraftTimer(s);
+      this.resetDraft(s);
+      this.syncDraft(s);
       s.info.exitCode = e.exitCode;
       this.log({ kind: 'exit', sessionId: id, agent: o.agent, exitCode: e.exitCode, at: Date.now() });
       if (!s.removed) this.saveScrollback(s);
@@ -689,7 +773,8 @@ export class SessionManager {
       if (this.syncBlocked(s)) changed = true;
       s.deliveringUntil = 0;
       s.inputDisabledUntil = 0;
-      s.hasDraft = false;
+      this.resetDraft(s);
+      if (this.syncDraft(s)) changed = true;
       s.interruptedByUser = false;
       const now = Date.now();
       if (s.systemInjectedPending > 0 && now <= s.systemInjectedUntil) {
@@ -744,37 +829,131 @@ export class SessionManager {
     const wasPermBlocked = s.permBlocked;
     s.lastInputAt = Date.now();
     s.inputSeq++;
+    s.pendingClearSeq = null;
     s.waitSeq++;
     s.permBlocked = false;
-    if (s.enterTimer) {
-      clearTimeout(s.enterTimer);
-      s.enterTimer = null;
-      s.deliveringUntil = 0;
-      if (s.enterWasSystem && s.systemInjectedPending > 0) s.systemInjectedPending--;
-      s.enterWasSystem = false;
+    const interrupted = s.enterTimer !== null;
+    if (interrupted) {
+      this.stopEnter(s, 'uncertain', 'interrupted');
+      s.hasDraft = true;
+      s.draftComplex = true;
     }
+    const paste = d.includes(PASTE_START) || d.includes(PASTE_END);
     if (d.includes('\x03')) {
-      s.hasDraft = false;
+      this.resetDraft(s);
       s.deliveringUntil = 0;
       if (s.queue.length > 0) s.interruptedByUser = true;
-    } else if (d.includes('\r') || d.includes('\n')) {
-      s.hasDraft = false;
+    } else if (!paste && (d === '\r' || d === '\n' || d === '\r\n')) {
+      this.resetDraft(s);
       s.interruptedByUser = false;
       s.startupBlocked = false;
       s.initialPromptPending = false;
-    } else if (d.includes('\x15') || d === '\x1b') {
-      s.hasDraft = false;
-    } else if (!wasPermBlocked && (s.info.status === 'needs_you' || s.info.status === 'idle')) {
+    } else if (d === '\x15' || d === '\x1b') {
+      this.resetDraft(s);
+    } else if (!wasPermBlocked && !s.startupBlocked && (s.info.status === 'needs_you' || s.info.status === 'idle' || s.info.status === 'working')) {
       const cleaned = d.replaceAll(PASTE_START, '').replaceAll(PASTE_END, '');
-      if (/[^\x00-\x1f\x7f]/.test(cleaned) && !cleaned.startsWith('\x1b')) {
+      if (/[^\x08\x7f\x20-\x7e\p{L}\p{N}\p{P}]/u.test(cleaned) || /[\p{Regional_Indicator}\p{Emoji_Modifier}\p{Format}\p{Mark}]/u.test(cleaned)) {
+        s.draftComplex = true;
+        if (paste || !cleaned.startsWith('\x1b') && /[^\x00-\x1f\x7f]/.test(cleaned)) s.hasDraft = true;
+      } else if (!s.draftComplex) {
+        for (const char of cleaned) {
+          if (char === '\x7f' || char === '\x08') s.draftLen = Math.max(0, s.draftLen - 1);
+          else s.draftLen++;
+        }
+        s.hasDraft = s.draftLen > 0;
+      } else if (/[^\x08\x7f]/.test(cleaned)) {
         s.hasDraft = true;
       }
     }
     const blockedChanged = this.syncBlocked(s);
+    const draftChanged = this.syncDraft(s, true);
+    const metaChanged = blockedChanged || draftChanged || interrupted;
     const prevStatus = s.info.status;
     s.proc.write(d);
     this.apply(s, { type: 'input', data: d });
-    if (blockedChanged && s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
+    if (metaChanged && s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
+  }
+
+  // Phase 1 of verified terminal draft clear: writes ONLY a strictly validated edit/control sequence to PTY.
+  // Deliberately keeps `s.hasDraft` and `s.lastInputAt` intact until the client verifies the prompt became empty
+  // and sends `confirmClearInput`, so a write error or an uncooperative CLI never unlocks queued delivery!
+  clearInput(id: string, d: string): boolean;
+  clearInput(id: string, d: string, expectedDraftSeq: number | undefined, requireVersion?: boolean): DraftActionResult;
+  clearInput(id: string, d: string, ...args: [number | undefined, boolean?] | []): boolean | DraftActionResult {
+    const result = this.clearDraft(id, d, args[0], args[1] === true);
+    return args.length ? result : result.ok;
+  }
+
+  private clearDraft(id: string, d: string, expectedDraftSeq?: number, requireVersion = false): DraftActionResult {
+    const s = this.live.get(id);
+    if (!s || s.info.status === 'exited') return { ok: false, reason: 'error' };
+    const draftSeq = s.inputSeq;
+    const missingRequiredSeq = requireVersion && s.hasDraft && expectedDraftSeq === undefined;
+    if (missingRequiredSeq || (expectedDraftSeq !== undefined && (expectedDraftSeq !== draftSeq || !s.hasDraft))) {
+      this.flushDraft(id);
+      return { ok: false, reason: 'stale', draftSeq };
+    }
+    if (s.permBlocked || s.startupBlocked) return { ok: false, reason: 'blocked', draftSeq };
+    if (s.enterTimer) return { ok: false, reason: 'busy', draftSeq };
+    if (!/^(?:[\x01\x05\x08\x0b\x15\x7f]|\x1b\[[ABCD])+$/.test(d)) return { ok: false, reason: 'error', draftSeq };
+    s.pendingClearSeq = null;
+    try {
+      s.proc.write(d);
+    } catch (e) {
+      console.warn('[clear-input]', (e as Error).message);
+      return { ok: false, reason: 'error', draftSeq };
+    }
+    s.pendingClearSeq = draftSeq;
+    if (s.hasDraft) s.draftComplex = true;
+    return { ok: true, draftSeq };
+  }
+
+  // Phase 2 of verified terminal draft clear: releases `s.hasDraft` and `s.lastInputAt` ONLY when a matching
+  // `clearInput()` succeeded for this exact `draftSeq` and no newer user input arrived since.
+  confirmClearInput(id: string, draftSeq?: number): boolean {
+    const s = this.live.get(id);
+    if (!s || s.info.status === 'exited') return false;
+    if (typeof draftSeq !== 'number' || !Number.isInteger(draftSeq)) return false;
+    if (s.pendingClearSeq === null || s.pendingClearSeq !== s.inputSeq || draftSeq !== s.inputSeq) return false;
+    return this.confirmEmptyDraft(id, draftSeq);
+  }
+
+  confirmEmptyDraft(id: string, draftSeq: number): boolean {
+    const s = this.live.get(id);
+    if (!s || !s.hasDraft || s.info.status === 'exited' || s.inputSeq !== draftSeq || s.permBlocked || s.startupBlocked) return false;
+    this.resetDraft(s);
+    s.lastInputAt = 0;
+    this.syncDraft(s);
+    this.emit({ t: 'session', session: s.info });
+    return true;
+  }
+
+  sendDraft(id: string, expectedDraftSeq?: number, requireVersion = false): DraftActionResult {
+    const s = this.live.get(id);
+    if (!s || s.info.status === 'exited') return { ok: false, reason: 'error' };
+    const draftSeq = s.inputSeq;
+    if (!s.hasDraft || (requireVersion && expectedDraftSeq === undefined) || (expectedDraftSeq !== undefined && expectedDraftSeq !== draftSeq)) {
+      this.flushDraft(id);
+      return { ok: false, reason: 'stale', draftSeq };
+    }
+    if (s.permBlocked || s.startupBlocked) return { ok: false, reason: 'blocked', draftSeq };
+    if ((s.info.status !== 'idle' && s.info.status !== 'needs_you') || s.enterTimer || s.pendingClearSeq !== null) return { ok: false, reason: 'busy', draftSeq };
+    try {
+      s.proc.write('\r');
+    } catch (e) {
+      console.warn('[send-draft]', (e as Error).message);
+      return { ok: false, reason: 'error', draftSeq };
+    }
+    s.inputSeq++;
+    s.waitSeq++;
+    s.lastInputAt = this.lastDesktopActive = Date.now();
+    s.interruptedByUser = false;
+    this.resetDraft(s);
+    this.syncDraft(s);
+    const prevStatus = s.info.status;
+    this.apply(s, { type: 'input', data: '\r' });
+    if (s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
+    return { ok: true, draftSeq: s.inputSeq };
   }
 
   // Queues text to be pasted into the session once it is idle (see deliverable). False if the session is not running.
@@ -783,21 +962,90 @@ export class SessionManager {
     if (!s || s.info.status === 'exited') return false;
     const system = opts?.system === true;
     if (!system) {
-      // Explicit human action from UI unfreezes prior Ctrl+C / draft blocks on this session.
+      // Explicit human action from UI unfreezes prior Ctrl+C pause.
+      // Never blindly clear a live terminal draft: only an explicit `draftAction: 'ignore'` bound to the exact
+      // current `draftSeq === s.inputSeq` can unlock `hasDraft`.
       s.interruptedByUser = false;
-      s.hasDraft = false;
+      const canReleaseDraft = opts?.draftAction === 'ignore'
+        && (!s.hasDraft || (typeof opts.draftSeq === 'number' && opts.draftSeq === s.inputSeq));
+      if (canReleaseDraft) {
+        this.resetDraft(s);
+        this.syncDraft(s);
+        if (opts?.immediate) s.lastInputAt = 0;
+      } else if (opts?.immediate && !s.hasDraft) {
+        s.lastInputAt = 0;
+      }
     }
-    s.queue.push({ text, system, onDelivered: opts?.onDelivered });
+    const idSeq = `p-${++s.pendingSeq}`;
+    s.queue.push({ id: idSeq, text, system, queuedAt: Date.now(), onDelivered: opts?.onDelivered });
     s.info.queued = s.queue.length;
     this.emit({ t: 'session', session: s.info });
     this.queueTimer ??= setInterval(() => this.drain(), QUEUE_TICK_MS);
     return true;
   }
 
+  // Returns live human messages currently queued in PTY wait or delivered within RECENT_DELIVERY_TTL_MS.
+  // Used by StreamWatcher so optimistic user bubbles reflect exact live queue state and never resurrect old history.
+  getPendingInputs(id: string): PendingUserInput[] {
+    const s = this.live.get(id);
+    if (!s || s.info.status === 'exited') return [];
+    const now = Date.now();
+    const out = s.recentDeliveries.filter(d => d === s.enteringInput || deliveryIsRecent(d, now));
+    const reason = s.hasDraft ? 'terminal-draft' : s.permBlocked || s.startupBlocked ? 'blocked' : 'working';
+    for (const q of s.queue) {
+      if (!q.system) out.push({ id: q.id, text: q.text, at: q.queuedAt, state: 'queued', reason });
+    }
+    return out;
+  }
+
+  cancelPendingInput(id: string, pendingId: string): boolean {
+    const s = this.live.get(id);
+    if (!s || s.info.status === 'exited') return false;
+    const queued = s.queue.findIndex(item => item.id === pendingId && !item.system);
+    const recent = s.recentDeliveries.findIndex(item => item.id === pendingId && (item.state === 'failed' || item.state === 'uncertain'));
+    if (queued < 0 && recent < 0) return false;
+    if (queued >= 0) s.queue.splice(queued, 1);
+    if (recent >= 0) s.recentDeliveries.splice(recent, 1);
+    this.emitQueue(s);
+    return true;
+  }
+
+  // Losslessly re-enqueues a failed/uncertain delivery with its full untruncated original text & attachment paths,
+  // removing the old failure entry ONLY after enqueue succeeds.
+  retryPendingInput(id: string, pendingId: string): boolean {
+    const s = this.live.get(id);
+    if (!s || s.info.status === 'exited' || s.queuePaused) return false;
+    const idx = s.recentDeliveries.findIndex(item => item.id === pendingId && (item.state === 'failed' || item.state === 'uncertain'));
+    if (idx < 0) return false;
+    const original = s.recentDeliveries[idx];
+    const ok = this.enqueue(id, original.text, { immediate: true, draftAction: 'guard' });
+    if (!ok) return false;
+    const curIdx = s.recentDeliveries.findIndex(item => item.id === pendingId);
+    if (curIdx >= 0) s.recentDeliveries.splice(curIdx, 1);
+    this.emitQueue(s);
+    return true;
+  }
+
+  setQueuePaused(id: string, paused: boolean): void {
+    const s = this.live.get(id);
+    if (!s) return;
+    s.queuePaused = paused;
+  }
+
+  private emitQueue(s: Live) {
+    s.info.queued = s.queue.length;
+    this.emit({ t: 'session', session: s.info });
+  }
+
+  private pruneDeliveries(s: Live, now: number) {
+    s.recentDeliveries = s.recentDeliveries.filter(item => item === s.enteringInput || deliveryIsRecent(item, now));
+  }
+
   private drain() {
     const now = Date.now();
     let pending = false;
     for (const s of this.live.values()) {
+      if (s.recentDeliveries.length) this.pruneDeliveries(s, now);
       if (!s.queue.length) continue;
       if (deliverable({ ...s, status: s.info.status, statusSince: s.info.statusSince, enterPending: s.enterTimer !== null }, now)) {
         this.deliver(s, now);
@@ -807,6 +1055,19 @@ export class SessionManager {
     if (!pending && this.queueTimer) {
       clearInterval(this.queueTimer);
       this.queueTimer = null;
+    }
+  }
+
+  private stopEnter(s: Live, state: 'failed' | 'uncertain', reason: 'write-error' | 'interrupted') {
+    if (s.enterTimer) clearTimeout(s.enterTimer);
+    s.enterTimer = null;
+    s.deliveringUntil = 0;
+    if (s.enterWasSystem && s.systemInjectedPending > 0) s.systemInjectedPending--;
+    s.enterWasSystem = false;
+    if (s.enteringInput) {
+      s.enteringInput.state = state;
+      s.enteringInput.reason = reason;
+      s.enteringInput = null;
     }
   }
 
@@ -823,24 +1084,32 @@ export class SessionManager {
     if (system) {
       s.systemInjectedPending++;
       s.systemInjectedUntil = now + initial.nextDelayMs + SYSTEM_INJECT_TTL_MS;
+    } else {
+      s.enteringInput = { id: item.id, text, at: now, state: 'sending' };
+      s.recentDeliveries.push(s.enteringInput);
     }
+    s.enterWasSystem = system;
     const seq = s.inputSeq;
     const frame = pasteFrame(text, s.modes.get(2004) === true, s.info.agent === 'codex' && process.platform === 'win32' ? CODEX_NEWLINE : '\n');
     try {
       s.proc.write(frame);
     } catch (e) {
       console.warn('[inject]', (e as Error).message);
+      this.stopEnter(s, 'failed', 'write-error');
+      this.emitQueue(s);
+      return;
     }
-    if (s.enterTimer) clearTimeout(s.enterTimer);
-    s.enterWasSystem = system;
     const injectAt = now;
     const scheduleEnter = (delayMs: number) => {
       s.enterTimer = setTimeout(() => {
         s.enterTimer = null;
-        if (s.removed || s.info.status === 'exited' || s.inputSeq !== seq) {
-          s.enterWasSystem = false;
-          s.deliveringUntil = 0;
-          if (system && s.systemInjectedPending > 0) s.systemInjectedPending--;
+        if (s.removed || s.info.status === 'exited' || s.inputSeq !== seq || s.permBlocked || s.startupBlocked) {
+          this.stopEnter(s, 'uncertain', 'interrupted');
+          if (!s.removed && s.info.status !== 'exited') {
+            s.hasDraft = s.draftComplex = true;
+            this.syncDraft(s);
+            this.emitQueue(s);
+          }
           return;
         }
         const pollNow = Date.now();
@@ -857,27 +1126,34 @@ export class SessionManager {
           scheduleEnter(r.nextDelayMs);
           return;
         }
-        s.enterWasSystem = false;
         s.lastDeliveryAt = pollNow;
         s.deliveringUntil = pollNow + DELIVERY_INFLIGHT_MS;
         if (system) s.systemInjectedUntil = pollNow + SYSTEM_INJECT_TTL_MS;
         try {
           s.proc.write('\r');
-          onDelivered?.();
         } catch (e) {
           console.warn('[inject]', (e as Error).message);
+          this.stopEnter(s, 'failed', 'write-error');
+          s.hasDraft = s.draftComplex = true;
+          this.syncDraft(s);
+          this.emitQueue(s);
+          return;
         }
+        s.enterWasSystem = false;
+        s.enteringInput = null;
+        onDelivered?.();
       }, delayMs);
     };
     scheduleEnter(initial.nextDelayMs);
-    s.info.queued = s.queue.length;
-    this.emit({ t: 'session', session: s.info });
+    this.emitQueue(s);
     this.log({ kind: 'inject', sessionId: s.info.id, chars: text.length, system, at: now });
   }
 
   private dropQueue(s: Live) {
     if (s.queue.length) this.log({ kind: 'inject-dropped', sessionId: s.info.id, count: s.queue.length, at: Date.now() });
     s.queue = [];
+    s.recentDeliveries = [];
+    s.enteringInput = null;
     if (s.info.queued) s.info.queued = 0;
   }
 
@@ -976,6 +1252,7 @@ export class SessionManager {
     this.peerTokens.delete(s.peerToken);
     s.removed = true;
     this.dropQueue(s);
+    this.clearDraftTimer(s);
     if (s.quiet) clearTimeout(s.quiet);
     if (s.enterTimer) {
       clearTimeout(s.enterTimer);

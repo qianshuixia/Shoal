@@ -1,7 +1,14 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Marked, type Token, type Tokens } from 'marked';
 import remend from 'remend';
+import { ImageLightbox } from './ImageViewer.tsx';
+import {
+  findNextExplicitFilePathStart,
+  isSingleExplicitFilePath,
+  matchExplicitFilePathAtStart,
+  splitExplicitFilePaths,
+} from './linkParse.ts';
 import {
   CodeBlockCard,
   EChartsDiagramCard,
@@ -22,6 +29,12 @@ interface MathInlineToken {
   type: 'mathInline';
   raw: string;
   text: string;
+}
+
+interface LocalFilePathToken {
+  type: 'localFilePath';
+  raw: string;
+  path: string;
 }
 
 const streamMarked = new Marked({
@@ -53,6 +66,23 @@ const streamMarked = new Marked({
         // Ignore pure numeric ranges/currency-like expressions without math operators/letters.
         if (/^[\d.,\s]+$/.test(expr)) return undefined;
         return { type: 'mathInline', raw: m[0], text: expr };
+      },
+    },
+    {
+      // Runs before CommonMark's `escape` and `em` rules so Windows paths like `G:\proj\.studio\a_b_c.jpg`
+      // never lose their `\.` backslash or get split into italics.
+      name: 'localFilePath',
+      level: 'inline',
+      start(src: string) {
+        return findNextExplicitFilePathStart(src);
+      },
+      tokenizer(src: string, tokens: Token[]): LocalFilePathToken | undefined {
+        const prev = tokens[tokens.length - 1];
+        const prevRaw = prev && 'raw' in prev ? String(prev.raw ?? '') : '';
+        const prevChar = prevRaw ? prevRaw[prevRaw.length - 1] : undefined;
+        const hit = matchExplicitFilePathAtStart(src, prevChar);
+        if (!hit) return undefined;
+        return { type: 'localFilePath', raw: hit.raw, path: hit.path };
       },
     },
   ],
@@ -113,6 +143,7 @@ interface RevealSegment {
 }
 
 const TOKEN_SETTLE_MS = 280;
+const REVEAL_FRAME_MS = 40;
 
 export function SmoothText({
   text,
@@ -263,12 +294,210 @@ function joinProjectPath(projectPath: string | undefined, rel: string): string |
   return `${base}/${clean.replace(/^\.\//, '')}${suffix}`;
 }
 
+// ---- Inline renderer (module-level and pure so table cells can reuse it with a stable callback) ----
+
+interface InlineCtx {
+  projectPath?: string;
+  onInspectFile?: (filePath: string) => void;
+  privacy?: boolean;
+  insideLink?: boolean;
+}
+
+function isAllowedImageSrc(href: string): boolean {
+  return /^https?:\/\//i.test(href) || /^\/api\//.test(href);
+}
+
+function fileTitle(filePath: string, privacy?: boolean): string {
+  if (!privacy) return `在右侧面板查看：${filePath}`;
+  const clean = filePath.replace(/(?:#L\d+(?:C\d+)?(?:-L?\d+(?:C\d+)?)?|:\d+(?::\d+)?)$/i, '').replaceAll('\\', '/').replace(/\/+$/, '');
+  return `在右侧面板查看 ${clean.split('/').pop() || '文件'}`;
+}
+
+function renderClickablePath(text: string, filePath: string, key: string, ctx: InlineCtx, isCode = false): ReactNode {
+  const inspect = ctx.onInspectFile;
+  if (!inspect || ctx.insideLink) {
+    return isCode ? <code key={key} className="sv-inline-code">{text}</code> : text;
+  }
+  return (
+    <span
+      key={key}
+      role="button"
+      tabIndex={0}
+      className={isCode ? 'sv-inline-code sv-path-link is-code' : 'sv-path-link'}
+      data-testid="sv-path-link"
+      data-file-path={filePath}
+      title={fileTitle(filePath, ctx.privacy)}
+      onClick={() => {
+        if (window.getSelection()?.toString()) return;
+        inspect(filePath);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          inspect(filePath);
+        }
+      }}
+    >
+      {text}
+    </span>
+  );
+}
+
+function MarkdownImage({
+  src,
+  alt,
+  insideLink = false,
+  privacy = false,
+}: {
+  src: string;
+  alt: string;
+  insideLink?: boolean;
+  privacy?: boolean;
+}) {
+  const [failed, setFailed] = useState(false);
+  const [zoomed, setZoomed] = useState(false);
+  const external = /^https?:\/\//i.test(src);
+  if (failed) return <span className="sv-md-img-fallback">{alt ? `[图片：${alt}]` : '[图片加载失败]'}</span>;
+  const imgNode = (
+    <img
+      className="sv-md-img"
+      src={src}
+      alt={alt}
+      loading="lazy"
+      decoding="async"
+      referrerPolicy={external ? 'no-referrer' : undefined}
+      onError={() => setFailed(true)}
+    />
+  );
+  if (insideLink) return imgNode;
+  return (
+    <>
+      <button type="button" className="sv-md-img-btn" onClick={() => setZoomed(true)} title={privacy ? '点击放大' : (alt || '点击放大')}>
+        {imgNode}
+      </button>
+      {zoomed && (
+        <ImageLightbox
+          src={src}
+          alt={alt}
+          title={alt || '图片预览'}
+          referrerPolicy={external ? 'no-referrer' : undefined}
+          onClose={() => setZoomed(false)}
+        />
+      )}
+    </>
+  );
+}
+
+function renderInlineTokens(list: Token[] | undefined, keyPrefix: string, ctx: InlineCtx): ReactNode {
+  if (!list || list.length === 0) return null;
+  return list.map((tok, idx) => {
+    const k = `${keyPrefix}-${idx}`;
+    switch (tok.type) {
+      case 'text': {
+        const t = tok as Tokens.Text;
+        if (t.tokens && t.tokens.length > 0) return <span key={k}>{renderInlineTokens(t.tokens, k, ctx)}</span>;
+        if (!ctx.insideLink && ctx.onInspectFile && ctx.projectPath?.startsWith('/') && t.text.includes(ctx.projectPath)) {
+          const segs = splitExplicitFilePaths(t.text, ctx.projectPath);
+          if (segs.some((s) => s.kind === 'file')) {
+            return (
+              <span key={k}>
+                {segs.map((seg, si) => (seg.kind === 'file' ? renderClickablePath(seg.text, seg.path, `${k}-p-${si}`, ctx) : seg.text))}
+              </span>
+            );
+          }
+        }
+        return t.text;
+      }
+      case 'localFilePath': {
+        const fp = tok as unknown as LocalFilePathToken;
+        return renderClickablePath(fp.raw, fp.path, k, ctx);
+      }
+      case 'escape':
+        return (tok as Tokens.Escape).text;
+      case 'strong':
+        return <strong key={k}>{renderInlineTokens((tok as Tokens.Strong).tokens, k, ctx)}</strong>;
+      case 'em':
+        return <em key={k}>{renderInlineTokens((tok as Tokens.Em).tokens, k, ctx)}</em>;
+      case 'del':
+        return <del key={k}>{renderInlineTokens((tok as Tokens.Del).tokens, k, ctx)}</del>;
+      case 'codespan': {
+        const text = (tok as Tokens.Codespan).text;
+        const explicit = !ctx.insideLink && ctx.onInspectFile ? isSingleExplicitFilePath(text, ctx.projectPath) : null;
+        if (explicit) return renderClickablePath(text, explicit, k, ctx, true);
+        return <code key={k} className="sv-inline-code">{text}</code>;
+      }
+      case 'mathInline':
+        return <KatexMath key={k} expr={(tok as unknown as MathInlineToken).text} display={false} />;
+      case 'br':
+        return <br key={k} />;
+      case 'checkbox':
+        return null;
+      case 'link': {
+        const l = tok as Tokens.Link;
+        const href = (l.href ?? '').trim();
+        const linkCtx = ctx.insideLink ? ctx : { ...ctx, insideLink: true };
+        const children = renderInlineTokens(l.tokens, k, linkCtx) || l.text;
+        if (/^file:/i.test(href)) {
+          const fp = decodeFileHref(href);
+          const inspect = ctx.onInspectFile;
+          if (!fp || !inspect) return <span key={k} className="sv-file-ref">{shortFileLabel(l.text, fp ?? href)}</span>;
+          return (
+            <button
+              type="button"
+              key={k}
+              className="sv-file-link"
+              title={fileTitle(fp, ctx.privacy)}
+              onClick={() => inspect(fp)}
+            >
+              {shortFileLabel(l.text, fp)}
+            </button>
+          );
+        }
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
+          if (!isSafeExternalUrl(href)) return <span key={k}>{children}</span>;
+          return (
+            <a key={k} href={href} target="_blank" rel="noopener noreferrer" className="sv-ext-link">
+              {children}
+            </a>
+          );
+        }
+        if (href.startsWith('#')) return <span key={k}>{children}</span>;
+        const abs = joinProjectPath(ctx.projectPath, href);
+        const inspectRel = ctx.onInspectFile;
+        if (abs && inspectRel) {
+          return (
+            <button type="button" key={k} className="sv-file-link" title={fileTitle(abs, ctx.privacy)} onClick={() => inspectRel(abs)}>
+              {children}
+            </button>
+          );
+        }
+        return <span key={k}>{children}</span>;
+      }
+      case 'image': {
+        const img = tok as Tokens.Image;
+        const href = (img.href ?? '').trim();
+        const alt = img.text || '';
+        if (!isAllowedImageSrc(href)) return <span key={k} className="sv-md-img-fallback">{alt ? `[图片：${alt}]` : '[图片]'}</span>;
+        return <MarkdownImage key={k} src={href} alt={alt} insideLink={ctx.insideLink} privacy={ctx.privacy} />;
+      }
+      case 'html':
+        return <code key={k} className="sv-inline-code">{(tok as Tokens.HTML).raw}</code>;
+      default:
+        return 'raw' in tok ? String(tok.raw ?? '') : null;
+    }
+  });
+}
+
 export interface StreamMarkdownProps {
   content: string;
   projectPath?: string;
   onInspectFile?: (filePath: string) => void;
   animateEntrance?: boolean;
   initialRevealedChars?: number;
+  // Live (still growing) text: skip Shiki / chart rendering until settled, show light skeletons for unclosed viz fences.
+  streaming?: boolean;
+  // Privacy mode: never expose full local absolute paths in link/file-chip titles.
+  privacy?: boolean;
 }
 
 // Self-heals incomplete streaming Markdown (unclosed fences, bold/italic, links, math blocks) via `remend`.
@@ -290,8 +519,11 @@ export const StreamMarkdown = memo(function StreamMarkdown({
   onInspectFile,
   animateEntrance = false,
   initialRevealedChars = 0,
+  streaming = false,
+  privacy = false,
 }: StreamMarkdownProps) {
-  const shouldReveal = animateEntrance && !prefersReducedMotion() && content.length > 0;
+  // Live text is already arriving incrementally: never layer the per-character reveal on top of it.
+  const shouldReveal = animateEntrance && !streaming && !prefersReducedMotion() && content.length > 0;
   const [revealLen, setRevealLen] = useState<number>(() => {
     if (!shouldReveal) return content.length;
     return Math.min(content.length, Math.max(0, initialRevealedChars));
@@ -315,7 +547,12 @@ export const StreamMarkdown = memo(function StreamMarkdown({
     const charsPerMs = Math.max(0.08, totalRemain / targetDurationMs);
 
     const tick = (now: number) => {
-      const dt = Math.min(48, Math.max(8, now - lastTs));
+      // Commit at most every REVEAL_FRAME_MS: each commit re-runs remend + lexer over the whole visible prefix.
+      if (now - lastTs < REVEAL_FRAME_MS) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      const dt = Math.min(120, now - lastTs);
       lastTs = now;
       const cur = revealRef.current;
       if (cur >= content.length) return;
@@ -335,83 +572,26 @@ export const StreamMarkdown = memo(function StreamMarkdown({
   }, [content, shouldReveal]);
 
   const revealing = shouldReveal && revealLen < content.length;
-  const visibleContent = useMemo(
-    () => (revealing ? stabilizePartialMarkdown(content.slice(0, revealLen)) : content),
-    [content, revealing, revealLen],
-  );
+  const visibleContent = useMemo(() => {
+    if (revealing) return stabilizePartialMarkdown(content.slice(0, revealLen));
+    return streaming ? stabilizePartialMarkdown(content) : content;
+  }, [content, revealing, revealLen, streaming]);
   const tokens = useMemo(() => streamMarked.lexer(visibleContent), [visibleContent]);
+  // True while the last fence is still open: only that tail block is "growing" (settled blocks above render normally).
+  const unclosedFence = useMemo(
+    () => streaming && ((content.match(/^```/gm)?.length ?? 0) % 2 === 1),
+    [content, streaming],
+  );
 
-  const renderInline = (list: Token[] | undefined, keyPrefix: string): ReactNode => {
-    if (!list || list.length === 0) return null;
-    return list.map((tok, idx) => {
-      const k = `${keyPrefix}-${idx}`;
-      switch (tok.type) {
-        case 'text': {
-          const t = tok as Tokens.Text;
-          if (t.tokens && t.tokens.length > 0) return <span key={k}>{renderInline(t.tokens, k)}</span>;
-          return t.text;
-        }
-        case 'escape':
-          return (tok as Tokens.Escape).text;
-        case 'strong':
-          return <strong key={k}>{renderInline((tok as Tokens.Strong).tokens, k)}</strong>;
-        case 'em':
-          return <em key={k}>{renderInline((tok as Tokens.Em).tokens, k)}</em>;
-        case 'del':
-          return <del key={k}>{renderInline((tok as Tokens.Del).tokens, k)}</del>;
-        case 'codespan':
-          return <code key={k} className="sv-inline-code">{(tok as Tokens.Codespan).text}</code>;
-        case 'mathInline':
-          return <KatexMath key={k} expr={(tok as unknown as MathInlineToken).text} display={false} />;
-        case 'br':
-          return <br key={k} />;
-        case 'checkbox':
-          return null;
-        case 'link': {
-          const l = tok as Tokens.Link;
-          const href = (l.href ?? '').trim();
-          const children = renderInline(l.tokens, k) || l.text;
-          if (/^file:/i.test(href)) {
-            const fp = decodeFileHref(href);
-            if (!fp || !onInspectFile) return <span key={k} className="sv-file-ref">{shortFileLabel(l.text, fp ?? href)}</span>;
-            return (
-              <button
-                type="button"
-                key={k}
-                className="sv-file-link"
-                title={fp}
-                onClick={() => onInspectFile(fp)}
-              >
-                {shortFileLabel(l.text, fp)}
-              </button>
-            );
-          }
-          if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) {
-            if (!isSafeExternalUrl(href)) return <span key={k}>{children}</span>;
-            return (
-              <a key={k} href={href} target="_blank" rel="noopener noreferrer" className="sv-ext-link">
-                {children}
-              </a>
-            );
-          }
-          if (href.startsWith('#')) return <span key={k}>{children}</span>;
-          const abs = joinProjectPath(projectPath, href);
-          if (abs && onInspectFile) {
-            return (
-              <button type="button" key={k} className="sv-file-link" title={abs} onClick={() => onInspectFile(abs)}>
-                {children}
-              </button>
-            );
-          }
-          return <span key={k}>{children}</span>;
-        }
-        case 'html':
-          return <code key={k} className="sv-inline-code">{(tok as Tokens.HTML).raw}</code>;
-        default:
-          return 'raw' in tok ? String(tok.raw ?? '') : null;
-      }
-    });
-  };
+  const inlineCtx = useMemo<InlineCtx>(
+    () => ({ projectPath, onInspectFile, privacy }),
+    [projectPath, onInspectFile, privacy],
+  );
+  // Stable identity (only changes with the ctx) so memoized children such as RichTableCard are not rebuilt per frame.
+  const renderInline = useCallback(
+    (list: Token[] | undefined, keyPrefix: string): ReactNode => renderInlineTokens(list, keyPrefix, inlineCtx),
+    [inlineCtx],
+  );
 
   const renderBlocks = (list: Token[], keyPrefix: string, stagger = false): ReactNode =>
     list.map((tok, idx) => {
@@ -447,7 +627,7 @@ export const StreamMarkdown = memo(function StreamMarkdown({
         case 'code': {
           const c = tok as Tokens.Code;
           const lang = (c.lang ?? '').trim().toLowerCase().split(/[\s{]/)[0] ?? '';
-          const isTailBlock = revealing && idx === list.length - 1;
+          const isTailBlock = (revealing || unclosedFence) && idx === list.length - 1 && list === tokens;
           if (lang === 'mermaid') {
             return (
               <div key={k} className={cls} style={delayStyle}>
@@ -471,7 +651,7 @@ export const StreamMarkdown = memo(function StreamMarkdown({
           }
           return (
             <div key={k} className={cls} style={delayStyle}>
-              <CodeBlockCard lang={c.lang} text={c.text} />
+              <CodeBlockCard lang={c.lang} text={c.text} streaming={isTailBlock} />
             </div>
           );
         }

@@ -275,6 +275,130 @@ function submit() {
         }, 280);
       }, 320);
     }, 260);
+  } else if (cmd === 'subagent') {
+    // Simulates an agy-style async subagent workflow: update_steps + invoke_subagent + child transcript +
+    // wrapped narration ("...\n评审结论。") + live bottom subagent bar -> final SYSTEM_MESSAGE reply & completion.
+    const fileArg = arg && !/^\d+$/.test(arg) ? arg : '';
+    const holdMs = Math.max(300, Number(/^\d+$/.test(arg ?? '') ? arg : rest[0]) || 1600);
+    const t0 = Date.now();
+    const subId = '11111111-2222-4333-8444-555555555555';
+    const subLogsDir = path.join(
+      process.env.AGY_CONFIG_DIR ?? path.join(os.homedir(), '.gemini', 'antigravity-cli'),
+      'brain', subId, '.system_generated', 'logs',
+    );
+    fs.mkdirSync(subLogsDir, { recursive: true });
+    const subTranscript = path.join(subLogsDir, 'transcript.jsonl');
+    fs.writeFileSync(subTranscript, JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date(t0 + 100).toISOString(),
+      model: 'gemini-4-neon-high',
+      thinking: 'Inspecting target implementation and checking break damage propagation.',
+      tool_calls: fileArg
+        ? [{ name: 'default_api:read_file', args: { Path: JSON.stringify(fileArg) } }]
+        : [{ name: 'default_api:fast_search', args: { Query: '"break_dmg"' } }],
+    }) + '\n');
+    const subLogUri = `file:///${subTranscript.replaceAll('\\', '/')}`;
+    fs.appendFileSync(transcript, JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date(t0 + 120).toISOString(),
+      model: 'gemini-4-neon-high',
+      thinking: 'Dispatch independent read-only review subagent.',
+      tool_calls: [
+        {
+          name: 'default_api:update_steps',
+          args: {
+            steps: JSON.stringify([
+              { title: '接入破绽上限递增机制', status: 'done' },
+              { title: '独立评审与回归验收', status: 'in_progress' },
+            ]),
+          },
+        },
+        {
+          name: 'default_api:invoke_subagent',
+          args: {
+            TypeName: '"gemini-reviewer"',
+            Role: '"首领破绽节奏只读评审员"',
+            Model: '"inherit"',
+          },
+        },
+      ],
+    }) + '\n');
+    fs.appendFileSync(transcript, JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: new Date(t0 + 150).toISOString(),
+      content: 'Steps updated.',
+    }) + '\n');
+    fs.appendFileSync(transcript, JSON.stringify({
+      step_index: 3,
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: new Date(t0 + 180).toISOString(),
+      content: `Created the following subagent:\n{\n  "conversationId": "${subId}",\n  "logAbsoluteUri": "${subLogUri}"\n}`,
+    }) + '\n');
+    fs.appendFileSync(transcript, JSON.stringify({
+      step_index: 4,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date(t0 + 200).toISOString(),
+      model: 'gemini-4-neon-high',
+      content: '核心回归 5 项全过，正在等待 `gemini-reviewer` 评审结论。',
+      tool_calls: [],
+    }) + '\n');
+    out(
+      '\r\n● Agent(gemini-reviewer: 首领破绽节奏只读评审员)(只读审查...) (ctrl+o to expand)'
+      + '\r\n  核心回归 5 项全过，正在等待 gemini-reviewer'
+      + '\r\n  评审结论。'
+      + '\r\n────────────────────────────────────────────────────────────'
+      + '\r\n>'
+      + '\r\n────────────────────────────────────────────────────────────'
+      + '\r\n● Agent(gemini-reviewer: 首领破绽节奏只读评审员) · Gemini 4 Neon   The inconsistent break dama... · 1m12s',
+    );
+    workTimer = setTimeout(() => {
+      fs.appendFileSync(subTranscript, JSON.stringify({
+        step_index: 2,
+        type: 'GENERIC',
+        status: 'DONE',
+        created_at: new Date(Date.now()).toISOString(),
+        content: 'Read file done.',
+      }) + '\n');
+      fs.appendFileSync(transcript, JSON.stringify({
+        step_index: 5,
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: new Date(Date.now()).toISOString(),
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=${new Date().toISOString()} sender=${subId} priority=HIGH content=VERDICT: PASS（0 P0 / 0 P1）\n</SYSTEM_MESSAGE>`,
+      }) + '\n');
+      const finalReply = '独立评审已通过（VERDICT: PASS），全部验证闭环。';
+      fs.appendFileSync(transcript, JSON.stringify({
+        step_index: 6,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(Date.now()).toISOString(),
+        model: 'gemini-4-neon-high',
+        content: finalReply,
+        tool_calls: [
+          {
+            name: 'default_api:update_steps',
+            args: {
+              steps: JSON.stringify([
+                { title: '接入破绽上限递增机制', status: 'done' },
+                { title: '独立评审与回归验收', status: 'done' },
+              ]),
+            },
+          },
+        ],
+      }) + '\n');
+      mode = 'idle';
+      out(`\r\n  ${finalReply}`);
+      hook('Stop', { last_assistant_message: finalReply });
+      out('\r\n> ');
+    }, holdMs);
   } else if (cmd === 'rich') {
     const t0 = Date.now();
     const richMd = [
@@ -354,10 +478,66 @@ function submit() {
         tool_calls: [],
       }) + '\n');
       mode = 'idle';
-      out('\r\n  完成。');
+      out('\r\n完成。');
       hook('Stop', { last_assistant_message: richMd });
       out('\r\n> ');
     }, 180);
+  } else if (cmd === 'autoscroll') {
+    // Reproduces the exact step-collapse + typewriter reveal + dock-expansion race:
+    // 1. Emit a tall lone completed step with long thinking + 3 tools (stays expanded in buildFlow).
+    // 2. Emit a second completed step so buildFlow collapses BOTH into a 1-line StepGroup (sudden scrollHeight shrink),
+    //    plus a long assistant reply that animates via StreamMarkdown typewriter reveal & expands DockTray todos.
+    const t0 = Date.now();
+    const longThinking = Array.from({ length: 8 }, (_, i) => `Reasoning line ${i + 1}: inspecting layout geometry, step collapse clamp, and dock height transitions.`).join('\n');
+    out('\r\n⣷  正在读取并分析 3 个文件...');
+    workTimer = setTimeout(() => {
+      fs.appendFileSync(transcript, JSON.stringify({
+        step_index: 10,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: new Date(t0 + 200).toISOString(),
+        model: 'gemini-4-neon-xhigh',
+        thinking: longThinking,
+        tool_calls: [
+          { name: 'default_api:read_file', args: { Path: '"web/src/StreamView.tsx"' } },
+          { name: 'default_api:read_file', args: { Path: '"web/src/styles.css"' } },
+          { name: 'default_api:read_file', args: { Path: '"web/src/stream/DockTray.tsx"' } },
+        ],
+      }) + '\n');
+      workTimer = setTimeout(() => {
+        const longReply = [
+          '### 根因定位与修复结论',
+          '',
+          ...Array.from({ length: 18 }, (_, i) => `${i + 1}. 自动跟底验证段落 #${i + 1}：步骤折叠瞬间触发浏览器 scrollTop clamp，叠加新回复逐字展开与 Dock 托盘增高，不得误判为用户主动上滚。`),
+          '',
+          '**AUTOSCROLL_TAIL_SENTINEL**',
+        ].join('\n');
+        fs.appendFileSync(transcript, JSON.stringify({
+          step_index: 11,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: new Date(t0 + 600).toISOString(),
+          model: 'gemini-4-neon-xhigh',
+          thinking: 'Collapsing step run and emitting final multi-paragraph response.',
+          tool_calls: [
+            {
+              name: 'default_api:update_steps',
+              args: {
+                steps: JSON.stringify([
+                  { title: '定位步骤折叠回退误杀', status: 'done' },
+                  { title: '补齐视口缩放与页签恢复', status: 'in_progress' },
+                  { title: '端到端自动滚动回归', status: 'pending' },
+                ]),
+              },
+            },
+          ],
+          content: longReply,
+        }) + '\n');
+        mode = 'idle';
+        out('\r\nreply: autoscroll done\r\n\r\n> ');
+        hook('Stop', { last_assistant_message: longReply });
+      }, 650);
+    }, 200);
   } else if (cmd === 'shoal') {
     const cliArgs = splitShellArgs(text.trim().slice(5).trim());
     const p = process.platform === 'win32'
@@ -430,6 +610,12 @@ function key(ch) {
   } else if (ch === '\r' || ch === '\n') {
     if (mode === 'working') queued = true;
     else submit();
+  } else if (ch === '\x15') {
+    // Ctrl+U: clear entire uncommitted input line (like readline / TUI composers).
+    line = '';
+    out('\r\x1b[K> ');
+  } else if (ch === '\x05' || ch === '\x01') {
+    // Ctrl+E / Ctrl+A: cursor navigation no-op in simple single-line fake CLI.
   } else if (ch === '\x7f' || ch === '\b') {
     const chars = Array.from(line);
     if (chars.length) {

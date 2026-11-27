@@ -2,7 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExter
 import type { CSSProperties, DragEvent, RefObject } from 'react';
 import type { ActivityPhase, Card, CliToolInfo, PaneViewMode, Project, QuotaInfo, SessionActivity, SessionContext, SessionInfo, SessionStreamState, Task, TaskMetrics } from '../../shared/protocol.ts';
 import { agentLabel, DELEGATION_LABEL, DELEGATION_MODE_LABEL, canResume, delegationState, isDeepAgent } from '../../shared/protocol.ts';
-import { attach, detach, fitEntry, focusOnly, isReplayEmpty, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty } from './terms.ts';
+import { extractPtyPromptState } from '../../shared/ptyLive.ts';
+import { attach, detach, fitEntry, focusOnly, isReplayEmpty, readTermLiveSnapshot, refreshTerminalCanvas, requestReplay, subscribeReplayEmpty, subscribeTermOutput } from './terms.ts';
 import { send } from './ws.ts';
 import { EditableTitle, PencilIcon, QuotaPill, StatusTag, TelemetryPill } from './bits.tsx';
 import { ContextMiniBar } from './QuotaPanel.tsx';
@@ -11,7 +12,8 @@ import { usePrivacy } from './privacy.ts';
 import { liveWindows, type QuotaDisplayMode } from './quota.ts';
 import { fmtClock } from './util.ts';
 import { DelegationHud, hudVisibleBox, type DelegateView } from './DelegationHud.tsx';
-import { StreamView } from './StreamView.tsx';
+import { StreamView, type StreamSendOpts } from './StreamView.tsx';
+import { hasStreamDraft, subscribeStreamDrafts } from './streamDrafts.ts';
 
 interface Props {
   index: number;
@@ -26,7 +28,7 @@ interface Props {
   viewMode?: PaneViewMode;
   onViewModeChange?(mode: PaneViewMode): void;
   streamState?: SessionStreamState | null;
-  onSendMessage?(text: string, attachments?: string[]): Promise<void>;
+  onSendMessage?(text: string, attachments?: string[], opts?: StreamSendOpts): Promise<void>;
   onAnswerPrompt?(fingerprint: string, waitSeq: number, data: string): Promise<void>;
   quota?: QuotaInfo;
   quotaMode?: QuotaDisplayMode;
@@ -96,9 +98,10 @@ function fileBase(p: string): string {
 }
 
 // Floating live activity HUD overlaid inside .pane-stage: position:absolute so .pane-body never resizes or clears ConPTY.
-function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus, onVacate }: {
+function ActivityHud({ activity, now, suspended = false, onInterrupt, onInspectFile, onRestoreFocus, onVacate }: {
   activity: SessionActivity;
   now: number;
+  suspended?: boolean;
   onInterrupt?(): void;
   onInspectFile?(filePath: string): void;
   onRestoreFocus?(): void;
@@ -111,6 +114,10 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
   const onVacateRef = useRef(onVacate);
   onVacateRef.current = onVacate;
   const privacy = usePrivacy();
+
+  useEffect(() => {
+    if (suspended) setOpen(false);
+  }, [suspended]);
 
   const turnSec = Math.max(0, Math.floor((now - activity.turnStartedAt) / 1000));
   const idleMs = Math.max(0, now - activity.lastProgressAt);
@@ -145,7 +152,7 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
   }, []);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || suspended) return;
     const away = (e: MouseEvent) => {
       if (!ref.current?.contains(e.target as Node)) setOpen(false);
     };
@@ -163,7 +170,7 @@ function ActivityHud({ activity, now, onInterrupt, onInspectFile, onRestoreFocus
       document.removeEventListener('mousedown', away);
       window.removeEventListener('keydown', onKey, true);
     };
-  }, [open, onRestoreFocus]);
+  }, [open, suspended, onRestoreFocus]);
 
   const steps = activity.recentSteps.slice().reverse();
 
@@ -486,6 +493,8 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
   const canStream = !!sessionId && !!paneAgent && isDeepAgent(paneAgent);
   const effectiveMode: PaneViewMode = canStream && viewMode === 'stream' ? 'stream' : 'term';
   const paneWindows = paneAgent ? liveWindows(quota, now) : [];
+  // Stable reference: StreamView is memoized and must not re-render for the per-second `now` tick.
+  const switchToTerminal = useCallback(() => onViewModeChange?.('term'), [onViewModeChange]);
 
   // Show this session's terminal in the pane and keep it fitted to the pane size.
   useLayoutEffect(() => {
@@ -529,6 +538,7 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
     if (sessionId && exited) requestReplay(sessionId);
   }, [sessionId, exited]);
   const noReplay = useSyncExternalStore(subscribeReplayEmpty, () => !!sessionId && isReplayEmpty(sessionId));
+  const streamDraftActive = useSyncExternalStore(subscribeStreamDrafts, () => !!sessionId && hasStreamDraft(sessionId));
 
   // Watch dual-source stream updates on demand only while this pane is displaying the rich Dialog view.
   useEffect(() => {
@@ -538,6 +548,49 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
       send({ t: 'unwatch-stream', id: sessionId });
     };
   }, [effectiveMode, sessionId, connected]);
+
+  // Terminal-mode complex-draft self-heal: when the user stays in Terminal mode (StreamView unmounted), types,
+  // uses arrow keys (setting server `draftComplex`), and then deletes back to an empty prompt, observe the live
+  // xterm prompt and emit `confirm-empty-draft` once visibly empty and stable so mobile/peer queues never wedge.
+  const confirmedTermEmptySeqRef = useRef<number | null>(null);
+  const termDraftSeq = session?.terminalDraftSeq;
+  const hasServerTermDraft = !!session?.hasTerminalDraft;
+  const termAgent = session?.agent ?? task?.agent;
+  const termBlocked = !!session?.blocked;
+  useEffect(() => {
+    if (effectiveMode === 'stream' || !sessionId || !connected || exited || termBlocked || !termAgent) return;
+    if (!hasServerTermDraft || termDraftSeq === undefined) {
+      confirmedTermEmptySeqRef.current = null;
+      return;
+    }
+    let timer = 0;
+    const scheduleIfEmpty = () => {
+      if (timer) {
+        window.clearTimeout(timer);
+        timer = 0;
+      }
+      if (confirmedTermEmptySeqRef.current === termDraftSeq) return;
+      const snap = readTermLiveSnapshot(sessionId);
+      if (!snap) return;
+      const st = extractPtyPromptState(termAgent, snap.lines, snap.isAlternate);
+      if (!st.found || st.draft) return;
+      timer = window.setTimeout(() => {
+        timer = 0;
+        const latest = readTermLiveSnapshot(sessionId);
+        if (!latest) return;
+        const recheck = extractPtyPromptState(termAgent, latest.lines, latest.isAlternate);
+        if (!recheck.found || recheck.draft) return;
+        confirmedTermEmptySeqRef.current = termDraftSeq;
+        send({ t: 'confirm-empty-draft', id: sessionId, draftSeq: termDraftSeq });
+      }, 450);
+    };
+    scheduleIfEmpty();
+    const unsub = subscribeTermOutput(sessionId, scheduleIfEmpty);
+    return () => {
+      unsub();
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [effectiveMode, sessionId, connected, exited, termBlocked, termAgent, hasServerTermDraft, termDraftSeq]);
 
   // Repaint the WebGL2 canvas when floating notices/popovers vanish, shift vertically, or when leaving StreamView.
   const hasActivity = session?.status === 'working' && activity?.sessionId === sessionId;
@@ -676,9 +729,13 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
                 type="button"
                 role="radio"
                 aria-checked={effectiveMode === 'stream'}
-                className={`ghost seg-btn ${effectiveMode === 'stream' ? 'on' : ''}`}
+                className={`ghost seg-btn ${effectiveMode === 'stream' ? 'on' : ''} ${effectiveMode === 'term' && streamDraftActive ? 'has-draft' : ''}`}
                 data-testid="pane-mode-stream"
-                title="流式对话视图（Alt+M）：保留原生 CLI 后台运行，前置平滑排版与思考/工具时间线"
+                title={
+                  effectiveMode === 'term' && streamDraftActive
+                    ? '对话模式有未发送草稿（Alt+M 切回查看）'
+                    : '流式对话视图（Alt+M）：保留原生 CLI 后台运行，前置平滑排版与思考/工具时间线'
+                }
                 onClick={() => onViewModeChange('stream')}
               >
                 对话
@@ -736,10 +793,11 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
                 key={sessionId}
                 activity={activity}
                 now={now}
+                suspended={effectiveMode === 'stream'}
                 onInterrupt={onInterrupt}
                 onInspectFile={onInspectFile}
                 onRestoreFocus={() => {
-                  if (!dual || focused) focusOnly(sessionId);
+                  if (effectiveMode !== 'stream' && (!dual || focused)) focusOnly(sessionId);
                 }}
                 onVacate={repaintPane}
               />
@@ -751,16 +809,17 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
                 key={sessionId}
                 delegates={delegates}
                 now={now}
+                suspended={effectiveMode === 'stream'}
                 onOpen={onOpenDelegate}
                 onRestoreFocus={() => {
-                  if (!dual || focused) focusOnly(sessionId);
+                  if (effectiveMode !== 'stream' && (!dual || focused)) focusOnly(sessionId);
                 }}
                 onVacate={repaintPane}
               />
             )}
           </div>
         </div>
-        {exited && noReplay && (
+        {exited && noReplay && effectiveMode !== 'stream' && (
           <ExitedSummary card={card} transcriptPath={session?.transcriptPath} onOpenPath={onOpenPath} />
         )}
         {!!session?.queued && effectiveMode !== 'stream' && (
@@ -775,9 +834,10 @@ export function Pane({ index, sessionId, session, task, project, focused, dual, 
             streamState={streamState ?? null}
             activity={activity}
             context={context}
-            now={now}
+            delegates={delegates}
+            onOpenDelegate={onOpenDelegate}
             privacy={privacy}
-            onSwitchToTerminal={() => onViewModeChange?.('term')}
+            onSwitchToTerminal={switchToTerminal}
             onInterrupt={onInterrupt}
             onInspectFile={onInspectFile}
             onSendMessage={onSendMessage}
