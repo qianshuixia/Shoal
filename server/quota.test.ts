@@ -316,6 +316,66 @@ describe('readLatestCodexQuotaFromDisk & custom Codex quota helpers', () => {
     expect(third?.windows[0].usedPercent).toBe(95);
   });
 
+  it('ranks rollouts by rate_limits event timestamp so a touched older rollout does not overwrite a newer 5h window', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-codex-ts-'));
+    const dayDir = path.join(home, 'sessions', '2026', '11', '27');
+    fs.mkdirSync(dayDir, { recursive: true });
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expired5hSec = nowSec - 600;
+    const live5hSec = nowSec + 18_000;
+    const live7dSec = nowSec + 500_000;
+
+    // Newer active session: rate_limits written at T-10s with a live 5h window (6% used)
+    const activeFile = path.join(dayDir, 'rollout-2026-11-27T15-49-46-active.jsonl');
+    const activeEventTs = new Date(Date.now() - 10_000).toISOString();
+    fs.writeFileSync(
+      activeFile,
+      JSON.stringify({
+        timestamp: activeEventTs,
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          rate_limits: {
+            limit_id: 'codex',
+            primary: { used_percent: 6, window_minutes: 300, resets_at: live5hSec },
+            secondary: { used_percent: 29, window_minutes: 10080, resets_at: live7dSec },
+            plan_type: 'plus',
+          },
+        },
+      }) + '\n',
+    );
+    const activeMtime = new Date(Date.now() - 10_000);
+    fs.utimesSync(activeFile, activeMtime, activeMtime);
+
+    // Older session whose file mtime was touched AFTER activeFile (T-2s), but its last rate_limits was 2h ago (expired 5h, live 7d)
+    const touchedOldFile = path.join(dayDir, 'rollout-2026-11-27T12-36-37-touched.jsonl');
+    const staleEventTs = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    fs.writeFileSync(
+      touchedOldFile,
+      JSON.stringify({
+        timestamp: staleEventTs,
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          rate_limits: {
+            limit_id: 'codex',
+            primary: { used_percent: 65, window_minutes: 300, resets_at: expired5hSec },
+            secondary: { used_percent: 27, window_minutes: 10080, resets_at: live7dSec },
+            plan_type: 'plus',
+          },
+        },
+      }) + '\n{"timestamp":"' + new Date(Date.now() - 2_000).toISOString() + '","type":"event_msg","payload":{"type":"idle"}}\n',
+    );
+    const newerMtime = new Date(Date.now() - 2_000);
+    fs.utimesSync(touchedOldFile, newerMtime, newerMtime);
+
+    const latest = readLatestCodexQuotaFromDisk(home);
+    expect(latest?.windows).toHaveLength(2);
+    expect(latest?.windows[0].usedPercent).toBe(6);
+    expect(latest?.windows[0].resetsAt).toBe(live5hSec * 1000);
+    expect(latest?.windows[1].usedPercent).toBe(29);
+  });
+
   it('uses authoritative quotaKey strictly: no cross-account fallback, no stale bucket hijack, and disabled CLIs are excluded', () => {
     const now = 1_000_000;
     const mkTool = (id: string, label: string, quotaKey: string, enabled = true): CliToolInfo => ({

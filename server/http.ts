@@ -246,10 +246,13 @@ export function createApp(cfg: AppConfig) {
         try {
           mtimeMs = fs.statSync(s.transcriptPath!).mtimeMs;
         } catch { continue; }
-        if (bestDefault && mtimeMs <= bestDefault.mtimeMs) continue;
+        if (bestDefault && mtimeMs + 60_000 < bestDefault.mtimeMs) continue;
         const parsed = readCodexQuotaInfo(s.transcriptPath!);
         if (parsed && parsed.windows.some(w => w.resetsAt > now)) {
-          bestDefault = { quota: parsed, mtimeMs };
+          const effectiveTs = parsed.observedAt ?? mtimeMs;
+          if (!bestDefault || effectiveTs > bestDefault.mtimeMs) {
+            bestDefault = { quota: parsed, mtimeMs: effectiveTs };
+          }
         }
       }
     }
@@ -1608,12 +1611,14 @@ export function createApp(cfg: AppConfig) {
   // Poll git, live usage, and transcript activity only while somebody is looking; unref so timers never keep the process alive.
   const gitTimer = setInterval(() => { if (clients.size) void refreshAllGit(); }, 10_000);
   gitTimer.unref();
-  let lastCustomCodexPollAt = 0;
+  let lastCodexQuotaPollAt = 0;
   const usageTimer = setInterval(() => {
     if (!hasConnectedClients()) return;
-    if (sessions.list().some(s => s.status === 'working')) refreshTelemetry();
-    if (Date.now() - lastCustomCodexPollAt >= 8_000 && hasLiveCustomCodexSession()) {
-      lastCustomCodexPollAt = Date.now();
+    const live = sessions.list();
+    if (live.some(s => s.status === 'working')) refreshTelemetry();
+    const hasActiveCodex = live.some(s => s.agent === 'codex' && s.status === 'working') || hasLiveCustomCodexSession();
+    if (Date.now() - lastCodexQuotaPollAt >= 8_000 && hasActiveCodex) {
+      lastCodexQuotaPollAt = Date.now();
       refreshCodexQuota(true);
     }
   }, 4_000);
