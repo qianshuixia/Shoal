@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import pty from 'node-pty';
-import type { AgentKind, HookBody, PendingInputReason, PendingInputState, PermissionMode, ServerMsg, SessionInfo } from '../shared/protocol.ts';
-import { isDeepAgent } from '../shared/protocol.ts';
+import type { AgentKind, HookBody, InteractiveInputReason, InteractiveKey, PendingInputReason, PendingInputState, PermissionMode, ServerMsg, SessionInfo } from '../shared/protocol.ts';
+import { isDeepAgent, MAX_INTERACTIVE_TEXT } from '../shared/protocol.ts';
 import { agyConversationState, agyUserStatusLine, buildLaunch, userStatusLine } from './agents.ts';
 import type { LaunchCliMeta } from './agents.ts';
 import { detectLimit, readResetsAt } from './quota.ts';
@@ -22,6 +22,24 @@ const DELIVERY_GAP_MS = 2000; // between two deliveries to the same session
 const SETTLE_MS = 1500;
 const ENTER_DELAY_MS = 300; // pasted text first, Enter separately
 const ENTER_POLL_MS = 50;
+const INTERACTIVE_KEY_STEP_MS = 28; // safe per-key cadence for ConPTY + BubbleTea / Ink / crossterm pickers
+const MAX_INTERACTIVE_KEYS = 32;
+const INTERACTIVE_KEYS = new Set<InteractiveKey>(['up', 'down', 'left', 'right', 'enter', 'space', 'esc', 'ctrl+r', 'tab', 'shift+tab']);
+
+function encodeInteractiveKey(key: InteractiveKey, appCursor: boolean): string {
+  switch (key) {
+    case 'up': return appCursor ? '\x1bOA' : '\x1b[A';
+    case 'down': return appCursor ? '\x1bOB' : '\x1b[B';
+    case 'right': return appCursor ? '\x1bOC' : '\x1b[C';
+    case 'left': return appCursor ? '\x1bOD' : '\x1b[D';
+    case 'enter': return '\r';
+    case 'space': return ' ';
+    case 'esc': return '\x1b';
+    case 'ctrl+r': return '\x12';
+    case 'tab': return '\t';
+    case 'shift+tab': return '\x1b[Z';
+  }
+}
 // Codex on Windows drains pastes as per-key console events (~2,000 chars/s) and suppresses Enter for ~120 ms after a
 // paste burst so trailing newlines in clipboard pastes do not auto-submit. Wait for both a size-based floor and PTY
 // echo silence before sending `\r`, capped so continuous status output cannot starve submission.
@@ -91,6 +109,17 @@ export interface PendingUserInput {
 }
 
 type DraftActionResult = Pick<Extract<ServerMsg, { t: 'draft-action-result' }>, 'ok' | 'reason' | 'draftSeq'>;
+export type InteractiveInputResult = Pick<Extract<ServerMsg, { t: 'interactive-input-result' }>, 'ok' | 'reason'>;
+
+type InteractiveStep =
+  | { kind: 'key'; key: InteractiveKey; delayMs: number }
+  | { kind: 'text'; text: string; cleanChars: number };
+
+interface InteractiveActive {
+  inputSeq: number;
+  waitSeq: number;
+  onDone?: (result: InteractiveInputResult) => void;
+}
 
 interface QueuedMessage {
   id: string;
@@ -149,6 +178,10 @@ interface Live {
   systemInjectedUntil: number;
   subagentWait: boolean; // true while agy main conversation waits for async subagents (intermediate-stop)
   modes: Map<number, boolean>; // last state of each REPLAY_MODES mode the CLI set
+  appCursorKeys: boolean; // live DEC mode ?1 (DECCKM) for arrow-key encoding in interactive pickers
+  interactiveSteps: InteractiveStep[];
+  interactiveTimer: NodeJS.Timeout | null;
+  interactiveActive: InteractiveActive | null;
   tail: string; // end of the previous PTY chunk, so a mode switch split across chunks is still seen
   trimmed: boolean; // buf has lost its start
   scrollDirty: boolean; // buf changed since it was last written to disk
@@ -307,6 +340,7 @@ export interface DeliveryState {
   deliveringUntil?: number;
   inputDisabledUntil?: number;
   enterPending?: boolean;
+  interactivePending?: boolean;
   hasDraft?: boolean;
   interruptedByUser?: boolean;
   queuePaused?: boolean;
@@ -342,6 +376,7 @@ export function deliverable(s: DeliveryState, now: number): boolean {
     && !s.initialPromptPending
     && !s.startupBlocked
     && !s.enterPending
+    && !s.interactivePending
     && !s.hasDraft
     && !s.interruptedByUser
     && !s.queuePaused
@@ -612,7 +647,7 @@ export class SessionManager {
       interruptedByUser: false, lastInputAt: 0, lastDeliveryAt: 0, deliveringUntil: 0,
       inputSeq: 0, pendingClearSeq: null, waitSeq: 0, outSeq: 0, enterTimer: null, enterWasSystem: false, enteringInput: null,
       systemInjectedPending: 0, systemInjectedUntil: 0, subagentWait: false,
-      modes: new Map(), tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0, lastOutAt: 0,
+      modes: new Map(), appCursorKeys: false, interactiveSteps: [], interactiveTimer: null, interactiveActive: null, tail: '', trimmed: false, scrollDirty: false, firstOutAt: 0, lastOutAt: 0,
       initialPromptPending: deep && Boolean(o.prompt && !o.resume),
     };
     this.live.set(id, s);
@@ -627,13 +662,18 @@ export class SessionManager {
         s.outSeq++;
       }
       const prevTail = s.tail;
-      trackModes(s.modes, prevTail + d);
-      s.tail = (prevTail + d).slice(-MODE_TAIL);
+      const joined = prevTail + d;
+      trackModes(s.modes, joined);
+      for (const m of joined.matchAll(/\x1b\[\?([\d;]+)([hl])/g)) {
+        if (m[1].split(';').includes('1')) s.appCursorKeys = m[2] === 'h';
+      }
+      s.tail = joined.slice(-MODE_TAIL);
       if (deep && !s.firstTurnSeen) {
         s.startupTail = (s.startupTail + stripAnsiForMatch(prevTail + d)).slice(-1024);
         if (!s.startupBlocked && STARTUP_BLOCK_RE.test(s.startupTail)) {
           s.startupBlocked = true;
           s.waitSeq++;
+          this.abortInteractiveSteps(s, 'blocked');
           if (this.syncBlocked(s) && !s.removed) this.emit({ t: 'session', session: s.info });
         }
       }
@@ -665,6 +705,7 @@ export class SessionManager {
     proc.onExit(e => {
       if (s.peerToken) this.peerTokens.delete(s.peerToken);
       if (s.quiet) clearTimeout(s.quiet);
+      this.abortInteractiveSteps(s, 'exited');
       if (s.enterTimer) {
         clearTimeout(s.enterTimer);
         s.enterTimer = null;
@@ -768,6 +809,7 @@ export class SessionManager {
     let userTurn = false;
     let systemInjected = false;
     if (PROMPT_EVENTS.has(body.event)) {
+      this.abortInteractiveSteps(s, 'aborted');
       s.firstTurnSeen = true;
       s.startupBlocked = false;
       if (this.syncBlocked(s)) changed = true;
@@ -791,6 +833,7 @@ export class SessionManager {
     } else if (body.event === 'SessionStart' && beforeNative !== null && s.info.nativeSessionId !== beforeNative) {
       userTurn = true;
     } else if (body.event === 'Stop' || body.event === 'StopFailure') {
+      this.abortInteractiveSteps(s, 'aborted');
       s.firstTurnSeen = true;
       s.startupBlocked = false;
       if (this.syncBlocked(s)) changed = true;
@@ -809,6 +852,7 @@ export class SessionManager {
     if (body.event === 'PermissionRequest') {
       s.permBlocked = true;
       s.waitSeq++;
+      this.abortInteractiveSteps(s, 'blocked');
     }
     else if (isStatusHook(body.event)) s.permBlocked = false;
     if (this.syncBlocked(s)) changed = true;
@@ -825,6 +869,7 @@ export class SessionManager {
       s.proc.write(d);
       return;
     }
+    this.abortInteractiveSteps(s, 'aborted');
     if (!opts?.fromMobile) this.lastDesktopActive = Date.now();
     const wasPermBlocked = s.permBlocked;
     s.lastInputAt = Date.now();
@@ -874,6 +919,153 @@ export class SessionManager {
     if (metaChanged && s.info.status === prevStatus) this.emit({ t: 'session', session: s.info });
   }
 
+  private finishInteractiveBatch(s: Live, result: InteractiveInputResult) {
+    s.interactiveSteps = [];
+    if (s.interactiveTimer) {
+      clearTimeout(s.interactiveTimer);
+      s.interactiveTimer = null;
+    }
+    const active = s.interactiveActive;
+    s.interactiveActive = null;
+    active?.onDone?.(result);
+  }
+
+  private abortInteractiveSteps(s: Live, reason: InteractiveInputReason) {
+    if (!s.interactiveActive && s.interactiveSteps.length === 0 && !s.interactiveTimer) return;
+    this.finishInteractiveBatch(s, { ok: false, reason });
+  }
+
+  private interactiveGuardFailure(s: Live, active: InteractiveActive | null): InteractiveInputReason | null {
+    if (s.removed || s.info.status === 'exited') return 'exited';
+    if (s.permBlocked || s.startupBlocked) return 'blocked';
+    if (
+      !active ||
+      s.interactiveActive !== active ||
+      s.enterTimer !== null ||
+      s.pendingClearSeq !== null ||
+      s.inputSeq !== active.inputSeq ||
+      s.waitSeq !== active.waitSeq
+    ) {
+      return 'aborted';
+    }
+    return null;
+  }
+
+  private pumpInteractiveSteps(s: Live) {
+    if (s.interactiveTimer || s.interactiveSteps.length === 0) return;
+    const active = s.interactiveActive;
+    const guardErr = this.interactiveGuardFailure(s, active);
+    if (guardErr) {
+      this.abortInteractiveSteps(s, guardErr);
+      return;
+    }
+    const step = s.interactiveSteps.shift()!;
+    // Encode keys & paste frames lazily right before writing so mid-batch DECCKM (?1h/?1l) or ?2004 changes apply immediately.
+    const data =
+      step.kind === 'key'
+        ? encodeInteractiveKey(step.key, s.appCursorKeys)
+        : pasteFrame(step.text, s.modes.get(2004) === true, s.info.agent === 'codex' && process.platform === 'win32' ? CODEX_NEWLINE : '\n');
+    // Capture injectAt BEFORE write() so even synchronous PTY echo satisfies `lastOutAt >= injectAt` for echo-quiet.
+    const injectAt = step.kind === 'text' ? Date.now() : 0;
+    try {
+      s.proc.write(data);
+    } catch (e) {
+      console.warn('[interactive-input]', (e as Error).message);
+      this.abortInteractiveSteps(s, 'aborted');
+      return;
+    }
+    if (s.interactiveSteps.length === 0) {
+      this.finishInteractiveBatch(s, { ok: true });
+      return;
+    }
+    if (step.kind === 'text') {
+      // Reuse regular delivery's enterReady() floor + PTY echo-quiet gate so Windows Codex (~120ms Enter suppression
+      // after paste bursts) and large write-in pastes never drop the trailing Enter while still replying ok: true.
+      const schedulePasteSettle = (delayMs: number) => {
+        s.interactiveTimer = setTimeout(() => {
+          s.interactiveTimer = null;
+          const fail = this.interactiveGuardFailure(s, active);
+          if (fail) {
+            this.abortInteractiveSteps(s, fail);
+            return;
+          }
+          const r = enterReady({
+            agent: s.info.agent,
+            chars: step.cleanChars,
+            injectAt,
+            lastOutAt: s.lastOutAt,
+            now: Date.now(),
+          });
+          if (!r.ready) {
+            schedulePasteSettle(r.nextDelayMs);
+            return;
+          }
+          this.pumpInteractiveSteps(s);
+        }, delayMs);
+        s.interactiveTimer.unref?.();
+      };
+      const initial = enterReady({
+        agent: s.info.agent,
+        chars: step.cleanChars,
+        injectAt,
+        lastOutAt: s.lastOutAt,
+        now: injectAt,
+      });
+      schedulePasteSettle(initial.nextDelayMs);
+      return;
+    }
+    s.interactiveTimer = setTimeout(() => {
+      s.interactiveTimer = null;
+      this.pumpInteractiveSteps(s);
+    }, step.delayMs);
+    s.interactiveTimer.unref?.();
+  }
+
+  // Sends navigation / choice / write-in input to an active TUI picker without polluting `hasTerminalDraft`.
+  // Strictly single-flight per session and pre-write guarded against permission/startup prompts and message deliveries.
+  interactiveInput(
+    id: string,
+    opts: { keys?: InteractiveKey[]; text?: string; submit?: boolean },
+    onDone?: (result: InteractiveInputResult) => void,
+  ): boolean {
+    const reject = (reason: InteractiveInputReason) => {
+      onDone?.({ ok: false, reason });
+      return false;
+    };
+    const s = this.live.get(id);
+    if (!s || s.removed || s.info.status === 'exited') return reject('exited');
+    if (s.permBlocked || s.startupBlocked) return reject('blocked');
+    if (s.enterTimer !== null || s.pendingClearSeq !== null || s.interactiveActive !== null || s.interactiveSteps.length > 0) {
+      return reject('busy');
+    }
+    const steps: InteractiveStep[] = [];
+    if (Array.isArray(opts.keys)) {
+      if (opts.keys.length > MAX_INTERACTIVE_KEYS) return reject('invalid');
+      for (const k of opts.keys) {
+        if (!INTERACTIVE_KEYS.has(k)) return reject('invalid');
+        steps.push({ kind: 'key', key: k, delayMs: INTERACTIVE_KEY_STEP_MS });
+      }
+    }
+    if (typeof opts.text === 'string' && opts.text.length > 0) {
+      if (opts.text.length > MAX_INTERACTIVE_TEXT) return reject('too-large');
+      const clean = sanitizePaste(opts.text);
+      if (!clean) return reject('invalid');
+      steps.push({ kind: 'text', text: opts.text, cleanChars: clean.length });
+    }
+    if (opts.submit) {
+      steps.push({ kind: 'key', key: 'enter', delayMs: INTERACTIVE_KEY_STEP_MS });
+    }
+    if (steps.length === 0) return reject('invalid');
+    this.lastDesktopActive = Date.now();
+    s.lastInputAt = this.lastDesktopActive;
+    s.inputSeq++;
+    s.waitSeq++;
+    s.interactiveActive = { inputSeq: s.inputSeq, waitSeq: s.waitSeq, onDone };
+    s.interactiveSteps = steps;
+    this.pumpInteractiveSteps(s);
+    return true;
+  }
+
   // Phase 1 of verified terminal draft clear: writes ONLY a strictly validated edit/control sequence to PTY.
   // Deliberately keeps `s.hasDraft` and `s.lastInputAt` intact until the client verifies the prompt became empty
   // and sends `confirmClearInput`, so a write error or an uncooperative CLI never unlocks queued delivery!
@@ -894,7 +1086,7 @@ export class SessionManager {
       return { ok: false, reason: 'stale', draftSeq };
     }
     if (s.permBlocked || s.startupBlocked) return { ok: false, reason: 'blocked', draftSeq };
-    if (s.enterTimer) return { ok: false, reason: 'busy', draftSeq };
+    if (s.enterTimer || s.interactiveActive) return { ok: false, reason: 'busy', draftSeq };
     if (!/^(?:[\x01\x05\x08\x0b\x15\x7f]|\x1b\[[ABCD])+$/.test(d)) return { ok: false, reason: 'error', draftSeq };
     s.pendingClearSeq = null;
     try {
@@ -937,7 +1129,7 @@ export class SessionManager {
       return { ok: false, reason: 'stale', draftSeq };
     }
     if (s.permBlocked || s.startupBlocked) return { ok: false, reason: 'blocked', draftSeq };
-    if ((s.info.status !== 'idle' && s.info.status !== 'needs_you') || s.enterTimer || s.pendingClearSeq !== null) return { ok: false, reason: 'busy', draftSeq };
+    if ((s.info.status !== 'idle' && s.info.status !== 'needs_you') || s.enterTimer || s.pendingClearSeq !== null || s.interactiveActive) return { ok: false, reason: 'busy', draftSeq };
     try {
       s.proc.write('\r');
     } catch (e) {
@@ -1047,7 +1239,7 @@ export class SessionManager {
     for (const s of this.live.values()) {
       if (s.recentDeliveries.length) this.pruneDeliveries(s, now);
       if (!s.queue.length) continue;
-      if (deliverable({ ...s, status: s.info.status, statusSince: s.info.statusSince, enterPending: s.enterTimer !== null }, now)) {
+      if (deliverable({ ...s, status: s.info.status, statusSince: s.info.statusSince, enterPending: s.enterTimer !== null, interactivePending: s.interactiveActive !== null || s.interactiveSteps.length > 0 }, now)) {
         this.deliver(s, now);
       }
       if (s.queue.length) pending = true;
@@ -1072,6 +1264,7 @@ export class SessionManager {
   }
 
   private deliver(s: Live, now: number) {
+    this.abortInteractiveSteps(s, 'aborted');
     const item = s.queue.shift()!;
     const { text, system, onDelivered } = item;
     const cleanChars = sanitizePaste(text).length;
@@ -1253,6 +1446,7 @@ export class SessionManager {
     s.removed = true;
     this.dropQueue(s);
     this.clearDraftTimer(s);
+    this.abortInteractiveSteps(s, 'exited');
     if (s.quiet) clearTimeout(s.quiet);
     if (s.enterTimer) {
       clearTimeout(s.enterTimer);

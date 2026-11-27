@@ -862,3 +862,113 @@ test('StreamView multi-line composer typing: zero conversation list vertical fli
   await expect.poll(distFromBottom, { timeout: 5_000 }).toBeLessThanOrEqual(20);
   await expect(sv.getByTestId('sv-jump-bottom')).toHaveCount(0);
 });
+
+test('StreamView interactive question picker: renders native QuestionCard (no LiveTail blockquote leak), completes single/multi/write-in/review with zero PTY resize', async ({ page, request }) => {
+  await page.setViewportSize({ width: 1360, height: 920 });
+  const projName = token('question');
+  const project = await createProject(request, projName);
+  await page.goto('/');
+
+  const { session } = await createFakeTask(request, project.id, '交互问题选择验收', 'question');
+  const sid = session.id;
+  const p0 = pane(page, 0);
+  await row(page, sid).click();
+  await expect(p0).toHaveAttribute('data-session-id', sid);
+
+  // Wait for the terminal to render Question 1/3 while staying in `working` (no PermissionRequest hook).
+  await expect.poll(() => termText(page, sid), { timeout: 10_000 }).toContain('Question 1/3');
+  const initialSize = await page.evaluate((id) => (window as any).__wbTermSize(id), sid);
+
+  // Switch to Dialog mode -> native QuestionCard appears immediately, LiveTail does NOT leak blockquote!
+  await p0.getByTestId('pane-mode-stream').click();
+  const sv = p0.getByTestId('stream-view');
+  await expect(sv).toBeVisible();
+  const qCard = sv.getByTestId('sv-question-card');
+  await expect(qCard).toBeVisible({ timeout: 5_000 });
+  await expect(qCard).toHaveAttribute('data-mode', 'select');
+  await expect(qCard.getByTestId('sv-question-progress')).toContainText('1 / 3');
+  await expect(qCard.getByTestId('sv-question-title')).toContainText('昇龙破空重做');
+  await expect(qCard.getByTestId('sv-question-opt')).toHaveCount(3);
+  await expect(qCard.getByTestId('sv-question-opt').first()).toContainText('推荐');
+  await expect(sv.getByTestId('sv-live-answer')).toHaveCount(0);
+  await expect(sv.getByTestId('sv-term-draft-bar')).toHaveCount(0);
+  await expect(sv).toContainText('向你提问（3 个问题）');
+  await page.screenshot({ path: path.join(OUT, '12-question-single.png') });
+
+  // 1. Click option 2 (1B 鎏金苍白龙) -> advances cleanly to Question 2/3 (multi-select).
+  await qCard.getByTestId('sv-question-opt').nth(1).click();
+  await expect(qCard).toHaveAttribute('data-mode', 'multi', { timeout: 5_000 });
+  await expect(qCard.getByTestId('sv-question-progress')).toContainText('2 / 3');
+  await expect(qCard.getByTestId('sv-question-opt').nth(0)).toHaveAttribute('data-checked', 'true');
+  await expect(qCard.getByTestId('sv-question-opt').nth(1)).toHaveAttribute('data-checked', 'false');
+
+  // 2. Toggle option 2 in multi-select -> checkbox turns true, zero terminal-draft false alarm!
+  await qCard.getByTestId('sv-question-opt').nth(1).click();
+  await expect(qCard.getByTestId('sv-question-opt').nth(1)).toHaveAttribute('data-checked', 'true', { timeout: 5_000 });
+  await expect(sv.getByTestId('sv-term-draft-bar')).toHaveCount(0);
+  await page.screenshot({ path: path.join(OUT, '13-question-multi.png') });
+
+  // Confirm Q2 -> advances to Question 3/3.
+  await qCard.getByTestId('sv-question-action-confirm').click();
+  await expect(qCard).toHaveAttribute('data-mode', 'select', { timeout: 5_000 });
+  await expect(qCard.getByTestId('sv-question-progress')).toContainText('3 / 3');
+
+  // 3. Q3 has 3 options (`保持默认方案`, `精简为单段展示`, `Write-in...`). Click Write-in... (index 2: genuine 3-key
+  //    batch `down, down, enter` + 160ms transition delay) and execute an actual forced second click mid-flight to verify
+  //    intermediate arrow redraws NEVER unlock early or send a second batch into Q3/Write-in.
+  await expect(qCard.getByTestId('sv-question-opt')).toHaveCount(3);
+  const writeInOpt = qCard.locator('[data-testid="sv-question-opt"][data-write-in="true"]');
+  await writeInOpt.click();
+  await expect(qCard.getByTestId('sv-question-opt').first()).toBeDisabled();
+  await page.waitForTimeout(55);
+  await qCard.getByTestId('sv-question-opt').first().click({ force: true });
+  await expect(qCard).toHaveAttribute('data-mode', 'write-in', { timeout: 5_000 });
+  const writeInInput = qCard.getByTestId('sv-question-writein-input');
+  await expect(writeInInput).toBeVisible();
+  await expect(writeInInput).toBeFocused();
+  await page.screenshot({ path: path.join(OUT, '14-question-writein.png') });
+
+  // Write-in draft MUST survive full QuestionCard unmount/remount (e.g. peeking at Terminal mode or transient PermissionRequest).
+  await writeInInput.fill('草稿切终端后仍完整保留');
+  await qCard.getByTestId('sv-question-term').click();
+  await expect(p0.getByTestId('stream-view')).toHaveCount(0);
+  await p0.getByTestId('pane-mode-stream').click();
+  await expect(qCard).toHaveAttribute('data-mode', 'write-in', { timeout: 5_000 });
+  await expect(writeInInput).toHaveValue('草稿切终端后仍完整保留');
+
+  // Oversized Write-in (>32,000 chars) must show an inline alert, NEVER clear the draft, AND persist BOTH
+  // draft and alert across full StreamView unmount/remount (Terminal <-> Dialog toggle)!
+  const oversized = '超长测试'.repeat(8001);
+  await writeInInput.fill(oversized);
+  await qCard.getByTestId('sv-question-writein-submit').click();
+  await expect(qCard.getByTestId('sv-question-err')).toContainText('32,000');
+  await expect(writeInInput).toHaveValue(oversized);
+  await expect(qCard).toHaveAttribute('data-mode', 'write-in');
+  await qCard.getByTestId('sv-question-term').click();
+  await expect(p0.getByTestId('stream-view')).toHaveCount(0);
+  await p0.getByTestId('pane-mode-stream').click();
+  await expect(qCard).toHaveAttribute('data-mode', 'write-in', { timeout: 5_000 });
+  await expect(qCard.getByTestId('sv-question-err')).toContainText('32,000');
+  await expect(writeInInput).toHaveValue(oversized);
+
+  // Now submit a valid Chinese custom answer -> waits for server enterReady() + Review redraw cleanly!
+  await writeInInput.fill('优先保留青龙拖尾特效');
+  await qCard.getByTestId('sv-question-writein-submit').click();
+
+  // 4. Lands on Review Answers -> shows summary of all 3 answers and Submit All button!
+  await expect(qCard).toHaveAttribute('data-mode', 'review', { timeout: 5_000 });
+  await expect(qCard.getByTestId('sv-question-sub')).toContainText('1B 鎏金苍白龙');
+  await expect(qCard.getByTestId('sv-question-sub')).toContainText('战斗破绽回归');
+  await expect(qCard.getByTestId('sv-question-sub')).toContainText('优先保留青龙拖尾特效');
+  await page.screenshot({ path: path.join(OUT, '15-question-review.png') });
+
+  // Submit All -> QuestionCard closes, session completes cleanly, final reply renders, zero PTY resize!
+  await qCard.getByTestId('sv-question-opt').first().click();
+  await expect(qCard).toHaveCount(0, { timeout: 5_000 });
+  await expectStatus(page, sid, 'needs_you', 10_000);
+  await expect(sv).toContainText('已收到全部 3 项选择');
+  await expect(sv).toContainText('优先保留青龙拖尾特效');
+  await expect(sv.getByTestId('sv-term-draft-bar')).toHaveCount(0);
+  const sizeAfter = await page.evaluate((id) => (window as any).__wbTermSize(id), sid);
+  expect(sizeAfter).toEqual(initialSize);
+});

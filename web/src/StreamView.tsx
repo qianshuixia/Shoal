@@ -1,9 +1,10 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
-import type { Project, SessionActivity, SessionContext, SessionInfo, SessionStreamState, StreamBlock, Task } from '../../shared/protocol.ts';
+import type { InteractiveKey, Project, SessionActivity, SessionContext, SessionInfo, SessionStreamState, StreamBlock, Task } from '../../shared/protocol.ts';
+import { MAX_INTERACTIVE_TEXT } from '../../shared/protocol.ts';
 import {
-  composeLiveTail, extractPtyLiveFromLines, extractPtyPromptState,
-  type PtyLiveExtract, type PtyPromptState,
+  composeLiveTail, extractPtyInteractivePrompt, extractPtyLiveFromLines, extractPtyPromptState,
+  type PtyInteractivePrompt, type PtyLiveExtract, type PtyPromptState,
 } from '../../shared/ptyLive.ts';
 import type { DelegateView } from './DelegationHud.tsx';
 import {
@@ -19,12 +20,20 @@ import { CardBlock } from './stream/CardBlock.tsx';
 import { DockTray } from './stream/DockTray.tsx';
 import { LiveTail } from './stream/LiveTail.tsx';
 import { PromptBanner } from './stream/PromptBanner.tsx';
+import { QuestionCard } from './stream/QuestionCard.tsx';
 import { StepBlockView, StepGroup } from './stream/StepGroup.tsx';
 import { StreamComposer } from './stream/StreamComposer.tsx';
 import { TermDraftBar, type TermGuard } from './stream/TermDraftBar.tsx';
 import { UserBubble, type UserBlock } from './stream/UserBubble.tsx';
 import { fileBase, redactLocalPaths } from './stream/format.ts';
 import { clearTerminalInputAndVerify, sendTerminalDraft } from './stream/draftGuard.ts';
+import {
+  clearPendingInteractiveRequest, clearQuestionError, clearQuestionWriteInDraft,
+  clearSessionInteractiveCache, describeInteractiveRejection, getQuestionError,
+  getQuestionWriteInDraft, registerPendingInteractiveRequest, setQuestionError,
+  setQuestionWriteInDraft, subscribeInteractiveInputResult, waitInteractiveInputResult,
+  type InteractiveActionWait,
+} from './stream/interactiveActions.ts';
 import { mergeSubagents } from './stream/subagents.ts';
 import { buildFlow, WINDOW_SIZE, windowFlow } from './stream/steps.ts';
 import { parseUserMessage } from './stream/attachments.ts';
@@ -68,6 +77,28 @@ function newClientMsgId(): string {
   }
 }
 
+// Identifies the visible question state excluding cursor index (`selectedIndex`) and in-place Write-in echo
+// (`writeInText`), so neither intermediate arrow-key redraws nor pasted Write-in echoes look "settled" before
+// the terminal genuinely leaves the current prompt (next question, checkbox toggle, mode change, or card closed).
+function questionSettleKey(q: PtyInteractivePrompt | null): string {
+  if (!q) return 'none';
+  return JSON.stringify([
+    q.mode,
+    q.progress?.current ?? 0,
+    q.progress?.total ?? 0,
+    q.title,
+    q.subtitle ?? '',
+    q.options.map((o) => [o.number ?? '', o.label, o.checked ?? null]),
+    q.rawHint,
+  ]);
+}
+
+// Identifies the logical question across mode switches / transient PermissionRequest unmounts.
+function questionIdentityKey(q: PtyInteractivePrompt | null): string {
+  if (!q) return '';
+  return JSON.stringify([q.progress?.current ?? 0, q.progress?.total ?? 0, q.title]);
+}
+
 function StreamViewImpl({
   task,
   project,
@@ -103,6 +134,10 @@ function StreamViewImpl({
   const [sendErrGoto, setSendErrGoto] = useState(false); // offer a 「查看终端」 shortcut next to terminal-related errors
   const [promptBusy, setPromptBusy] = useState(false);
   const [promptNote, setPromptNote] = useState('');
+  const [questionBusy, setQuestionBusy] = useState(false);
+  const [questionStale, setQuestionStale] = useState(false);
+  const [questionErr, setQuestionErr] = useState('');
+  const [questionWriteInDraft, setQuestionWriteInDraftState] = useState('');
   const [termBusy, setTermBusy] = useState(false);
   const [termFlash, setTermFlash] = useState(false);
   // Binds 「终端是空的」 dismissal strictly to the exact terminalDraftSeq observed when clicked;
@@ -111,13 +146,23 @@ function StreamViewImpl({
   const [focusSubagentTick, setFocusSubagentTick] = useState(0);
 
   const flashTimerRef = useRef(0);
+  const sessionIdRef = useRef(sessionId);
+  const questionBusyRef = useRef(false);
+  const questionWaitRef = useRef<InteractiveActionWait | null>(null);
+  const questionSettleRef = useRef<{
+    beforeKey: string;
+    beforeIdentityKey: string;
+    clearWriteInKey?: string;
+    timer: number;
+  } | null>(null);
   const inputRef = useRef(input);
   const attachmentsRef = useRef(attachments);
   // Latest-value refs are refreshed after commit (never written during render).
   useLayoutEffect(() => {
+    sessionIdRef.current = sessionId;
     inputRef.current = input;
     attachmentsRef.current = attachments;
-  }, [input, attachments]);
+  }, [sessionId, input, attachments]);
   const thumbs = useAttachmentThumbs(attachments);
 
   const setError = useCallback((msg: string, offerTerminal = false) => {
@@ -153,6 +198,13 @@ function StreamViewImpl({
       mountedRef.current = false;
       window.clearTimeout(flashTimerRef.current);
       flashTimerRef.current = 0;
+      questionWaitRef.current?.cancel();
+      questionWaitRef.current = null;
+      if (questionSettleRef.current) {
+        window.clearTimeout(questionSettleRef.current.timer);
+        questionSettleRef.current = null;
+      }
+      questionBusyRef.current = false;
     };
   }, []);
 
@@ -165,12 +217,17 @@ function StreamViewImpl({
 
   // Live snapshot observer over the uncorrupted browser xterm.js viewport:
   // - While working: extracts live streaming thinking/answer/subagent bars with 220ms transient-blank hold.
-  // - At all times (non-exited): extracts the active CLI terminal input draft so switching 终端 -> 对话 never collides.
+  // - At all times (non-exited): extracts the active CLI terminal input draft and interactive question pickers.
   const [ptyExtract, setPtyExtract] = useState<PtyLiveExtract | null>(null);
   const [ptyPrompt, setPtyPrompt] = useState<PtyPromptState>(() => {
     if (!sessionId) return { found: false, draft: null };
     const snap = readTermLiveSnapshot(sessionId);
     return snap ? extractPtyPromptState(agent, snap.lines, snap.isAlternate) : { found: false, draft: null };
+  });
+  const [ptyQuestion, setPtyQuestion] = useState<PtyInteractivePrompt | null>(() => {
+    if (!sessionId) return null;
+    const snap = readTermLiveSnapshot(sessionId);
+    return snap ? extractPtyInteractivePrompt(agent, snap.lines, snap.isAlternate) : null;
   });
   const lastLiveAnswerLenRef = useRef(0);
   const liveExtRef = useRef<PtyLiveExtract | null>(null); // newest raw sample, read by the 220ms hold timer
@@ -197,6 +254,7 @@ function StreamViewImpl({
     if (!sessionId || exited) {
       setPtyExtract(null);
       setPtyPrompt({ found: false, draft: null });
+      setPtyQuestion(null);
       liveExtRef.current = null;
       return;
     }
@@ -225,6 +283,9 @@ function StreamViewImpl({
           ? prev
           : nextPrompt,
       );
+
+      const nextInteractive = extractPtyInteractivePrompt(agent, snap.lines, snap.isAlternate);
+      setPtyQuestion((prev) => (prev?.fingerprint === nextInteractive?.fingerprint ? prev : nextInteractive));
 
       if (!working) return;
       const ext = extractPtyLiveFromLines(agent, snap.lines, lastUserRef.current, snap.isAlternate);
@@ -282,7 +343,23 @@ function StreamViewImpl({
       clearTimeout(throttleTimer);
       clearTimeout(holdTimer);
     };
-  }, [working, exited, sessionId, agent, session?.hasTerminalDraft]);
+  }, [working, exited, sessionId, agent, session?.blocked, session?.hasTerminalDraft]);
+
+  const activeQuestion = !exited && !prompt && !session?.blocked ? ptyQuestion : null;
+  const hiddenByBlock = (!!prompt || !!session?.blocked) && activeQuestion === null;
+  const activeQuestionSettleKey = useMemo(() => questionSettleKey(activeQuestion), [activeQuestion]);
+  const activeQuestionIdentityKey = useMemo(() => questionIdentityKey(activeQuestion), [activeQuestion]);
+  const activeQuestionSettleKeyRef = useRef(activeQuestionSettleKey);
+  const activeQuestionIdentityKeyRef = useRef(activeQuestionIdentityKey);
+  const activeQuestionModeRef = useRef<PtyInteractivePrompt['mode'] | null>(activeQuestion?.mode ?? null);
+  const hiddenByBlockRef = useRef(hiddenByBlock);
+  const lastQuestionIdentityRef = useRef('');
+  useLayoutEffect(() => {
+    activeQuestionSettleKeyRef.current = activeQuestionSettleKey;
+    activeQuestionIdentityKeyRef.current = activeQuestionIdentityKey;
+    activeQuestionModeRef.current = activeQuestion?.mode ?? null;
+    hiddenByBlockRef.current = hiddenByBlock;
+  }, [activeQuestionSettleKey, activeQuestionIdentityKey, activeQuestion?.mode, hiddenByBlock]);
 
   const mergedSubagents = useMemo(
     () => mergeSubagents(streamState?.subagents, ptyExtract?.subagents, working),
@@ -315,7 +392,7 @@ function StreamViewImpl({
   // - If xterm sees a definitely empty prompt box -> no false alarm even if server hasDraft was stale after Backspace.
   // - If xterm prompt box is obscured/unreadable AND server recorded uncommitted typing -> show safe fallback guard.
   const termGuard = useMemo<TermGuard | null>(() => {
-    if (exited || session?.blocked) return null;
+    if (exited || session?.blocked || activeQuestion) return null;
     // While working, a visible `> ...` line at the bottom can be the already-submitted prompt unless the server
     // recorded fresh uncommitted terminal typing (`hasTerminalDraft === true`).
     if (working && !session?.hasTerminalDraft) return null;
@@ -326,7 +403,7 @@ function StreamViewImpl({
       return { mode: 'unreadable' };
     }
     return null;
-  }, [exited, working, session?.blocked, session?.hasTerminalDraft, ptyPrompt, fallbackDismissed]);
+  }, [exited, working, session?.blocked, session?.hasTerminalDraft, ptyPrompt, fallbackDismissed, activeQuestion]);
 
   useEffect(() => {
     if (!termGuard && sendErr === TERM_GUARD_MSG) setError('');
@@ -377,7 +454,7 @@ function StreamViewImpl({
       : tailBlock.kind === 'card'
         ? tailBlock.card.body.length
         : tailBlock.text.length;
-  const contentKey = `${blocks.length}:${tailBlock?.id ?? ''}:${tailContentLen}:${live?.phase ?? ''}:${live?.answerText?.length ?? 0}:${live?.thinkingText?.length ?? 0}:${prompt?.fingerprint ?? ''}`;
+  const contentKey = `${blocks.length}:${tailBlock?.id ?? ''}:${tailContentLen}:${live?.phase ?? ''}:${live?.answerText?.length ?? 0}:${live?.thinkingText?.length ?? 0}:${prompt?.fingerprint ?? ''}:${activeQuestion?.fingerprint ?? ''}`;
   const replySignal = useMemo(
     () => ({
       blockCount: blocks.length,
@@ -421,6 +498,83 @@ function StreamViewImpl({
     setPromptNote('');
     setPromptBusy(false);
   }, [sessionId, prompt?.fingerprint]);
+
+  const releaseQuestionLock = useCallback(() => {
+    questionWaitRef.current?.cancel();
+    questionWaitRef.current = null;
+    if (questionSettleRef.current) {
+      window.clearTimeout(questionSettleRef.current.timer);
+      questionSettleRef.current = null;
+    }
+    questionBusyRef.current = false;
+    if (mountedRef.current) {
+      setQuestionBusy(false);
+      setQuestionStale(false);
+    }
+  }, []);
+
+  // Reset local interactive lock when switching sessions (draft & error caches stay persisted per sessionId).
+  useEffect(() => {
+    releaseQuestionLock();
+    lastQuestionIdentityRef.current = '';
+    setQuestionWriteInDraftState(getQuestionWriteInDraft(sessionId, activeQuestionIdentityKeyRef.current));
+    setQuestionErr(getQuestionError(sessionId, activeQuestionIdentityKeyRef.current));
+  }, [sessionId, releaseQuestionLock]);
+
+  // Clear cached Write-in draft & errors once the session exits.
+  useEffect(() => {
+    if (!exited) return;
+    clearSessionInteractiveCache(sessionId);
+    setQuestionWriteInDraftState('');
+    setQuestionErr('');
+  }, [exited, sessionId]);
+
+  // Hydrate Write-in draft & persisted error when mounting or returning to the same question (including across
+  // transient PermissionRequest unmounts or full StreamView Terminal <-> Dialog toggles).
+  useEffect(() => {
+    if (!activeQuestionIdentityKey) return;
+    if (lastQuestionIdentityRef.current && lastQuestionIdentityRef.current !== activeQuestionIdentityKey) {
+      clearQuestionError(sessionId, lastQuestionIdentityRef.current);
+    }
+    lastQuestionIdentityRef.current = activeQuestionIdentityKey;
+    setQuestionWriteInDraftState(getQuestionWriteInDraft(sessionId, activeQuestionIdentityKey));
+    setQuestionErr(getQuestionError(sessionId, activeQuestionIdentityKey));
+  }, [sessionId, activeQuestionIdentityKey]);
+
+  // Surface late server rejections immediately even if the user switched Terminal -> Dialog while a request was in flight.
+  useEffect(() => {
+    if (!sessionId) return;
+    return subscribeInteractiveInputResult((msg) => {
+      if (msg.id !== sessionId || msg.ok || !mountedRef.current) return;
+      const persisted = getQuestionError(sessionId, activeQuestionIdentityKeyRef.current);
+      if (persisted) setQuestionErr(persisted);
+    });
+  }, [sessionId]);
+
+  // Release the post-ack settle lock ONLY once xterm visibly advances past the previous question/checkbox/write-in
+  // state AND is NOT obscured by `prompt` or `session.blocked`. Never auto-unlocks a stale card!
+  useEffect(() => {
+    const pendingSettle = questionSettleRef.current;
+    if (!pendingSettle || hiddenByBlock || activeQuestionSettleKey === pendingSettle.beforeKey) return;
+    const leftWriteIn =
+      !pendingSettle.clearWriteInKey ||
+      activeQuestion?.mode !== 'write-in' ||
+      activeQuestionIdentityKey !== pendingSettle.clearWriteInKey;
+    if (!leftWriteIn) return;
+    window.clearTimeout(pendingSettle.timer);
+    questionSettleRef.current = null;
+    if (pendingSettle.clearWriteInKey) {
+      clearQuestionWriteInDraft(sessionId, pendingSettle.clearWriteInKey);
+      if (activeQuestionIdentityKeyRef.current === pendingSettle.clearWriteInKey || !activeQuestionIdentityKeyRef.current) {
+        setQuestionWriteInDraftState('');
+      }
+    }
+    clearQuestionError(sessionId, pendingSettle.beforeIdentityKey);
+    questionBusyRef.current = false;
+    setQuestionBusy(false);
+    setQuestionStale(false);
+    setQuestionErr('');
+  }, [sessionId, hiddenByBlock, activeQuestion?.mode, activeQuestionIdentityKey, activeQuestionSettleKey]);
 
   const appendAttachments = (targetSid: string | null, incoming: StreamAttachment[]): boolean => {
     if (!incoming.length) return false;
@@ -738,6 +892,132 @@ function StreamViewImpl({
     }
   };
 
+  const handleQuestionWriteInChange = useCallback((text: string) => {
+    setQuestionWriteInDraftState(text);
+    setQuestionWriteInDraft(sessionId, activeQuestionIdentityKeyRef.current, text);
+  }, [sessionId]);
+
+  const handleQuestionUnlock = useCallback(() => {
+    if (questionSettleRef.current) {
+      window.clearTimeout(questionSettleRef.current.timer);
+      questionSettleRef.current = null;
+    }
+    clearQuestionError(sessionId, activeQuestionIdentityKeyRef.current);
+    questionBusyRef.current = false;
+    setQuestionBusy(false);
+    setQuestionStale(false);
+    setQuestionErr('');
+  }, [sessionId]);
+
+  const dispatchInteractiveInput = useCallback(async (payload: {
+    keys?: InteractiveKey[];
+    text?: string;
+    submit?: boolean;
+  }): Promise<boolean> => {
+    if (!sessionId || questionBusyRef.current) return false;
+    const beforeKey = activeQuestionSettleKeyRef.current;
+    const beforeIdentityKey = activeQuestionIdentityKeyRef.current;
+    if (payload.text !== undefined && payload.text.length > MAX_INTERACTIVE_TEXT) {
+      const msg = describeInteractiveRejection('too-large');
+      setQuestionError(sessionId, beforeIdentityKey, msg);
+      setQuestionErr(msg);
+      return false;
+    }
+    const reqId = newClientMsgId();
+    // Write-in paste waits for server enterReady() (up to 12s cap on large Windows Codex pastes).
+    const expectedMs =
+      (payload.keys?.length ?? 0) * 40 +
+      (payload.text ? 13_000 : 0) +
+      (payload.submit ? 100 : 0) +
+      3500;
+    questionBusyRef.current = true;
+    setQuestionBusy(true);
+    setQuestionStale(false);
+    clearQuestionError(sessionId, beforeIdentityKey);
+    setQuestionErr('');
+
+    registerPendingInteractiveRequest(reqId, sessionId, beforeIdentityKey, expectedMs);
+    const wait = waitInteractiveInputResult(sessionId, reqId, expectedMs);
+    questionWaitRef.current = wait;
+    const sent = send({ t: 'interactive-input', id: sessionId, reqId, ...payload });
+    if (!sent) {
+      clearPendingInteractiveRequest(reqId);
+      wait.cancel();
+      if (questionWaitRef.current === wait) questionWaitRef.current = null;
+      questionBusyRef.current = false;
+      if (mountedRef.current) {
+        const msg = describeInteractiveRejection('disconnected');
+        setQuestionError(sessionId, beforeIdentityKey, msg);
+        setQuestionBusy(false);
+        setQuestionErr(msg);
+      }
+      return false;
+    }
+
+    const res = await wait.promise;
+    if (questionWaitRef.current === wait) questionWaitRef.current = null;
+    if (!mountedRef.current || sessionIdRef.current !== sessionId) return false;
+
+    if (!res) {
+      clearPendingInteractiveRequest(reqId);
+      const msg = describeInteractiveRejection('timeout');
+      setQuestionError(sessionId, beforeIdentityKey, msg);
+      questionBusyRef.current = false;
+      setQuestionBusy(false);
+      setQuestionErr(msg);
+      return false;
+    }
+    if (!res.ok) {
+      const msg = describeInteractiveRejection(res.reason);
+      setQuestionError(sessionId, beforeIdentityKey, msg);
+      questionBusyRef.current = false;
+      setQuestionBusy(false);
+      setQuestionErr(msg);
+      return false;
+    }
+
+    // Server finished writing every step. Only clear Write-in draft and unlock once xterm visibly leaves
+    // `beforeKey` while NOT hidden by `prompt`/`session.blocked` (ignoring in-place Write-in text echo!).
+    const clearWriteInKey = payload.text ? beforeIdentityKey : undefined;
+    const leftWriteIn =
+      !clearWriteInKey ||
+      activeQuestionModeRef.current !== 'write-in' ||
+      activeQuestionIdentityKeyRef.current !== clearWriteInKey;
+    if (!hiddenByBlockRef.current && activeQuestionSettleKeyRef.current !== beforeKey && leftWriteIn) {
+      if (clearWriteInKey) {
+        clearQuestionWriteInDraft(sessionId, clearWriteInKey);
+        setQuestionWriteInDraftState('');
+      }
+      clearQuestionError(sessionId, beforeIdentityKey);
+      questionBusyRef.current = false;
+      setQuestionBusy(false);
+      setQuestionStale(false);
+    } else {
+      const timer = window.setTimeout(() => {
+        if (!mountedRef.current || questionSettleRef.current?.timer !== timer) return;
+        // Keep buttons disabled instead of silently auto-unlocking; persist alert across unmount too.
+        const msg = payload.text
+          ? '已发送提交，但终端界面尚未刷新；原内容已保留，请确认终端状态后再试或切到终端处理'
+          : '已发送操作，但终端界面尚未刷新；请确认终端状态后再试或切到终端处理';
+        setQuestionError(sessionId, beforeIdentityKey, msg);
+        setQuestionStale(true);
+        setQuestionErr(msg);
+      }, 1500);
+      questionSettleRef.current = { beforeKey, beforeIdentityKey, clearWriteInKey, timer };
+    }
+    return true;
+  }, [sessionId]);
+
+  const handleQuestionKeys = useCallback((keys: InteractiveKey[]) => {
+    if (!keys.length) return;
+    void dispatchInteractiveInput({ keys });
+  }, [dispatchInteractiveInput]);
+
+  const handleQuestionText = useCallback((text: string): Promise<boolean> => {
+    if (!text.trim()) return Promise.resolve(false);
+    return dispatchInteractiveInput({ text, submit: true });
+  }, [dispatchInteractiveInput]);
+
   // Stable per-bubble callbacks (UserBubble is memoized).
   const reuseText = useCallback((text: string) => {
     setInput((cur) => (cur.trim() ? `${cur}\n${text}` : text));
@@ -894,7 +1174,7 @@ function StreamViewImpl({
             );
           })}
 
-          {live && (
+          {live && (!activeQuestion || live.phase === 'subagent') && (
             <LiveTail
               live={live}
               hasActiveStepTail={tailBlock?.kind === 'step' && tailBlock.active === true}
@@ -926,7 +1206,7 @@ function StreamViewImpl({
           subagents={mergedSubagents}
           delegates={delegates}
           livePhase={live?.phase}
-          hasPrompt={!!prompt}
+          hasPrompt={!!prompt || !!activeQuestion}
           privacy={privacy}
           focusSubagentTick={focusSubagentTick}
           onOpenDelegate={onOpenDelegate}
@@ -939,6 +1219,22 @@ function StreamViewImpl({
             busy={promptBusy}
             note={promptNote}
             onAnswer={(data) => void handlePromptClick(data)}
+            onOpenTerminal={onSwitchToTerminal}
+          />
+        )}
+
+        {activeQuestion && (
+          <QuestionCard
+            prompt={activeQuestion}
+            busy={questionBusy}
+            stale={questionStale}
+            error={questionErr}
+            writeInDraft={questionWriteInDraft}
+            privacy={privacy}
+            onWriteInChange={handleQuestionWriteInChange}
+            onSendKeys={handleQuestionKeys}
+            onSubmitText={handleQuestionText}
+            onUnlock={handleQuestionUnlock}
             onOpenTerminal={onSwitchToTerminal}
           />
         )}
@@ -1001,9 +1297,11 @@ function StreamViewImpl({
             placeholder={
               hasDraftBlock
                 ? '先处理上方终端里的未发送内容…'
-                : working
-                  ? '继续补充要求（本轮结束后自动发送）…'
-                  : '在此输入消息，或粘贴/拖入文件…（Enter 发送，Shift+Enter 换行）'
+                : activeQuestion
+                  ? '请先完成上方问题选择，或继续补充说明（本轮结束后发送）…'
+                  : working
+                    ? '继续补充要求（本轮结束后自动发送）…'
+                    : '在此输入消息，或粘贴/拖入文件…（Enter 发送，Shift+Enter 换行）'
             }
             working={!!working}
             onInterrupt={onInterrupt}

@@ -189,6 +189,19 @@ export function summarizeToolCall(rawName: string, rawArgs: unknown): ParsedTool
       const q = str(args.query);
       return { summary: q ? `检索网页「${cut(q, 24)}」` : '检索网页', detail: rawName, subagent: false, filesRead, filesWritten };
     }
+    case 'ask_question':
+    case 'AskUserQuestion':
+    case 'request_user_input': {
+      const qs = Array.isArray(args.questions) ? args.questions : [];
+      const n = qs.length;
+      return {
+        summary: n > 0 ? `向你提问（${n} 个问题）` : '等待你回答问题',
+        detail: rawName,
+        subagent: false,
+        filesRead,
+        filesWritten,
+      };
+    }
     default: {
       if (explicit) return { summary: cut(explicit, 42), detail: rawName, subagent: false, filesRead, filesWritten };
       return { summary: `调用 ${cut(shortName, 30)}`, detail: rawName, subagent: false, filesRead, filesWritten };

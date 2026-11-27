@@ -191,6 +191,66 @@ function submit() {
     out("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. Yes, and don't ask again\r\n  3. No, keep asking");
     mode = 'menu';
     askText = echo;
+  } else if (cmd === 'question') {
+    // Simulates agy's ask_question TUI while staying in `working` (NO PermissionRequest hook!):
+    // Q1 single-select -> Q2 multi-select -> Q3 single + Write-in -> Review & Submit All -> final answer.
+    const t0 = Date.now();
+    fs.appendFileSync(transcript, JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: new Date(t0).toISOString(),
+      model: 'gemini-4-neon-xhigh',
+      content: '方案已整理完成，请先拍板以下 3 项核心决定：',
+      tool_calls: [{
+        name: 'default_api:ask_question',
+        args: {
+          questions: JSON.stringify([
+            { question: 'Q1（2 级 · 昇龙破空重做）：默认龙色选哪套？', is_multi_select: false, options: ['(Recommended) 1A 原作青碧白炽龙', '1B 鎏金苍白龙'] },
+            { question: 'Q2（验收范围）：需要同步开启哪些回归项？', is_multi_select: true, options: ['像素指纹守卫', '战斗破绽回归', 'Windows 三包验证'] },
+            { question: 'Q3（补充要求）：是否需要额外备注？', is_multi_select: false, options: ['保持默认方案'] },
+          ]),
+        },
+      }],
+    }) + '\n');
+    fs.appendFileSync(transcript, JSON.stringify({
+      step_index: 2,
+      type: 'GENERIC',
+      status: 'RUNNING',
+      created_at: new Date(t0 + 50).toISOString(),
+    }) + '\n');
+    qState = {
+      idx: 0,
+      cursor: 0,
+      review: false,
+      reviewCursor: 0,
+      writeIn: false,
+      writeInBuf: '',
+      answers: [null, [0], null],
+      questions: [
+        {
+          title: 'Q1（2 级 · 昇龙破空重做）：采纳 3 段飞龙冲霄浮空 + 腾蛟影龙重放，默认龙色选哪套？',
+          multi: false,
+          options: [
+            '(Recommended) 1A 原作青碧白炽龙（忠实群英传 Magic_127，黄土战场高辨识）',
+            '1B 鎏金苍白龙（延续主角骑将暖金主色调）',
+            'Write-in...',
+          ],
+        },
+        {
+          title: 'Q2（验收范围）：需要同步开启哪些回归项？',
+          multi: true,
+          options: ['像素指纹守卫', '战斗破绽回归', 'Windows 三包验证'],
+        },
+        {
+          title: 'Q3（补充要求）：是否需要额外备注？',
+          multi: false,
+          options: ['保持默认方案', '精简为单段展示', 'Write-in...'],
+        },
+      ],
+    };
+    mode = 'question';
+    renderQuestion();
   } else if (cmd === 'stream') {
     // Simulates an agy-style multi-stage streaming turn: live thinking + todolist -> tool step -> live PTY answer -> lossless Markdown.
     const fileArg = [arg, ...rest].filter(Boolean).join(' ').trim();
@@ -554,6 +614,209 @@ function submit() {
   }
 }
 let askText = '';
+let qState = null;
+
+function renderQuestion() {
+  if (!qState) return;
+  const lines = ['\x1b[2J\x1b[H', '────────────────────────────────────────────────────────────────────────────────', ''];
+  if (qState.review) {
+    lines.push('Review Answers', '');
+    qState.questions.forEach((q, idx) => {
+      const a = qState.answers[idx];
+      const text = Array.isArray(a)
+        ? a.map((i) => q.options[i]).join(', ') || '(skipped)'
+        : (a ?? '(skipped)');
+      lines.push(`${idx + 1}. Q${idx + 1}: ${text}`);
+    });
+    lines.push('');
+    lines.push(`${qState.reviewCursor === 0 ? '> ' : '  '}Submit All`);
+    lines.push(`${qState.reviewCursor === 1 ? '> ' : '  '}Back`);
+    lines.push('', '  ↑/↓ Navigate · enter Select · esc Back');
+  } else {
+    const q = qState.questions[qState.idx];
+    lines.push(`Question ${qState.idx + 1}/${qState.questions.length}: ${q.title}`, '');
+    q.options.forEach((opt, i) => {
+      const prefix = i === qState.cursor ? '> ' : '  ';
+      if (q.multi) {
+        const checked = Array.isArray(qState.answers[qState.idx]) && qState.answers[qState.idx].includes(i);
+        lines.push(`${prefix}${i + 1}. [${checked ? 'x' : ' '}] ${opt}`);
+      } else {
+        lines.push(`${prefix}${i + 1}. ${opt}`);
+      }
+    });
+    if (qState.writeIn) {
+      lines.push(`  > ${qState.writeInBuf}`, '', '  enter Confirm · esc Back');
+    } else {
+      const nav = [];
+      nav.push('↑/↓ Navigate');
+      if (q.multi) nav.push('space Toggle');
+      if (qState.idx > 0) nav.push('← Prev');
+      if (qState.idx + 1 < qState.questions.length) nav.push('→ Next');
+      nav.push(q.multi ? 'enter Confirm' : 'enter Select');
+      nav.push('esc Skip');
+      nav.push('ctrl+r Review');
+      lines.push('', `  ${nav.join(' · ')}`);
+    }
+  }
+  lines.push('esc to cancel                                                                                auto · Gemini 4');
+  out(lines.join('\r\n'));
+}
+
+function finishQuestion(cancelled = false) {
+  const qs = qState;
+  qState = null;
+  mode = 'idle';
+  const summary = cancelled
+    ? '已取消问题选择。'
+    : qs.questions.map((q, idx) => {
+        const a = qs.answers[idx];
+        const val = Array.isArray(a)
+          ? a.map((i) => q.options[i]).join(' + ') || '(skipped)'
+          : (a ?? '(skipped)');
+        return `A${idx + 1}: ${val}`;
+      }).join('\n');
+  const tDone = Date.now();
+  fs.appendFileSync(transcript, JSON.stringify({
+    step_index: 2,
+    type: 'GENERIC',
+    status: 'DONE',
+    created_at: new Date(tDone).toISOString(),
+    content: summary,
+  }) + '\n');
+  const finalReply = cancelled ? '已收到取消指令。' : `已收到全部 3 项选择：\n\n${summary}`;
+  fs.appendFileSync(transcript, JSON.stringify({
+    step_index: 3,
+    type: 'PLANNER_RESPONSE',
+    status: 'DONE',
+    created_at: new Date(tDone + 50).toISOString(),
+    model: 'gemini-4-neon-xhigh',
+    content: finalReply,
+  }) + '\n');
+  out(`\x1b[2J\x1b[H${finalReply}\r\n> `);
+  hook('Stop', { last_assistant_message: finalReply });
+}
+
+function handleQuestionCsi(seq) {
+  if (!qState) return;
+  if (qState.writeIn) return;
+  if (qState.review) {
+    if (seq === '\x1b[A' || seq === '\x1bOA') qState.reviewCursor = Math.max(0, qState.reviewCursor - 1);
+    else if (seq === '\x1b[B' || seq === '\x1bOB') qState.reviewCursor = Math.min(1, qState.reviewCursor + 1);
+    renderQuestion();
+    return;
+  }
+  const q = qState.questions[qState.idx];
+  if (seq === '\x1b[A' || seq === '\x1bOA') qState.cursor = Math.max(0, qState.cursor - 1);
+  else if (seq === '\x1b[B' || seq === '\x1bOB') qState.cursor = Math.min(q.options.length - 1, qState.cursor + 1);
+  else if ((seq === '\x1b[D' || seq === '\x1bOD') && qState.idx > 0) {
+    qState.idx--;
+    qState.cursor = 0;
+  } else if ((seq === '\x1b[C' || seq === '\x1bOC') && qState.idx + 1 < qState.questions.length) {
+    qState.idx++;
+    qState.cursor = 0;
+  }
+  renderQuestion();
+}
+
+function handleQuestionKey(ch) {
+  if (!qState) return;
+  if (ch === '\x1b') {
+    if (qState.writeIn) {
+      qState.writeIn = false;
+      qState.writeInBuf = '';
+      renderQuestion();
+    } else if (qState.review) {
+      qState.review = false;
+      renderQuestion();
+    } else if (qState.idx + 1 < qState.questions.length) {
+      qState.idx++;
+      qState.cursor = 0;
+      renderQuestion();
+    } else {
+      qState.review = true;
+      qState.reviewCursor = 0;
+      renderQuestion();
+    }
+    return;
+  }
+  if (qState.writeIn) {
+    if (ch === '\r' || ch === '\n') {
+      qState.answers[qState.idx] = qState.writeInBuf.trim() || '(empty)';
+      qState.writeIn = false;
+      qState.writeInBuf = '';
+      if (qState.idx + 1 < qState.questions.length) {
+        qState.idx++;
+        qState.cursor = 0;
+      } else {
+        qState.review = true;
+        qState.reviewCursor = 0;
+      }
+      renderQuestion();
+    } else if (ch === '\x7f' || ch === '\b') {
+      const chars = Array.from(qState.writeInBuf);
+      chars.pop();
+      qState.writeInBuf = chars.join('');
+      renderQuestion();
+    } else if (ch >= ' ') {
+      qState.writeInBuf += ch;
+      renderQuestion();
+    }
+    return;
+  }
+  if (qState.review) {
+    if (ch === '\r' || ch === '\n') {
+      if (qState.reviewCursor === 0) finishQuestion(false);
+      else {
+        qState.review = false;
+        renderQuestion();
+      }
+    }
+    return;
+  }
+  const q = qState.questions[qState.idx];
+  if (ch === '\x12') {
+    qState.review = true;
+    qState.reviewCursor = 0;
+    renderQuestion();
+  } else if (q.multi && ch === ' ') {
+    const set = new Set(Array.isArray(qState.answers[qState.idx]) ? qState.answers[qState.idx] : []);
+    if (set.has(qState.cursor)) set.delete(qState.cursor);
+    else set.add(qState.cursor);
+    qState.answers[qState.idx] = [...set].sort((a, b) => a - b);
+    renderQuestion();
+  } else if (ch === '\r' || ch === '\n') {
+    if (q.multi) {
+      if (qState.idx + 1 < qState.questions.length) {
+        qState.idx++;
+        qState.cursor = 0;
+      } else {
+        qState.review = true;
+        qState.reviewCursor = 0;
+      }
+      renderQuestion();
+    } else {
+      const picked = q.options[qState.cursor];
+      if (/^write-in/i.test(picked)) {
+        qState.writeIn = true;
+        qState.writeInBuf = '';
+        // Brief realistic TUI transition delay so E2E verifies intermediate arrow redraws & slow transitions never unlock early.
+        setTimeout(() => {
+          if (mode === 'question' && qState?.writeIn) renderQuestion();
+        }, 160);
+      } else {
+        qState.answers[qState.idx] = picked;
+        if (qState.idx + 1 < qState.questions.length) {
+          qState.idx++;
+          qState.cursor = 0;
+        } else {
+          qState.review = true;
+          qState.reviewCursor = 0;
+        }
+        renderQuestion();
+      }
+    }
+  }
+}
 
 function interrupt() {
   clearTimeout(workTimer);
@@ -591,6 +854,11 @@ function key(ch) {
       out(ch);
       finishTurn(`${askText} [${ch}]`);
     }
+    return;
+  }
+  if (mode === 'question') {
+    logKey(ch);
+    handleQuestionKey(ch);
     return;
   }
   if (mode === 'trust') {
@@ -643,7 +911,9 @@ function feed(data) {
         escTimer = setTimeout(() => {
           if (carry === '\x1b') {
             carry = '';
-            if (mode !== 'idle') {
+            if (mode === 'question') {
+              handleQuestionKey('\x1b');
+            } else if (mode !== 'idle') {
               clearTimeout(workTimer);
               queued = false;
               mode = 'idle';
@@ -663,7 +933,12 @@ function feed(data) {
         const seq = s.slice(i, j + 1);
         if (seq === '\x1b[200~') inPaste = true;
         else if (seq === '\x1b[201~') inPaste = false;
+        else if (mode === 'question') handleQuestionCsi(seq);
         i = j + 1;
+      } else if (s[i + 1] === 'O' && i + 2 < s.length) {
+        const seq = s.slice(i, i + 3);
+        if (mode === 'question') handleQuestionCsi(seq);
+        i += 3;
       } else {
         // Meta key (Alt+x): echo it visibly so a leaked workbench shortcut shows up in tests.
         for (const c of `<M-${s[i + 1]}>`) key(c);

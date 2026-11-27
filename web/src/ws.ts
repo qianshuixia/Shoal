@@ -2,9 +2,11 @@ import type { ClientMsg, ServerMsg } from '../../shared/protocol.ts';
 
 let socket: WebSocket | null = null;
 
-// Input is dropped while disconnected; the server keeps the session alive meanwhile.
-export function send(msg: ClientMsg): void {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+// Input is dropped while disconnected; returns whether the frame was handed to an open WebSocket.
+export function send(msg: ClientMsg): boolean {
+  if (socket?.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(msg));
+  return true;
 }
 
 export interface Handlers {

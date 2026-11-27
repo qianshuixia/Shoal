@@ -839,4 +839,152 @@ describe('shutdown & Windows ConPTY process-tree cleanup', () => {
       fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
     }
   });
+
+  it('interactiveInput paces arrow/choice keys, honors DECCKM mode, submits write-in text, and never pollutes hasTerminalDraft', async () => {
+    vi.useFakeTimers();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-interactive-'));
+    const writes: string[] = [];
+    let dataCb: (d: string) => void = () => {};
+    let exitCb: (e: { exitCode: number }) => void = () => {};
+    vi.spyOn(pty, 'spawn').mockImplementation((() => ({
+      pid: 9010, cols: 120, rows: 36, process: 'agy', handleFlowControl: false,
+      onData: (cb: (d: string) => void) => { dataCb = cb; return { dispose() {} }; },
+      onExit: (cb: (e: { exitCode: number }) => void) => { exitCb = cb; return { dispose() {} }; },
+      write: (d: string) => { writes.push(d); },
+      resize() {}, kill() { exitCb({ exitCode: 0 }); },
+      pause() {}, resume() {}, clear() {},
+    })) as typeof pty.spawn);
+
+    const mgr = new SessionManager({ port: 47899, token: 't', stateDir: tmp });
+    try {
+      const s = mgr.spawn({ taskId: 'tq', projectId: 'p1', agent: 'fake', cwd: tmp, prompt: '' });
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'SessionStart', at: Date.now(), payload: { session_id: 'nq' } });
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'nq' } });
+      dataCb('\x1b[?2004h');
+
+      // Normal cursor mode + space toggle must NEVER set hasTerminalDraft.
+      expect(mgr.interactiveInput(s.id, { keys: ['down', 'down', 'space'] })).toBe(true);
+      expect(writes).toEqual(['\x1b[B']);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(writes).toEqual(['\x1b[B', '\x1b[B', ' ']);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBeUndefined();
+
+      // Application cursor keys mode (?1h) switches arrows to SS3 (\x1bOB / \x1bOA).
+      writes.length = 0;
+      dataCb('\x1b[?1h');
+      expect(mgr.interactiveInput(s.id, { keys: ['up', 'enter'] })).toBe(true);
+      await vi.advanceTimersByTimeAsync(60);
+      expect(writes).toEqual(['\x1bOA', '\r']);
+      dataCb('\x1b[?1l');
+
+      // Write-in text + submit uses bracketed paste and enterReady() paste-settle delay (never < 300ms / 120ms Codex window)
+      // without polluting hasTerminalDraft, and emits ok: true ONLY after Enter is actually written.
+      writes.length = 0;
+      const writeInDone: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { text: '自定义暗金龙焰', submit: true }, r => writeInDone.push(r))).toBe(true);
+      expect(writes).toEqual(['\x1b[200~自定义暗金龙焰\x1b[201~']);
+      await vi.advanceTimersByTimeAsync(120);
+      // Enter MUST NOT fire prematurely inside the 120ms paste-burst suppression window, and ok: true is still pending.
+      expect(writes).toEqual(['\x1b[200~自定义暗金龙焰\x1b[201~']);
+      expect(writeInDone).toEqual([]);
+      // Simulate PTY echoing the pasted text at t=120ms -> echo-quiet adds 150ms, past the 300ms floor -> fires by 320ms.
+      dataCb('自定义暗金龙焰');
+      await vi.advanceTimersByTimeAsync(220);
+      expect(writes).toEqual(['\x1b[200~自定义暗金龙焰\x1b[201~', '\r']);
+      expect(writeInDone).toEqual([{ ok: true }]);
+      expect(mgr.list().find(x => x.id === s.id)?.hasTerminalDraft).toBeUndefined();
+
+      // PermissionRequest arriving during the Write-in enterReady() settle wait aborts before Enter is ever written!
+      writes.length = 0;
+      const writeInAborted: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { text: '会被权限框打断的文本', submit: true }, r => writeInAborted.push(r))).toBe(true);
+      expect(writes).toEqual(['\x1b[200~会被权限框打断的文本\x1b[201~']);
+      await vi.advanceTimersByTimeAsync(100);
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'PermissionRequest', at: Date.now(), payload: {} });
+      await vi.advanceTimersByTimeAsync(400);
+      expect(writes).toEqual(['\x1b[200~会被权限框打断的文本\x1b[201~']);
+      expect(writeInAborted).toEqual([{ ok: false, reason: 'blocked' }]);
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'nq' } });
+
+      // Invalid keys or oversized batches are rejected cleanly with exact reasons.
+      const invalidResults: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { keys: ['bad-key' as never] }, r => invalidResults.push(r))).toBe(false);
+      expect(mgr.interactiveInput(s.id, { keys: Array(40).fill('down') }, r => invalidResults.push(r))).toBe(false);
+      expect(mgr.interactiveInput(s.id, { text: 'x'.repeat(32_001), submit: true }, r => invalidResults.push(r))).toBe(false);
+      expect(invalidResults).toEqual([
+        { ok: false, reason: 'invalid' },
+        { ok: false, reason: 'invalid' },
+        { ok: false, reason: 'too-large' },
+      ]);
+
+      // Split-chunk DECCKM (?1h) and mid-batch switch (?1h -> ?1l) encode each arrow step lazily right before write.
+      writes.length = 0;
+      const decckmDone: Array<{ ok: boolean; reason?: string }> = [];
+      dataCb('\x1b[?');
+      dataCb('1h');
+      expect(mgr.interactiveInput(s.id, { keys: ['down', 'down', 'enter'] }, r => decckmDone.push(r))).toBe(true);
+      expect(writes).toEqual(['\x1bOB']);
+      dataCb('\x1b[?1l');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(writes).toEqual(['\x1bOB', '\x1b[B', '\r']);
+      expect(decckmDone).toEqual([{ ok: true }]);
+
+      // Single-flight mutex: a concurrent interactiveInput while a batch is in flight is rejected as `busy` (never queued).
+      writes.length = 0;
+      const firstBatch: Array<{ ok: boolean; reason?: string }> = [];
+      const secondBatch: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { keys: ['down', 'enter'] }, r => firstBatch.push(r))).toBe(true);
+      expect(mgr.interactiveInput(s.id, { keys: ['down', 'enter'] }, r => secondBatch.push(r))).toBe(false);
+      expect(secondBatch).toEqual([{ ok: false, reason: 'busy' }]);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(writes).toEqual(['\x1b[B', '\r']);
+      expect(firstBatch).toEqual([{ ok: true }]);
+
+      // Mid-batch PermissionRequest aborts remaining steps immediately so Enter NEVER answers a newly opened permission dialog.
+      writes.length = 0;
+      const permAborted: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { keys: ['down', 'enter'] }, r => permAborted.push(r))).toBe(true);
+      expect(writes).toEqual(['\x1b[B']);
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'PermissionRequest', at: Date.now(), payload: {} });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(writes).toEqual(['\x1b[B']);
+      expect(permAborted).toEqual([{ ok: false, reason: 'blocked' }]);
+      // While permBlocked, new interactiveInput calls are rejected as `blocked`.
+      const blockedRes: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { keys: ['enter'] }, r => blockedRes.push(r))).toBe(false);
+      expect(blockedRes).toEqual([{ ok: false, reason: 'blocked' }]);
+
+      // Clear permBlocked via Stop -> ready, enqueue a normal message so enterTimer is active,
+      // and verify interactiveInput is rejected as `busy` without prematurely submitting or marking the message uncertain.
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'Stop', at: Date.now(), payload: {} });
+      await vi.advanceTimersByTimeAsync(6000);
+      writes.length = 0;
+      expect(mgr.enqueue(s.id, 'normal message', { immediate: true })).toBe(true);
+      await vi.advanceTimersByTimeAsync(260);
+      expect(writes).toEqual(['\x1b[200~normal message\x1b[201~']);
+      const busyDuringEnter: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { keys: ['enter'] }, r => busyDuringEnter.push(r))).toBe(false);
+      expect(busyDuringEnter).toEqual([{ ok: false, reason: 'busy' }]);
+      // Normal message's delayed Enter still completes cleanly!
+      await vi.advanceTimersByTimeAsync(400);
+      expect(writes).toEqual(['\x1b[200~normal message\x1b[201~', '\r']);
+      expect(mgr.getPendingInputs(s.id).some(p => p.state === 'uncertain')).toBe(false);
+
+      // Pending steps stop immediately and report `exited` if the PTY exits mid-sequence.
+      mgr.hook({ sessionId: s.id, agent: 'fake', event: 'UserPromptSubmit', at: Date.now(), payload: { session_id: 'nq' } });
+      writes.length = 0;
+      const exitAborted: Array<{ ok: boolean; reason?: string }> = [];
+      expect(mgr.interactiveInput(s.id, { keys: ['down', 'down', 'enter'] }, r => exitAborted.push(r))).toBe(true);
+      expect(writes).toEqual(['\x1b[B']);
+      exitCb({ exitCode: 0 });
+      await vi.advanceTimersByTimeAsync(200);
+      expect(writes).toEqual(['\x1b[B']);
+      expect(exitAborted).toEqual([{ ok: false, reason: 'exited' }]);
+    } finally {
+      await mgr.killAll();
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

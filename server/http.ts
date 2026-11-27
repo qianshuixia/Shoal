@@ -8,7 +8,7 @@ import { pipeline as pipelineAsync } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import type { WebSocket } from 'ws';
 import type {
-  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
+  AgentKind, ArchiveStoppedResult, Card, ClientMsg, CreateProjectBody, CreateTaskBody, DirListing, FeedbackBody, FeedbackResult, ForwardBody, ForwardResult, HookBody, InteractiveKey, PeerDelegateBody, PeerDelegationActionBody, PeerSendBody, PermissionMode, Project,
   GitInfo, QuotaInfo, RenameTaskBody, ResumeInterruptedResult, ResumeResult, ResumeTaskBody, ServerMsg, SessionContext, SessionInfo, Settings, Snapshot, SwitchAgentBody, SwitchResult, Task, TaskDelegation, TaskPhase,
 } from '../shared/protocol.ts';
 import { DEFAULT_DELEGATION_RULES, DELEGATION_RULES_MAX, canResume, composeSessionInstructions, feedbackPrompt, forwardText, isDeepAgent, isSystemPromptText, isValidAgyModel, rawPreviewOf } from '../shared/protocol.ts';
@@ -1950,6 +1950,30 @@ export function createApp(cfg: AppConfig) {
       try { m = JSON.parse(raw.toString()) as ClientMsg; } catch { return; }
       if (!m || typeof m !== 'object') return;
       if (m.t === 'in' && typeof m.id === 'string' && typeof m.d === 'string') sessions.input(m.id, m.d);
+      else if (m.t === 'interactive-input' && typeof m.id === 'string') {
+        const reqId = typeof m.reqId === 'string' ? m.reqId : undefined;
+        const reply = (result: { ok: boolean; reason?: 'busy' | 'blocked' | 'invalid' | 'exited' | 'too-large' | 'aborted' }) => {
+          if (ws.readyState === 1) {
+            ws.send(JSON.stringify({
+              t: 'interactive-input-result',
+              id: m.id,
+              ...(reqId ? { reqId } : {}),
+              ...result,
+            } satisfies ServerMsg));
+          }
+        };
+        if (m.keys !== undefined && (!Array.isArray(m.keys) || !m.keys.every((k): k is InteractiveKey => typeof k === 'string'))) {
+          reply({ ok: false, reason: 'invalid' });
+        } else if (m.text !== undefined && typeof m.text !== 'string') {
+          reply({ ok: false, reason: 'invalid' });
+        } else {
+          sessions.interactiveInput(
+            m.id,
+            { keys: m.keys, text: m.text, submit: m.submit === true },
+            reply,
+          );
+        }
+      }
       else if (m.t === 'clear-input' && typeof m.id === 'string' && typeof m.d === 'string') {
         const result = sessions.clearInput(m.id, m.d, m.draftSeq, true);
         ws.send(JSON.stringify({ t: 'draft-action-result', id: m.id, action: 'clear', ...result } satisfies ServerMsg));

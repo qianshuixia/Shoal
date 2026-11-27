@@ -6,8 +6,8 @@ import type {
   StreamBlock, StreamSubagent, StreamSubagentStatus, StreamSubagentStep, StreamTodoItem, StreamTodoStatus, StreamToolEntry, Task,
 } from '../shared/protocol.ts';
 import {
-  composeLiveTail, dedupeLiveAnswer, extractPtyLiveFromLines, extractPtyPromptDraft, extractPtyPromptState,
-  parsePtySubagentLine,
+  composeLiveTail, dedupeLiveAnswer, extractPtyInteractivePrompt, extractPtyLiveFromLines, extractPtyPromptDraft,
+  extractPtyPromptState, parsePtySubagentLine,
 } from '../shared/ptyLive.ts';
 import { FALLBACK_CARD_SKEW_MS, PENDING_TRANSCRIPT_ADVANCE_MS, PENDING_USER_CLOCK_SKEW_MS, feedbackMatchesUserText } from '../shared/textMatch.ts';
 import { resolveLiveTranscript, summarizeToolCall, unquoteArg } from './activity.ts';
@@ -17,7 +17,10 @@ import { cleanAgyUserInput } from './transcript.ts';
 import { readTranscriptRaw } from './stream/incrementalReader.ts';
 import type { TranscriptRead } from './stream/incrementalReader.ts';
 
-export { composeLiveTail, dedupeLiveAnswer, extractPtyLiveFromLines, extractPtyPromptDraft, extractPtyPromptState, parsePtySubagentLine };
+export {
+  composeLiveTail, dedupeLiveAnswer, extractPtyInteractivePrompt, extractPtyLiveFromLines, extractPtyPromptDraft,
+  extractPtyPromptState, parsePtySubagentLine,
+};
 
 type Obj = Record<string, unknown>;
 

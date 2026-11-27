@@ -1457,14 +1457,20 @@ export type ServerMsg =
   | { t: 'activity'; sessionId: string; activity: SessionActivity | null } // live white-box execution HUD update
   | { t: 'stream'; state: SessionStreamState } // dual-source rich streaming conversation view update
   | { t: 'draft-action-result'; id: string; action: 'clear' | 'send'; ok: boolean; reason?: 'stale' | 'blocked' | 'busy' | 'error'; draftSeq?: number }
+  | { t: 'interactive-input-result'; id: string; reqId?: string; ok: boolean; reason?: InteractiveInputReason }
   | { t: 'session'; session: SessionInfo }
   | { t: 'replay'; id: string; d: string } // buffered history, sent once per running session right after snapshot, or on 'want-replay'
   | { t: 'out'; id: string; d: string }
   | { t: 'pong'; ts: number; via: MobileRouteVia }
   | { t: 'revoked' };
 
+export type InteractiveKey = 'up' | 'down' | 'left' | 'right' | 'enter' | 'space' | 'esc' | 'ctrl+r' | 'tab' | 'shift+tab';
+export type InteractiveInputReason = 'busy' | 'blocked' | 'invalid' | 'exited' | 'too-large' | 'aborted';
+export const MAX_INTERACTIVE_TEXT = 32_000;
+
 export type ClientMsg =
   | { t: 'in'; id: string; d: string }
+  | { t: 'interactive-input'; id: string; reqId?: string; keys?: InteractiveKey[]; text?: string; submit?: boolean }
   | { t: 'clear-input'; id: string; d: string; draftSeq?: number }
   | { t: 'confirm-clear-input'; id: string; draftSeq?: number }
   | { t: 'send-draft'; id: string; draftSeq?: number }

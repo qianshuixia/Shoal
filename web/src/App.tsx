@@ -28,6 +28,7 @@ import { TaskSearch } from './TaskSearch.tsx';
 import type { DelegateView } from './DelegationHud.tsx';
 import type { StreamSendOpts } from './StreamView.tsx';
 import { emitDraftActionResult } from './stream/draftActions.ts';
+import { emitInteractiveInputResult } from './stream/interactiveActions.ts';
 import { sameDelegates } from './stream/delegates.ts';
 import { needsList, nestDelegated, reviewList, sortProjectTasks, taskActivityAt, taskBand } from './util.ts';
 
@@ -433,6 +434,9 @@ export function App() {
       case 'draft-action-result':
         // Not state: StreamView awaits the one reply it asked for via a module-level pub/sub.
         emitDraftActionResult(msg);
+        break;
+      case 'interactive-input-result':
+        emitInteractiveInputResult(msg);
         break;
       case 'replay':
         replay(msg.id, msg.d);

@@ -1,4 +1,4 @@
-import type { AgentKind, LiveStreamTail, SessionActivity, SessionInfo, StreamBlock, StreamSubagent } from './protocol.ts';
+import type { AgentKind, InteractiveKey, LiveStreamTail, SessionActivity, SessionInfo, StreamBlock, StreamSubagent } from './protocol.ts';
 
 export interface TermLineSample {
   startRow: number;
@@ -27,6 +27,40 @@ export interface PtyPromptDraft {
 export interface PtyPromptState {
   found: boolean;
   draft: PtyPromptDraft | null;
+}
+
+export interface PtyQuestionOption {
+  index: number;
+  number?: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  selected: boolean;
+  checked?: boolean;
+  isWriteIn?: boolean;
+  isSubmit?: boolean;
+  isBack?: boolean;
+}
+
+export interface PtyQuestionAction {
+  id: 'prev' | 'next' | 'confirm' | 'submit' | 'skip' | 'back' | 'cancel' | 'review';
+  label: string;
+  keyHint: string;
+  key: InteractiveKey;
+}
+
+export interface PtyInteractivePrompt {
+  mode: 'select' | 'multi' | 'write-in' | 'review';
+  progress?: { current: number; total: number };
+  title: string;
+  subtitle?: string;
+  options: PtyQuestionOption[];
+  selectedIndex: number;
+  writeInText?: string;
+  actions: PtyQuestionAction[];
+  rawHint: string;
+  rawLines: string[];
+  fingerprint: string;
 }
 
 export interface PtyLiveExtract {
@@ -234,6 +268,10 @@ export function extractPtyLiveFromLines(
   }
 
   const subPatch = subagents.length > 0 ? { subagents } : {};
+  // Never leak an active interactive question/choice TUI picker into live Markdown answer prose.
+  if (extractPtyInteractivePrompt(agent, lines, isAlternate)) {
+    return subPatch;
+  }
   const body = lines.slice(0, end);
   if (body.length === 0) {
     return {
@@ -583,6 +621,714 @@ export function extractPtyPromptDraft(
   isAlternate = false,
 ): PtyPromptDraft | null {
   return extractPtyPromptState(agent, lines, isAlternate).draft;
+}
+
+// ---- Live Interactive Question / Choice TUI Extractor ----
+// Extracts active interactive question/choice pickers (e.g. agy `ask_question`, Claude `AskUserQuestion`,
+// Codex `request_user_input`) directly from the browser's clean xterm.js viewport so Dialog mode renders a real
+// interactive card instead of leaking raw TUI menus into LiveTail Markdown.
+
+const CJK_CHAR_RE = /[\u3000-\u303f\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]/;
+const PANEL_FRAME_TOP_RE = /^\s*[╭┌][─━═]+[╮┐]\s*$/;
+const PANEL_FRAME_BOTTOM_RE = /^\s*[╰└][─━═]+[╯┘]\s*$/;
+const QUESTION_HEADER_RE = /^Question\s+(\d+)\s*\/\s*(\d+)\s*(?:[:：]\s*(.*))?$/i;
+const PICKER_CURSOR_RE = /^(\s*)([>❯›▸▶])(?:\s+(.*)|)$/;
+const NUMBERED_OPT_RE = /^(\d+)[.)]\s+(?:(?:\[([ xX✓✔])\]|([☐☑✓✔]))\s+)?(.+?)\s*$/;
+const CHECKBOX_OPT_RE = /^(?:\[([ xX✓✔])\]|([☐☑✓✔]))\s+(?:(\d+)[.)]\s+)?(.+?)\s*$/;
+const RECOMMENDED_PREFIX_RE = /^(?:\(Recommended\)|（推荐）|\[Recommended\])\s*/i;
+const RECOMMENDED_SUFFIX_RE = /\s*(?:\(Recommended\)|（推荐）|\[Recommended\])$/i;
+const WRITE_IN_LABEL_RE = /^(?:write-in\b|other\b|type\s+something\b|type\s+your\s+(?:own\s+)?answer\b|custom\s+answer\b|其他[（(]?自定义|自定义回答)/i;
+const STRUCTURAL_WRITE_IN_LABEL_RE = /^(?:write-in(?:\.{3}|…)?|type\s+your\s+(?:own\s+)?answer|custom\s+answer|自定义回答)\s*[:：]?$/i;
+const SUBMIT_LABEL_RE = /^(?:submit(?:\s+all|\s+answers)?|confirm\s*&?\s*submit|提交|全部提交)$/i;
+const BACK_LABEL_RE = /^(?:back|go\s+back|return|返回)$/i;
+const UNNUMBERED_ACTION_RE = /^(?:submit(?:\s+all|\s+answers)?|confirm(?:\s+all)?|back|go\s+back|cancel|edit|review|skip|yes\b.*|no\b.*)$/i;
+const CONTINUATION_BOUNDARY_ACTION_RE = /^(?:submit(?:\s+all|\s+answers)?|confirm(?:\s+all)?|back|go\s+back|cancel)$/i;
+const REVIEW_TITLE_RE = /^(?:(?:review(?:\s+(?:your\s+)?answers|\s*&\s*submit)?|summary)\b|核对|确认提交)/i;
+const TAB_BAR_RE = /^(?:←\s+)?(?:[☐☑✓✔□■]\s+\S+(?:\s{2,}[☐☑✓✔□■]\s+\S+)+)(?:\s+→)?$/;
+const WRITE_IN_INPUT_LINE_RE = /^(?:>\s*|›\s*|❯\s*|│\s*)(.*)$/;
+
+interface ParsedHintBar {
+  raw: string;
+  hasNavigate: boolean;
+  prevKey?: 'left' | 'shift+tab';
+  nextKey?: 'right' | 'tab';
+  hasToggle: boolean;
+  hasSelect: boolean;
+  hasConfirm: boolean;
+  hasSubmit: boolean;
+  hasSkip: boolean;
+  hasBack: boolean;
+  hasCancel: boolean;
+  hasReview: boolean;
+  hasTabNotes: boolean;
+  count: number;
+}
+
+function unboxPanelLine(raw: string): string {
+  const norm = raw.replace(/\u00a0/g, ' ');
+  return norm.replace(/^\s*[│┃║]\s?/, '').replace(/\s?[│┃║]\s*$/, '');
+}
+
+function joinWrappedLine(prev: string, next: string): string {
+  const a = prev.trimEnd();
+  const b = next.trimStart();
+  if (!a) return b;
+  if (!b) return a;
+  const lastCh = a[a.length - 1];
+  const firstCh = b[0];
+  if (CJK_CHAR_RE.test(lastCh) || CJK_CHAR_RE.test(firstCh)) return a + b;
+  return `${a} ${b}`;
+}
+
+const HINT_GLOBAL_CHROME_RE = /\b(?:auto\s*·\s*Gemini|Gemini\s+\d|context\s+left|for\s+shortcuts|Auto-accept|bypass\s+permissions)\b/i;
+
+function parseHintLineTokens(raw: string): ParsedHintBar | null {
+  const t = raw.replace(/\u00a0/g, ' ').trim();
+  if (!t || t.length > 260) return null;
+  if (HINT_GLOBAL_CHROME_RE.test(t)) return null;
+  // Strip leading/trailing bar separators produced when a narrow terminal hard-wraps a hint bar across lines.
+  const stripped = t.replace(/^[·•|│]+\s*/, '').replace(/\s*[·•|│]+$/, '').trim();
+  if (!stripped || /[.。!?;:]$/.test(stripped)) return null;
+
+  const segments = stripped.split(/\s*(?:[·•|│]|\s{2,})\s*/).map((s) => s.trim()).filter(Boolean);
+  if (segments.length === 0) return null;
+
+  let hasNavigate = false;
+  let prevKey: 'left' | 'shift+tab' | undefined;
+  let nextKey: 'right' | 'tab' | undefined;
+  let hasToggle = false;
+  let hasSelect = false;
+  let hasConfirm = false;
+  let hasSubmit = false;
+  let hasSkip = false;
+  let hasBack = false;
+  let hasCancel = false;
+  let hasReview = false;
+  let hasTabNotes = false;
+
+  // Every segment must be a compact anchored `<key> [to] <action>` hint token — never ordinary prose sentences.
+  for (const seg of segments) {
+    if (seg.length > 42) return null;
+    if (/^(?:(?:tab\/)?(?:↑\/↓|↓\/↑|j\/k|arrow\s*keys?)\s+(?:to\s+)?(?:navigate|move|select)|navigate\s+(?:↑\/↓|↓\/↑))$/i.test(seg)) {
+      hasNavigate = true;
+    } else if (/^(?:←\/→|left\/right)\s+(?:to\s+)?(?:prev(?:ious)?\/next|next\/prev|switch|navigate|move|change)$/i.test(seg)) {
+      prevKey = 'left';
+      nextKey = 'right';
+    } else if (/^(?:←|left)\s+(?:to\s+)?(?:prev(?:ious)?|back|switch)$/i.test(seg)) {
+      prevKey = 'left';
+    } else if (/^shift\+tab\s+(?:to\s+)?(?:prev(?:ious)?|back|switch)$/i.test(seg)) {
+      prevKey ??= 'shift+tab';
+    } else if (/^(?:→|right)\s+(?:to\s+)?(?:next|switch)$/i.test(seg)) {
+      nextKey = 'right';
+    } else if (/^tab\s+(?:to\s+)?(?:next|switch)$/i.test(seg)) {
+      nextKey ??= 'tab';
+    } else if (/^tab\s+(?:to\s+)?add\s+notes$/i.test(seg)) {
+      hasTabNotes = true;
+    } else if (/^space\s+(?:to\s+)?(?:toggle|select|check)$/i.test(seg)) {
+      hasToggle = true;
+    } else if (/^(?:space\/enter|enter\/space)\s+(?:to\s+)?(?:toggle|select)$/i.test(seg)) {
+      hasToggle = true;
+      hasSelect = true;
+    } else if (/^enter\s+(?:to\s+)?(?:select|choose)$/i.test(seg)) {
+      hasSelect = true;
+    } else if (/^enter\s+(?:to\s+)?(?:confirm|save|continue)$/i.test(seg)) {
+      hasConfirm = true;
+    } else if (/^enter\s+(?:to\s+)?submit(?:\s+(?:all|answer|answers))?$/i.test(seg)) {
+      hasSubmit = true;
+    } else if (/^esc\s+(?:to\s+)?skip$/i.test(seg)) {
+      hasSkip = true;
+    } else if (/^esc\s+(?:to\s+)?(?:back|go\s+back)$/i.test(seg)) {
+      hasBack = true;
+    } else if (/^esc\s+(?:to\s+)?(?:cancel|close|interrupt|dismiss|discard)$/i.test(seg)) {
+      hasCancel = true;
+    } else if (/^ctrl\+r\s+(?:to\s+)?review$/i.test(seg)) {
+      hasReview = true;
+    } else if (/^[0-9][-–][0-9]\s+(?:to\s+)?(?:quick\s+)?(?:select|choose)$/i.test(seg)) {
+      // Valid numeric quick-select shortcut segment.
+    } else {
+      return null;
+    }
+  }
+
+  const count = [
+    hasNavigate, !!prevKey, !!nextKey, hasToggle, hasSelect, hasConfirm, hasSubmit,
+    hasSkip, hasBack, hasCancel, hasReview, hasTabNotes,
+  ].filter(Boolean).length;
+  if (count === 0) return null;
+
+  return {
+    raw: t,
+    hasNavigate,
+    prevKey,
+    nextKey,
+    hasToggle,
+    hasSelect,
+    hasConfirm,
+    hasSubmit,
+    hasSkip,
+    hasBack,
+    hasCancel,
+    hasReview,
+    hasTabNotes,
+    count,
+  };
+}
+
+function mergeParsedHints(parts: ParsedHintBar[]): ParsedHintBar | null {
+  if (parts.length === 0) return null;
+  let hasNavigate = false;
+  let prevKey: 'left' | 'shift+tab' | undefined;
+  let nextKey: 'right' | 'tab' | undefined;
+  let hasToggle = false;
+  let hasSelect = false;
+  let hasConfirm = false;
+  let hasSubmit = false;
+  let hasSkip = false;
+  let hasBack = false;
+  let hasCancel = false;
+  let hasReview = false;
+  let hasTabNotes = false;
+
+  for (const p of parts) {
+    if (p.hasNavigate) hasNavigate = true;
+    if (p.prevKey === 'left' || (!prevKey && p.prevKey)) prevKey = p.prevKey;
+    if (p.nextKey === 'right' || (!nextKey && p.nextKey)) nextKey = p.nextKey;
+    if (p.hasToggle) hasToggle = true;
+    if (p.hasSelect) hasSelect = true;
+    if (p.hasConfirm) hasConfirm = true;
+    if (p.hasSubmit) hasSubmit = true;
+    if (p.hasSkip) hasSkip = true;
+    if (p.hasBack) hasBack = true;
+    if (p.hasCancel) hasCancel = true;
+    if (p.hasReview) hasReview = true;
+    if (p.hasTabNotes) hasTabNotes = true;
+  }
+
+  const count = [
+    hasNavigate, !!prevKey, !!nextKey, hasToggle, hasSelect, hasConfirm, hasSubmit,
+    hasSkip, hasBack, hasCancel, hasReview, hasTabNotes,
+  ].filter(Boolean).length;
+  if (count < 2) return null;
+  const hasActionVerb = hasNavigate || hasToggle || hasSelect || hasConfirm || hasSubmit || hasReview || hasSkip || hasBack || hasTabNotes;
+  if (!hasActionVerb) return null;
+
+  return {
+    raw: parts.map((p) => p.raw).join(' '),
+    hasNavigate,
+    prevKey,
+    nextKey,
+    hasToggle,
+    hasSelect,
+    hasConfirm,
+    hasSubmit,
+    hasSkip,
+    hasBack,
+    hasCancel,
+    hasReview,
+    hasTabNotes,
+    count,
+  };
+}
+
+function matchHintWindow(texts: string[]): ParsedHintBar | null {
+  // 1. Whole window joined with spaces (handles tokens broken across any line boundary in 1–3 wrapped rows).
+  const whole = parseHintLineTokens(texts.join(' '));
+  if (whole) {
+    const merged = mergeParsedHints([whole]);
+    if (merged) return merged;
+  }
+  // 2. Each row independently valid, merged together (handles multi-line wrapping without inter-line separators).
+  const directParts: ParsedHintBar[] = [];
+  for (const t of texts) {
+    const p = parseHintLineTokens(t);
+    if (!p) {
+      directParts.length = 0;
+      break;
+    }
+    directParts.push(p);
+  }
+  if (directParts.length === texts.length) {
+    const merged = mergeParsedHints(directParts);
+    if (merged) return merged;
+  }
+  // 3. Three-row window where one adjacent pair broke mid-token while the remaining row is complete.
+  if (texts.length === 3) {
+    const ab = parseHintLineTokens(`${texts[0]} ${texts[1]}`);
+    const c = parseHintLineTokens(texts[2]);
+    if (ab && c) {
+      const merged = mergeParsedHints([ab, c]);
+      if (merged) return merged;
+    }
+    const a = parseHintLineTokens(texts[0]);
+    const bc = parseHintLineTokens(`${texts[1]} ${texts[2]}`);
+    if (a && bc) {
+      const merged = mergeParsedHints([a, bc]);
+      if (merged) return merged;
+    }
+  }
+  return null;
+}
+
+function cleanRecommended(raw: string): { label: string; recommended: boolean } {
+  let label = raw.trim();
+  let recommended = false;
+  if (RECOMMENDED_PREFIX_RE.test(label)) {
+    recommended = true;
+    const stripped = label.replace(RECOMMENDED_PREFIX_RE, '').trim();
+    if (stripped) label = stripped;
+  } else if (RECOMMENDED_SUFFIX_RE.test(label)) {
+    recommended = true;
+    const stripped = label.replace(RECOMMENDED_SUFFIX_RE, '').trim();
+    if (stripped) label = stripped;
+  }
+  return { label, recommended };
+}
+
+function parseOptionStart(raw: string): {
+  cursor: boolean;
+  number?: string;
+  checked?: boolean;
+  label: string;
+  numbered: boolean;
+} | null {
+  const unboxed = unboxPanelLine(raw);
+  if (!unboxed.trim()) return null;
+  const cm = PICKER_CURSOR_RE.exec(unboxed);
+  const cursor = !!cm;
+  const body = (cm ? (cm[3] ?? '') : unboxed.trimStart()).trim();
+  if (!body) return null;
+
+  const nm = NUMBERED_OPT_RE.exec(body);
+  if (nm) {
+    const boxMark = nm[2] ?? nm[3];
+    const checked = boxMark !== undefined ? boxMark !== ' ' && boxMark !== '☐' : undefined;
+    return { cursor, number: nm[1], checked, label: nm[4].trim(), numbered: true };
+  }
+  const cbm = CHECKBOX_OPT_RE.exec(body);
+  if (cbm) {
+    const boxMark = cbm[1] ?? cbm[2];
+    const checked = boxMark !== ' ' && boxMark !== '☐';
+    return { cursor, number: cbm[3], checked, label: cbm[4].trim(), numbered: !!cbm[3] };
+  }
+  return null;
+}
+
+function buildQuestionActions(
+  hint: ParsedHintBar | null,
+  mode: PtyInteractivePrompt['mode'],
+  hasGlobalCancel: boolean,
+): PtyQuestionAction[] {
+  const actions: PtyQuestionAction[] = [];
+  if (hint?.prevKey) {
+    actions.push({
+      id: 'prev',
+      label: '上一题',
+      keyHint: hint.prevKey === 'shift+tab' ? 'Shift+Tab' : '←',
+      key: hint.prevKey,
+    });
+  }
+  if (hint?.nextKey) {
+    actions.push({
+      id: 'next',
+      label: '下一题',
+      keyHint: hint.nextKey === 'tab' ? 'Tab' : '→',
+      key: hint.nextKey,
+    });
+  }
+  if (mode === 'multi') {
+    actions.push({ id: 'confirm', label: '确认本题', keyHint: 'Enter', key: 'enter' });
+  } else if (mode === 'review' && (hint?.hasSubmit || hint?.hasConfirm)) {
+    actions.push({ id: 'submit', label: '提交全部', keyHint: 'Enter', key: 'enter' });
+  }
+  if (hint?.hasReview) actions.push({ id: 'review', label: '核对提交', keyHint: 'Ctrl+R', key: 'ctrl+r' });
+  if (hint?.hasSkip) {
+    actions.push({ id: 'skip', label: '跳过', keyHint: 'Esc', key: 'esc' });
+  } else if (hint?.hasBack) {
+    actions.push({ id: 'back', label: '返回', keyHint: 'Esc', key: 'esc' });
+  } else if (hint?.hasCancel || hasGlobalCancel) {
+    actions.push({ id: 'cancel', label: '取消', keyHint: 'Esc', key: 'esc' });
+  }
+  return actions;
+}
+
+// Extracts an active interactive question/choice TUI picker from the browser's live xterm.js viewport.
+// Returns `null` when the terminal is in alternate screen, sits at a normal CLI prompt, or shows ordinary output.
+export function extractPtyInteractivePrompt(
+  agent: AgentKind,
+  lines: TermLineSample[],
+  isAlternate = false,
+): PtyInteractivePrompt | null {
+  if (isAlternate || lines.length === 0) return null;
+
+  // 1. Strip bottom global chrome (blank rows, status/model footers, subagent bars, closing frame/rules)
+  //    while preserving any single-line or narrow-wrapped interactive navigation hint bar.
+  let end = lines.length;
+  let scanned = 0;
+  let hint: ParsedHintBar | null = null;
+  const hintRowIndices: number[] = [];
+  let hasGlobalCancel = false;
+
+  while (end > 0 && scanned < 10) {
+    const raw = lines[end - 1].text;
+    const unboxed = unboxPanelLine(raw);
+    const t = unboxed.trim();
+    scanned++;
+    if (!t) {
+      end--;
+      continue;
+    }
+    if (parsePtySubagentLine(t)) {
+      end--;
+      continue;
+    }
+    // Try matching the longest valid contiguous shortcut hint window (3 -> 2 -> 1 rows) so narrow-screen
+    // 2–3 line wrapped hint bars are consumed completely without leaving line 1 inside `slice`.
+    let matchedWindow: { parsed: ParsedHintBar; rows: number[] } | null = null;
+    for (let k = Math.min(3, end); k >= 1; k--) {
+      const rows: number[] = [];
+      const texts: string[] = [];
+      let contiguous = true;
+      for (let r = end - k; r < end; r++) {
+        const rt = unboxPanelLine(lines[r].text).trim();
+        if (!rt) {
+          contiguous = false;
+          break;
+        }
+        rows.push(r);
+        texts.push(rt);
+      }
+      if (!contiguous) continue;
+      const parsed = matchHintWindow(texts);
+      if (parsed) {
+        matchedWindow = { parsed, rows };
+        break;
+      }
+    }
+    if (matchedWindow) {
+      hint = matchedWindow.parsed;
+      hintRowIndices.push(...matchedWindow.rows);
+      end = matchedWindow.rows[0];
+      break;
+    }
+    if (RULE_RE.test(t) || PANEL_FRAME_BOTTOM_RE.test(raw)) {
+      end--;
+      continue;
+    }
+    if (FOOTER_NOISE_RE.test(t) || TIP_LINE_RE.test(t) || AGY_PROMO_RE.test(t) || PROMPT_FOOTER_EXTRA_RE.test(t)) {
+      if (/\besc to cancel\b/i.test(t)) hasGlobalCancel = true;
+      end--;
+      continue;
+    }
+    break;
+  }
+
+  // A live interactive shortcut hint bar is mandatory: ordinary Markdown replies (e.g. `Question 1/2:` +
+  // blockquote `> 1. JSON` + `  2. YAML`) must NEVER be swallowed as an interactive picker.
+  if (end <= 0 || !hint) return null;
+
+  // 2. Locate the top boundary of the interactive panel (bounded by horizontal rule, box top, or CLI output anchor).
+  const minStart = Math.max(0, end - 36);
+  let start = minStart;
+  for (let i = end - 1; i >= minStart; i--) {
+    const raw = lines[i].text;
+    const unboxed = unboxPanelLine(raw);
+    const t = unboxed.trim();
+    if (!t) continue;
+    if (RULE_RE.test(t) || EMBEDDED_RULE_RE.test(t) || PANEL_FRAME_TOP_RE.test(raw)) {
+      start = i + 1;
+      break;
+    }
+    if (AGY_MARKER_RE.test(t) || AGY_STATS_RE.test(t) || AGY_BANNER_RE.test(t) || OUTPUT_STOP_RE.test(t)) {
+      start = i + 1;
+      break;
+    }
+    if (QUESTION_HEADER_RE.test(t)) {
+      start = i;
+      // Preserve a Claude-style multi-question tab header immediately above the Question line when present.
+      if (i > minStart && TAB_BAR_RE.test(unboxPanelLine(lines[i - 1].text).trim())) {
+        start = i - 1;
+      }
+      break;
+    }
+  }
+
+  const slice = lines.slice(start, end);
+  while (slice.length > 0 && !unboxPanelLine(slice[0].text).trim()) slice.shift();
+  while (slice.length > 0 && !unboxPanelLine(slice[slice.length - 1].text).trim()) slice.pop();
+  if (slice.length === 0) return null;
+
+  // 3. Scan for numbered / checkbox option groups; prefer the bottom-most group that holds the TUI selection cursor
+  //    so numbered summary lines in a Review screen (`1. Q1: ...`) never shadow `> Submit All` / `Back` below.
+  interface RawOpt {
+    rowIdx: number;
+    cursor: boolean;
+    number?: string;
+    checked?: boolean;
+    label: string;
+    description?: string;
+    numbered: boolean;
+  }
+
+  let rawOpts: RawOpt[] = [];
+  let firstOptIdx = -1;
+  let lastOptEndIdx = -1;
+
+  const isWriteInHint = !!hint && !hint.hasNavigate && (hint.hasSubmit || hint.hasConfirm) && (hint.hasBack || hint.hasCancel);
+
+  let curOpts: RawOpt[] = [];
+  let curFirst = -1;
+  let curLast = -1;
+  const commitGroup = () => {
+    if (curOpts.length > 0 && curOpts.some((o) => o.cursor)) {
+      rawOpts = curOpts;
+      firstOptIdx = curFirst;
+      lastOptEndIdx = curLast;
+    }
+    curOpts = [];
+    curFirst = -1;
+    curLast = -1;
+  };
+
+  for (let i = 0; i < slice.length; i++) {
+    const sample = slice[i];
+    const unboxed = unboxPanelLine(sample.text);
+    const t = unboxed.trim();
+    if (!t) {
+      commitGroup();
+      continue;
+    }
+    const parsed = parseOptionStart(sample.text);
+    if (parsed) {
+      if (parsed.numbered) {
+        const expected = curOpts.length === 0 ? 1 : Number(curOpts[curOpts.length - 1].number) + 1;
+        const got = Number(parsed.number);
+        if (got !== expected) {
+          commitGroup();
+          if (got !== 1) continue;
+        }
+      }
+      if (curFirst < 0) curFirst = i;
+      curOpts.push({ rowIdx: i, ...parsed });
+      curLast = i;
+      continue;
+    }
+    if (curOpts.length > 0) {
+      const prev = curOpts[curOpts.length - 1];
+      const isCursorOrPrompt = PICKER_CURSOR_RE.test(unboxed);
+      const prevCleanLabel = cleanRecommended(prev.label).label;
+      const prevIsWriteIn = WRITE_IN_LABEL_RE.test(prevCleanLabel);
+      const isIndented = /^\s+/.test(unboxed);
+      const isBoundaryLine =
+        isCursorOrPrompt ||
+        (isWriteInHint && prevIsWriteIn) ||
+        (!isIndented &&
+          (prevIsWriteIn ||
+            CONTINUATION_BOUNDARY_ACTION_RE.test(t) ||
+            TAB_BAR_RE.test(t) ||
+            QUESTION_HEADER_RE.test(t) ||
+            REVIEW_TITLE_RE.test(t) ||
+            STRUCTURAL_WRITE_IN_LABEL_RE.test(t) ||
+            WRITE_IN_INPUT_LINE_RE.test(t)));
+      if (isBoundaryLine) {
+        commitGroup();
+        continue;
+      }
+      if (sample.muted && (/^\s{2,}/.test(unboxed) || prev.description !== undefined)) {
+        prev.description = prev.description ? joinWrappedLine(prev.description, t) : t;
+      } else {
+        // Accept both indented and narrow-screen hard-wrapped unindented continuations inside a hint-verified panel.
+        prev.label = joinWrappedLine(prev.label, t);
+      }
+      curLast = i;
+    }
+  }
+  commitGroup();
+
+  // Fallback for unnumbered cursor action rows (e.g. Review screen: `> Submit All` / `  Back`) when a hint bar is present.
+  if (rawOpts.length === 0 && hint) {
+    let cursorRow = -1;
+    for (let i = slice.length - 1; i >= 0; i--) {
+      const unboxed = unboxPanelLine(slice[i].text);
+      const cm = PICKER_CURSOR_RE.exec(unboxed);
+      if (cm && UNNUMBERED_ACTION_RE.test((cm[3] ?? '').trim())) {
+        cursorRow = i;
+        break;
+      }
+    }
+    if (cursorRow >= 0) {
+      let blockStart = cursorRow;
+      while (blockStart > 0) {
+        const u = unboxPanelLine(slice[blockStart - 1].text).trim();
+        if (!u || !UNNUMBERED_ACTION_RE.test(u.replace(/^[>❯›▸▶]\s+/, ''))) break;
+        blockStart--;
+      }
+      let blockEnd = cursorRow;
+      while (blockEnd + 1 < slice.length) {
+        const u = unboxPanelLine(slice[blockEnd + 1].text).trim();
+        if (!u || !UNNUMBERED_ACTION_RE.test(u.replace(/^[>❯›▸▶]\s+/, ''))) break;
+        blockEnd++;
+      }
+      if (blockEnd >= blockStart) {
+        firstOptIdx = blockStart;
+        lastOptEndIdx = blockEnd;
+        for (let i = blockStart; i <= blockEnd; i++) {
+          const u = unboxPanelLine(slice[i].text);
+          const cm = PICKER_CURSOR_RE.exec(u);
+          rawOpts.push({
+            rowIdx: i,
+            cursor: !!cm,
+            label: (cm ? (cm[3] ?? '') : u).trim(),
+            numbered: false,
+          });
+        }
+      }
+    }
+  }
+
+  // 4. Parse header lines above the options (or the entire panel when in write-in / review mode without options).
+  const headerSlice = firstOptIdx >= 0 ? slice.slice(0, firstOptIdx) : slice;
+  const trailingSlice = lastOptEndIdx >= 0 && lastOptEndIdx + 1 < slice.length ? slice.slice(lastOptEndIdx + 1) : [];
+
+  let progress: { current: number; total: number } | undefined;
+  const titleLines: string[] = [];
+  const subtitleLines: string[] = [];
+  let inTitle = false;
+
+  for (const sample of headerSlice) {
+    const t = unboxPanelLine(sample.text).trim();
+    if (!t) {
+      if (titleLines.length > 0) inTitle = false;
+      continue;
+    }
+    if (TAB_BAR_RE.test(t)) {
+      subtitleLines.push(t);
+      continue;
+    }
+    const qm = QUESTION_HEADER_RE.exec(t);
+    if (qm) {
+      progress = { current: Number(qm[1]), total: Number(qm[2]) };
+      const rest = (qm[3] ?? '').trim();
+      if (rest) titleLines.push(rest);
+      inTitle = true;
+      continue;
+    }
+    if (titleLines.length === 0) {
+      titleLines.push(t);
+      inTitle = true;
+    } else if (inTitle && !REVIEW_TITLE_RE.test(titleLines[0])) {
+      titleLines[titleLines.length - 1] = joinWrappedLine(titleLines[titleLines.length - 1], t);
+    } else {
+      subtitleLines.push(t);
+    }
+  }
+
+  const options: PtyQuestionOption[] = rawOpts.map((opt, index) => {
+    const { label, recommended } = cleanRecommended(opt.label);
+    return {
+      index,
+      ...(opt.number ? { number: opt.number } : {}),
+      label,
+      ...(opt.description ? { description: opt.description } : {}),
+      ...(recommended ? { recommended: true } : {}),
+      selected: opt.cursor,
+      ...(opt.checked !== undefined ? { checked: opt.checked } : {}),
+      ...(WRITE_IN_LABEL_RE.test(label) ? { isWriteIn: true } : {}),
+      ...(SUBMIT_LABEL_RE.test(label) ? { isSubmit: true } : {}),
+      ...(BACK_LABEL_RE.test(label) ? { isBack: true } : {}),
+    };
+  });
+
+  const selectedIndex = options.findIndex((o) => o.selected);
+  const title = titleLines.join('\n').trim();
+  const trailingText = trailingSlice.map((l) => unboxPanelLine(l.text).trim()).filter(Boolean);
+
+  // 5. Classify mode with strict anti-false-positive guards.
+  let mode: PtyInteractivePrompt['mode'] | null = null;
+  let writeInText: string | undefined;
+
+  const selectedIsWriteIn = selectedIndex >= 0 && options[selectedIndex]?.isWriteIn === true;
+  const hasTrailingInput = trailingText.some((t) => WRITE_IN_LABEL_RE.test(t) || WRITE_IN_INPUT_LINE_RE.test(t));
+  const hasSubtitleInput = subtitleLines.some((t) => WRITE_IN_INPUT_LINE_RE.test(t));
+  // Match ONLY standalone structural prompt headers, never arbitrary substrings inside a user's Review summary answers.
+  const hasStructuralWriteInHeader =
+    STRUCTURAL_WRITE_IN_LABEL_RE.test(title) ||
+    subtitleLines.some((t) => STRUCTURAL_WRITE_IN_LABEL_RE.test(t));
+  const isReviewScreen =
+    !selectedIsWriteIn &&
+    !hasTrailingInput &&
+    (options.some((o) => o.isSubmit) ||
+      (REVIEW_TITLE_RE.test(title) && (options.length > 0 || hint.hasSubmit || hint.hasConfirm)) ||
+      (!progress && !hasSubtitleInput && !hasStructuralWriteInHeader && hint.hasSubmit && !hint.hasNavigate && options.length === 0 && (subtitleLines.length > 0 || title.length > 0)));
+
+  if (isReviewScreen) {
+    mode = 'review';
+  } else if (
+    isWriteInHint &&
+    (selectedIsWriteIn || hasTrailingInput || hasSubtitleInput || hasStructuralWriteInHeader || (options.length === 0 && !!progress))
+  ) {
+    mode = 'write-in';
+    const inputCandidates = trailingText.length > 0 ? trailingText : subtitleLines;
+    for (let i = inputCandidates.length - 1; i >= 0; i--) {
+      const m = WRITE_IN_INPUT_LINE_RE.exec(inputCandidates[i]);
+      if (m) {
+        writeInText = m[1].trim();
+        if (inputCandidates === subtitleLines) subtitleLines.splice(i, 1);
+        break;
+      }
+    }
+    // Drop a lone `Write-in:` label from subtitle when the card itself already shows the Write-in header.
+    for (let i = subtitleLines.length - 1; i >= 0; i--) {
+      if (/^write-in\s*[:：]?$/i.test(subtitleLines[i])) subtitleLines.splice(i, 1);
+    }
+  } else if (options.length >= 2 && selectedIndex >= 0) {
+    const hasCheckbox = options.some((o) => o.checked !== undefined);
+    mode = hasCheckbox || hint.hasToggle ? 'multi' : 'select';
+  }
+
+  if (!mode) return null;
+
+  // In Review mode with no explicit title, keep a clean heading and move lines into subtitle.
+  let finalTitle = title;
+  const finalSubLines = [...subtitleLines];
+  if (mode === 'review' && !finalTitle) {
+    finalTitle = '核对并提交回答';
+  } else if (mode === 'write-in' && !finalTitle) {
+    finalTitle = '输入自定义回答';
+  }
+  if (mode === 'review' && trailingText.length > 0) {
+    finalSubLines.push(...trailingText);
+  }
+  const subtitle = finalSubLines.length > 0 ? finalSubLines.join('\n') : undefined;
+  const actions = buildQuestionActions(hint, mode, hasGlobalCancel);
+  const rawLines = [
+    ...slice.map((l) => l.text.trimEnd()),
+    ...hintRowIndices.map((idx) => lines[idx].text.trimEnd()),
+  ];
+  const fingerprint = JSON.stringify([
+    mode,
+    progress?.current ?? 0,
+    progress?.total ?? 0,
+    finalTitle,
+    subtitle ?? '',
+    selectedIndex,
+    options.map((o) => [o.number ?? '', o.label, o.checked ?? null, o.selected]),
+    writeInText ?? '',
+    hint?.raw ?? '',
+  ]);
+
+  return {
+    mode,
+    ...(progress ? { progress } : {}),
+    title: finalTitle || '请选择',
+    ...(subtitle ? { subtitle } : {}),
+    options,
+    selectedIndex,
+    ...(writeInText !== undefined ? { writeInText } : {}),
+    actions,
+    rawHint: hint?.raw ?? '',
+    rawLines,
+    fingerprint,
+  };
 }
 
 // Removes live PTY answer text (whole or leading lines) once the authoritative transcript has already committed
