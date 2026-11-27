@@ -73,6 +73,28 @@ export const BUILTIN_CLI_CATALOG: readonly BuiltinCliSpec[] = [
     capabilities: DEEP_CAPS,
   },
   {
+    id: 'pi',
+    label: 'Pi Agent',
+    tier: 'deep',
+    commands: ['pi', 'pi-agent'],
+    fullAccessArgs: [],
+    normalArgs: [],
+    promptArg: 'positional',
+    fullAccessNote: '正常模式在 Pi 终端确认修改文件和运行命令，沿用 Pi 自己的操作系统权限',
+    capabilities: ['原生终端交互', '状态感知', '待验收卡片', '原生对话续接', 'Token 统计', '跨 CLI 委派'],
+    limitations: '需 Pi 1.6 或更新版本。用量来自 Pi 会话记录，订阅剩余额度由模型供应商提供。',
+    extraWinPaths: (_env, home) => [
+      path.win32.join(home, '.bun', 'bin', 'pi.exe'),
+      path.win32.join(home, '.pi', 'bin', 'pi.exe'),
+    ],
+    extraPosixPaths: (home) => [
+      path.posix.join(home, '.bun', 'bin', 'pi'),
+      path.posix.join(home, '.pi', 'bin', 'pi'),
+      path.posix.join(home, '.volta', 'bin', 'pi'),
+      path.posix.join(home, '.local', 'share', 'pnpm', 'pi'),
+    ],
+  },
+  {
     id: 'gemini',
     label: 'Gemini CLI',
     tier: 'generic',
@@ -1296,16 +1318,20 @@ export function buildCliTools(settings: Settings, c: CliEnv = {}): CliToolInfo[]
   for (const spec of BUILTIN_CLI_CATALOG) {
     const resolved = cachedBuiltinPath(spec, c);
     const installed = Boolean(resolved);
+    const version = resolved ? (versionCache.get(`${spec.id}:${resolved}`) ?? null) : null;
+    const isBatch = isCmdBatchPath(resolved, platform);
     let usable = installed;
     let unusableReason: string | undefined;
     if (spec.id === 'agy' && installed && !agyUsable()) {
       usable = false;
       unusableReason = '工作台路径包含空格，Antigravity hooks 无法启用';
     }
+    if (spec.id === 'pi' && (isBatch || (version && /^(?:0\.|1\.[0-5]\.)/.test(version)))) {
+      usable = false;
+      unusableReason = isBatch ? 'Pi 请使用标准 npm 安装或原生可执行文件' : 'Pi 深度适配需要 Pi 1.6 或更新版本';
+    }
     const enabled = effectiveToolEnabled({ id: spec.id, tier: spec.tier, source: 'builtin', usable }, prefs);
     const permissionMode = effectivePermissionMode(spec.id, prefs);
-    const version = resolved ? (versionCache.get(`${spec.id}:${resolved}`) ?? null) : null;
-    const isBatch = isCmdBatchPath(resolved, platform);
     tools.push({
       id: spec.id,
       label: spec.label,

@@ -21,7 +21,6 @@ export const MAX_DELEGATION_HOPS = 12;
 export { MAX_DELEGATION_ROUNDS }; // defined in shared/protocol.ts so the relayed next steps can tell the last round
 export const MAX_OPEN_DELEGATIONS = 6;
 const MAX_PEER_FILE_BYTES = 512 * 1024;
-const VALID_AGENTS = new Set<AgentKind>(['claude', 'codex', 'agy', 'fake']);
 
 export class CollabError extends Error {
   status: number;
@@ -494,7 +493,7 @@ export function createCollabManager(deps: CollabDeps) {
     }
 
     const lower = q.toLowerCase();
-    const isAgentName = VALID_AGENTS.has(lower as AgentKind);
+    const isAgentName = isDeepAgent(lower);
 
     if (createIfAgent && isAgentName) {
       return { kind: 'spawn', agent: lower as AgentKind };
@@ -727,7 +726,7 @@ export function createCollabManager(deps: CollabDeps) {
     if (agent && !isDeepAgent(agent) && deps.availableAgents().includes(agent)) {
       throw new CollabError(400, `「${agent}」目前为通用终端模式，暂不支持跨 CLI 自动委派与结果回传（仅深度适配 CLI 支持）`);
     }
-    if (!VALID_AGENTS.has(agent) || !delegatable.includes(agent)) {
+    if (!isDeepAgent(agent) || !delegatable.includes(agent)) {
       throw new CollabError(400, `智能体不可用：${String(body.agent)}（可用：${delegatable.join(' / ') || '无'}）`);
     }
     const hop = checkDelegationHop(callerSessionId);

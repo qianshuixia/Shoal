@@ -799,3 +799,30 @@ describe('HTTP integration: CLI scan, toggle, permission mode & parent-to-child 
     }
   }, 20_000);
 });
+
+describe('Pi Agent built-in deep discovery', () => {
+  it('auto-discovers pi or pi-agent alias and extra install paths as deep tier', () => {
+    const home = makeTmpDir();
+    const aliasDir = path.join(home, 'alias-bin');
+    fs.mkdirSync(aliasDir, { recursive: true });
+    const aliasExe = path.join(aliasDir, 'pi-agent.exe');
+    fs.writeFileSync(aliasExe, 'MZ');
+
+    const byAlias = buildCliTools(DEFAULT_SETTINGS, { platform: 'win32', env: { PATH: aliasDir }, home }).find((t) => t.id === 'pi')!;
+    expect(byAlias.tier).toBe('deep');
+    expect(byAlias.installed).toBe(true);
+    expect(byAlias.usable).toBe(true);
+    expect(byAlias.enabled).toBe(true);
+    expect(byAlias.path).toBe(aliasExe);
+
+    const bunDir = path.join(home, '.bun', 'bin');
+    fs.mkdirSync(bunDir, { recursive: true });
+    const bunExe = path.join(bunDir, 'pi.exe');
+    fs.writeFileSync(bunExe, 'MZ');
+
+    const byExtra = buildCliTools(DEFAULT_SETTINGS, { platform: 'win32', env: { PATH: '' }, home }).find((t) => t.id === 'pi')!;
+    expect(byExtra.installed).toBe(true);
+    expect(byExtra.usable).toBe(true);
+    expect(byExtra.path).toBe(bunExe);
+  });
+});

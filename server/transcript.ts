@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import type { AgentKind } from '../shared/protocol.ts';
+import { piConversation } from './piTranscript.ts';
 
 export interface Turn { role: 'user' | 'assistant' | 'tool'; text: string }
 
@@ -15,13 +16,13 @@ const isObj = (v: unknown): v is Obj => !!v && typeof v === 'object' && !Array.i
 const str = (v: unknown) => (typeof v === 'string' ? v : '');
 
 // Conversation turns of a CLI's own transcript file; [] when it cannot be read. Never throws.
-export function readTranscript(agent: AgentKind, file: string): Turn[] {
+export function readTranscript(agent: AgentKind, file: string, leaf?: string | null): Turn[] {
   try {
     const fd = fs.openSync(file, 'r');
     let raw: string;
     try {
       const size = fs.fstatSync(fd).size;
-      if (size <= FULL_READ) {
+      if (size <= FULL_READ || agent === 'pi') {
         const buf = Buffer.alloc(size);
         fs.readSync(fd, buf, 0, size, 0);
         raw = buf.toString('utf8');
@@ -38,7 +39,7 @@ export function readTranscript(agent: AgentKind, file: string): Turn[] {
     } finally {
       fs.closeSync(fd);
     }
-    return parseTranscript(agent, raw);
+    return parseTranscript(agent, raw, leaf);
   } catch (e) {
     console.warn(`[transcript] 读取失败：${(e as Error).message}`);
     return [];
@@ -113,7 +114,12 @@ function fakeTurns(v: Obj, out: Turn[]) {
   if ((v.role === 'user' || v.role === 'assistant') && str(v.text)) out.push({ role: v.role, text: str(v.text) });
 }
 
-export function parseTranscript(agent: AgentKind, raw: string): Turn[] {
+export function parseTranscript(agent: AgentKind, raw: string, leaf?: string | null): Turn[] {
+  if (agent === 'pi') {
+    const turns: Turn[] = [];
+    for (const message of piConversation(raw, leaf)) claudeTurns(message, turns);
+    return turns;
+  }
   const each = agent === 'claude' ? claudeTurns : agent === 'codex' ? codexTurns : agent === 'agy' ? agyTurns : agent === 'fake' ? fakeTurns : null;
   if (!each) return [];
   const out: Turn[] = [];

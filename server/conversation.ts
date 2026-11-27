@@ -76,7 +76,7 @@ export function buildTaskConversation(opts: {
     .sort((a, b) => a.createdAt - b.createdAt);
 
   const tp = resolveTranscriptPath(session);
-  const turns = tp ? readTranscript(session?.agent ?? task.agent, tp) : [];
+  const turns = tp ? readTranscript(session?.agent ?? task.agent, tp, session?.transcriptLeafId) : [];
   const items: ConversationItem[] = [];
 
   if (turns.length > 0) {

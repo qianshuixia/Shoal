@@ -215,6 +215,16 @@ describe('parseStatusLineContext', () => {
 describe('createQuotaStore', () => {
   const win = (p: number) => [{ label: '5h', usedPercent: p, resetsAt: 1793447357000, windowMinutes: 300 }];
 
+  it('timestamps a fresh provider result with the same windows and keeps it after a failed refresh', () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-quota-')), 'quota.json');
+    const store = createQuotaStore(file);
+    const meta = { plan: 'OpenCode Go', source: 'provider' } as const;
+    store.set('pi', win(100), 100, meta);
+    expect(store.set('pi', win(100), 200, meta)).toEqual({ windows: win(100), at: 200, ...meta });
+    expect(store.set('pi', [], 300, meta)).toBeNull();
+    expect(createQuotaStore(file).all().pi?.at).toBe(200);
+  });
+
   it('reports a change once, ignores identical windows and empty input, and reloads from disk', () => {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wb-quota-')), 'quota.json');
     const store = createQuotaStore(file);

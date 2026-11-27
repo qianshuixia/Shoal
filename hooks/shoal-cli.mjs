@@ -12,7 +12,7 @@ const USAGE = [
   '  shoal ask  <target> [-m "短说明"] [--file <path>] [--stdin] [--new]',
   '',
   '委派（把一件事派给另一个 CLI 的新任务，每轮结果自动送回当前会话）：',
-  '  shoal delegate <claude|codex|agy> [--review|--plan] [--title "标题"] [-m "一行说明"] [--file <path>] [--stdin]',
+  '  shoal delegate <agent> [--review|--plan] [--title "标题"] [-m "一行说明"] [--file <path>] [--stdin]',
   '      --review 派只读评审者（回 PASS/FAIL）；--plan 派只读方案顾问（独立出一份方案）；都不加是执行者',
   '  shoal status [--json]                      查看已委派的任务和状态',
   '  shoal rework <句柄|#序号|标题片段> [-m "意见"] [--file <path>] [--stdin]   打回返工',
@@ -153,7 +153,7 @@ if (review && plan) fail('--review 和 --plan 只能选一个', 2);
 target = (positionals[0] ?? '').replace(/^@+/, '');
 if (!target) {
   fail(cmd === 'delegate'
-    ? '用法：shoal delegate <claude|codex|agy> [--review|--plan] [--title "标题"] [-m "说明"] [--file <path>] [--stdin]'
+    ? '用法：shoal delegate <agent> [--review|--plan] [--title "标题"] [-m "说明"] [--file <path>] [--stdin]'
     : `用法：shoal ${cmd} <${cmd === 'send' || cmd === 'ask' ? 'target' : '句柄|#序号|标题片段'}>${cmd === 'done' || cmd === 'cancel' ? '' : ' [-m "内容"] [--file <path>] [--stdin]'}`, 2);
 }
 if (cmd === 'done' || cmd === 'cancel') {

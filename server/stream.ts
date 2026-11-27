@@ -5,6 +5,7 @@ import type {
 } from '../shared/protocol.ts';
 import { composeLiveTail, dedupeLiveAnswer, extractPtyLiveFromLines, normForDedupe } from '../shared/ptyLive.ts';
 import { resolveLiveTranscript, summarizeToolCall, unquoteArg } from './activity.ts';
+import { piConversation } from './piTranscript.ts';
 import { readPrompt } from './prompt.ts';
 import { cleanAgyUserInput } from './transcript.ts';
 
@@ -61,12 +62,12 @@ function toolDetail(name: string, rawArgs: unknown): string | undefined {
   return `${name}: ${clipped}`;
 }
 
-function readTranscriptRaw(file: string): string | null {
+function readTranscriptRaw(file: string, branched = false): string | null {
   try {
     const fd = fs.openSync(file, 'r');
     try {
       const size = fs.fstatSync(fd).size;
-      if (size <= FULL_READ) {
+      if (size <= FULL_READ || branched) {
         const buf = Buffer.alloc(size);
         fs.readSync(fd, buf, 0, size, 0);
         return buf.toString('utf8');
@@ -143,7 +144,7 @@ export interface ParsedTranscriptStream {
 }
 
 // Parses a CLI transcript (JSONL) into rich video-style blocks + latest live todo checklist.
-export function parseStreamData(agent: AgentKind, raw: string, keyPrefix = 's'): ParsedTranscriptStream {
+export function parseStreamData(agent: AgentKind, raw: string, keyPrefix = 's', leaf?: string | null): ParsedTranscriptStream {
   const blocks: StreamBlock[] = [];
   let latestTodos: StreamTodoItem[] = [];
   const toolIndex = new Map<string, { step: Extract<StreamBlock, { kind: 'step' }>; entry: StreamToolEntry }>();
@@ -517,6 +518,10 @@ export function parseStreamData(agent: AgentKind, raw: string, keyPrefix = 's'):
     if (at) lastEventAt = at;
   };
 
+  if (agent === 'pi') {
+    for (const message of piConversation(raw, leaf)) applyClaude(message);
+    return { blocks, todos: latestTodos };
+  }
   const each = agent === 'claude' ? applyClaude : agent === 'codex' ? applyCodex : agent === 'agy' ? applyAgy : applyFake;
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -540,8 +545,9 @@ export function buildStreamData(opts: {
   const { task, session } = opts;
   const taskCards = opts.cards.filter(c => c.taskId === task.id).sort((a, b) => a.createdAt - b.createdAt);
   const tp = session ? resolveLiveTranscript(session, { preferFull: true }) : undefined;
-  const raw = tp ? readTranscriptRaw(tp) : null;
-  const parsed = raw ? parseStreamData(session?.agent ?? task.agent, raw, session?.id ?? 's') : { blocks: [], todos: [] };
+  const agent = session?.agent ?? task.agent;
+  const raw = tp ? readTranscriptRaw(tp, agent === 'pi') : null;
+  const parsed = raw ? parseStreamData(agent, raw, session?.id ?? 's', session?.transcriptLeafId) : { blocks: [], todos: [] };
   const blocks: StreamBlock[] = [];
 
   if (parsed.blocks.length > 0) {
@@ -644,7 +650,7 @@ export function createStreamWatcher(deps: StreamWatcherDeps) {
     const session = deps.getSession(w.sessionId);
     const task = session ? deps.getTask(session.taskId) : undefined;
     if (!session || !task) return false;
-    const sig = `${transcriptSig(session)}|${session.status}|${deps.getCards().filter(c => c.taskId === task.id).length}`;
+    const sig = `${transcriptSig(session)}|${session.transcriptLeafId ?? ''}|${session.status}|${deps.getCards().filter(c => c.taskId === task.id).length}`;
     if (!force && sig === w.lastTranscriptSig) return false;
     w.lastTranscriptSig = sig;
     const built = buildStreamData({ task, session, cards: deps.getCards() });

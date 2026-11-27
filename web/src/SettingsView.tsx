@@ -31,7 +31,7 @@ async function delJson<T>(url: string): Promise<T> {
   return json as T;
 }
 
-const AUTO_DELEGATE_TIP = '启动 Claude Code、Codex 和 Antigravity 会话时告诉它们可以用 shoal delegate 把任务派给其他 CLI。关闭后 shoal 命令仍然可用，但 agent 只在你明确要求时才会用。只对之后新启动的会话生效。';
+const AUTO_DELEGATE_TIP = '启动 Claude Code、Codex、Antigravity 和 Pi Agent 会话时告诉它们可以用 shoal delegate 把任务派给其他 CLI。关闭后 shoal 命令仍然可用，但 agent 只在你明确要求时才会用。只对之后新启动的会话生效。';
 
 const RICH_OUTPUT_HINTS_TIP = '启动新会话时附带 4 行轻量排版提示，告诉 CLI 对话视图支持 Mermaid 流程图、ECharts 数据图表、GitHub 提示卡片与数学公式，让模型在适合对比、趋势或架构说明时主动出图。关闭后不影响前端渲染，仅不再主动引导。只对之后新启动的会话生效。';
 
@@ -1092,7 +1092,7 @@ function CliToolsSection({
       <div className="settings-card cli-tier-banner">
         <div className="cli-tier-row">
           <span className="cli-tier-badge tier-deep">深度适配</span>
-          <span>Claude Code / Codex / Antigravity：支持 Hooks 状态感知、待验收结果卡片、自动续接、Token 与额度统计、跨 CLI 委派。</span>
+          <span>Claude Code / Codex / Antigravity / Pi Agent：支持 Hooks 状态感知、待验收结果卡片、自动续接、Token 与额度统计、跨 CLI 委派。</span>
         </div>
         <div className="cli-tier-row">
           <span className="cli-tier-badge tier-generic">通用终端</span>

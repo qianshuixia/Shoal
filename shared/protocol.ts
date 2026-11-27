@@ -1,13 +1,13 @@
 // Contract shared by server/ and web/. Change it only together with both sides.
 
-export type BuiltinDeepAgent = 'claude' | 'codex' | 'agy' | 'fake';
+export type BuiltinDeepAgent = 'claude' | 'codex' | 'agy' | 'pi' | 'fake';
 export type AgentKind = string;
 export type PermissionMode = 'full' | 'normal';
 export type CliTier = 'deep' | 'generic';
 
-export const DEEP_AGENTS = new Set<string>(['claude', 'codex', 'agy', 'fake']);
+export const DEEP_AGENTS = new Set<string>(['claude', 'codex', 'agy', 'pi', 'fake']);
 export const BUILTIN_CLI_IDS = new Set<string>([
-  'claude', 'codex', 'agy', 'fake',
+  'claude', 'codex', 'agy', 'pi', 'fake',
   'gemini', 'kimi', 'droid', 'qwen', 'opencode', 'copilot', 'cursor-agent', 'aider', 'amp', 'cline', 'goose',
 ]);
 export const RESERVED_CLI_IDS = new Set<string>([
@@ -419,6 +419,7 @@ export interface SessionInfo {
   rows: number;
   queued?: number; // messages waiting to be pasted into this session (see POST /api/tasks/:id/feedback); 0/missing = none
   transcriptPath?: string; // the CLI's own conversation file, from hook payloads
+  transcriptLeafId?: string | null; // Pi's selected conversation branch
   // True when the session was still running when the previous server exited, until resumed or dismissed.
   interrupted?: boolean;
   // The session ran out of quota (resetsAt: ms epoch or null); cleared when the next turn starts.
@@ -446,7 +447,7 @@ export interface QuotaInfo {
   windows: QuotaWindow[];
   at: number; // ms epoch when observed
   plan?: string; // optional subscription tier/account source (e.g. 'plus', 'pro', 'Google')
-  source?: 'statusline' | 'rollout' | 'transcript';
+  source?: 'statusline' | 'rollout' | 'transcript' | 'provider';
 }
 
 // Live prompt context window occupancy of one session (cached vs uncached vs remaining), derived from statusLine or transcripts.
@@ -709,6 +710,7 @@ export interface UsageCounts {
   cacheWrite: number;
   reasoning: number;
   requests: number; // model responses that reported usage
+  piCostUsd?: number; // cost from Pi's usage records, which may be an estimate
 }
 
 export const usageTotal = (c: UsageCounts) => c.input + c.output + c.cacheRead + c.cacheWrite;
@@ -767,6 +769,7 @@ const AGENT_VENDOR: Partial<Record<string, string>> = { claude: 'Anthropic', cod
 
 // Vendor from the model name (a CLI can be pointed at another vendor's model), else from the CLI.
 export function vendorOf(model: string, agent: AgentKind): string {
+  if (agent === 'pi' && model.includes('/')) return model.slice(0, model.indexOf('/'));
   const m = model.toLowerCase().split('/').at(-1) ?? '';
   for (const [re, v] of VENDORS) if (re.test(m)) return v;
   return AGENT_VENDOR[agent] ?? '未知';
@@ -838,6 +841,7 @@ export const AGENT_LABEL: Partial<Record<string, string>> = {
   claude: 'Claude Code',
   codex: 'Codex',
   agy: 'Antigravity',
+  pi: 'Pi Agent',
   fake: 'Fake',
   gemini: 'Gemini CLI',
   kimi: 'Kimi Code',
@@ -988,9 +992,9 @@ export interface PeerDelegationActionResult {
 // them its own way (see buildLaunch): claude --append-system-prompt, codex developer_instructions, agy an always-on AGENTS.md.
 export const DELEGATION_INSTRUCTIONS = [
   '## Shoal delegation',
-  'You run inside Shoal, a workbench that hosts the Claude Code, Codex and Antigravity CLIs side by side on the user\'s own subscriptions. The `shoal` command is on PATH.',
+  'You run inside Shoal, a workbench that hosts multiple agent CLIs on the user\'s own accounts. The `shoal` command is on PATH.',
   '- Ordinary work needs no shoal command. Work your own CLI\'s subagents can do stays with them.',
-  '- Delegate to another vendor\'s CLI with `shoal delegate <claude|codex|agy>` when the user asks for it, when the user\'s instruction files route that kind of work to that agent, or when an independent implementation or review by a different model is worth a separate session. Do not switch to a different agent than the one asked for.',
+  '- Delegate to another available CLI with `shoal delegate <agent>` when the user asks for it, when the user\'s instruction files route that kind of work to that agent, or when an independent implementation or review by a different model is worth a separate session. Do not switch to a different agent than the one asked for.',
   '- The child sees only your brief, not this conversation. Write it self-contained: goal, files to read, behavior that must not change, checks to run. Pass it with `--stdin` or `--file <path inside the project>`; `-m` is for a single line.',
   '- `shoal delegate <agent> --review` dispatches a read-only reviewer: it changes no files and only returns a PASS/FAIL verdict with BLOCKING / NON-BLOCKING findings. Use it for an independent review of a requirement, plan or change. A three-way review means dispatching it to both other CLIs, reviewing independently yourself, then ruling on every finding and summarizing.',
   '- `shoal delegate <agent> --plan` dispatches a read-only advisor: it changes no files and returns its own independent plan (recommendation, alternatives and trade-offs, risks). For an independent plan, give it the user\'s request and the facts it needs, not your draft, and merge its plan with yours. To improve something that exists (UI copy, for example), give it the current version; it replies with replacements and does not edit files.',

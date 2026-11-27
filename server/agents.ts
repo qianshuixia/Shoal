@@ -507,6 +507,7 @@ export function buildLaunch(opts: {
   collabDir?: string;
   instructions?: string; // standing instructions for the session (the fake agent ignores them)
   permissionMode?: PermissionMode; // default 'full'; 'normal' omits skip-permission flags
+  readOnly?: boolean; // Pi review or plan session
   cliMeta?: LaunchCliMeta; // resolved executable & args for generic/custom CLIs (or fallback path for built-ins)
 }): Launch {
   const { agent, sessionId, stateDir, resume, model, collabDir, instructions, cliMeta } = opts;
@@ -564,6 +565,19 @@ export function buildLaunch(opts: {
       return typeof safe.args === 'string'
         ? { file: safe.file, args: [], verbatimArgs: safe.args, nativeSessionId: resume ?? null }
         : { file: safe.file, args: safe.args, nativeSessionId: resume ?? null };
+    }
+    case 'pi': {
+      const args = ['--extension', path.join(ROOT, 'hooks', 'pi.ts')];
+      if (resume) args.push('--session', resume);
+      if (opts.readOnly) args.push('--no-extensions', '--no-mcp', '--tools', 'read,grep,find,ls');
+      if (instructions) args.push('--append-system-prompt', instructions);
+      const target = cliMeta?.path ?? 'pi';
+      if (isCmdBatchPath(target)) throw new Error('Pi 请使用标准 npm 安装或原生可执行文件');
+      if (prompt) args.push(prompt.startsWith('@') ? ` ${prompt}` : prompt);
+      const safe = buildSafeProcessLaunch(target, args);
+      return typeof safe.args === 'string'
+        ? { file: safe.file, args: [], verbatimArgs: safe.args, nativeSessionId: null }
+        : { file: safe.file, args: safe.args, nativeSessionId: null };
     }
     case 'fake': {
       const args = [FAKE_AGENT];

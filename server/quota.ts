@@ -13,6 +13,9 @@ const LIMIT_TEXT = /hit your .*limit/i;
 // or a Stop whose last message says "You've hit your ... limit". codex and agy have no real sample yet, so for them
 // switching agent stays manual.
 export function detectLimit(agent: AgentKind, event: string, payload: Record<string, unknown>): LimitHit | null {
+  if (agent === 'pi' && event === 'StopFailure' && payload.error === 'rate_limit') {
+    return { message: 'Pi 模型供应商返回限流或用量上限', resetsAt: null };
+  }
   if (agent !== 'claude' && agent !== 'fake') return null;
   const last = typeof payload.last_assistant_message === 'string' ? payload.last_assistant_message.trim() : '';
   if (event === 'StopFailure') {
@@ -444,12 +447,13 @@ export function parseStatusLineContext(agent: AgentKind, payload: Record<string,
   const cacheRead = cu && isNum(cu.cache_read_input_tokens) && cu.cache_read_input_tokens >= 0 ? cu.cache_read_input_tokens : 0;
   const cacheCreate = cu && isNum(cu.cache_creation_input_tokens) && cu.cache_creation_input_tokens >= 0 ? cu.cache_creation_input_tokens : 0;
   const cached = cacheRead + cacheCreate;
-  let usedTokens = uncached + cached;
+  const exactUsed = agent === 'pi' && isNum(cw.used_tokens) && cw.used_tokens >= 0 ? cw.used_tokens : null;
+  let usedTokens = exactUsed ?? uncached + cached;
   let usedPercent: number | null = isNum(cw.used_percentage) ? pct(cw.used_percentage) : null;
   if (usedTokens === 0 && usedPercent !== null && maxSize > 0) {
     usedTokens = Math.round((usedPercent / 100) * maxSize);
   }
-  if (usedPercent === null && usedTokens > 0 && maxSize > 0) {
+  if (usedPercent === null && (usedTokens > 0 || exactUsed !== null) && maxSize > 0) {
     usedPercent = pct(Math.round((usedTokens / maxSize) * 1000) / 10);
   }
   if (usedPercent === null) return null;
@@ -473,7 +477,7 @@ const sameQuotaPayload = (a: QuotaInfo, b: QuotaWindow[], plan?: string, source?
 // Latest quota per agent kind, kept in memory and in a JSON file so it survives a restart.
 export interface QuotaStore {
   all(): Partial<Record<AgentKind, QuotaInfo>>;
-  // The new entry, or null (nothing changes) when the windows are the same as before or empty.
+  // Provider queries also update the observation time when the values are unchanged.
   set(agent: AgentKind, windows: QuotaWindow[], at?: number, meta?: { plan?: string; source?: QuotaInfo['source'] }): QuotaInfo | null;
   // Removes an entry (e.g. a deleted/disabled/re-targeted custom CLI bucket); returns true if one existed.
   delete(agent: AgentKind): boolean;
@@ -513,7 +517,7 @@ export function createQuotaStore(file: string): QuotaStore {
       const prev = data[agent];
       const nextPlan = meta?.plan ?? prev?.plan;
       const nextSource = meta?.source ?? prev?.source;
-      if (prev && sameQuotaPayload(prev, windows, nextPlan, nextSource)) return null;
+      if (prev && sameQuotaPayload(prev, windows, nextPlan, nextSource) && (nextSource !== 'provider' || at <= prev.at)) return null;
       const info: QuotaInfo = {
         windows,
         at,

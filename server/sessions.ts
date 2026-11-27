@@ -159,6 +159,7 @@ export interface SpawnOptions {
   resume?: string; // native session id to reopen
   instructions?: string; // standing instructions appended to the CLI's system prompt (see buildLaunch)
   permissionMode?: PermissionMode; // default 'full'; 'normal' omits skip-permission flags
+  readOnly?: boolean;
   cliMeta?: LaunchCliMeta; // resolved executable & flags for generic/custom CLIs
 }
 
@@ -492,7 +493,7 @@ export class SessionManager {
     const launch = buildLaunch({
       agent: o.agent, sessionId: id, prompt: o.prompt, stateDir: this.cfg.stateDir,
       resume: o.resume, model: o.model, collabDir, instructions: deep ? o.instructions : undefined,
-      permissionMode, cliMeta: o.cliMeta,
+      permissionMode, readOnly: o.readOnly, cliMeta: o.cliMeta,
     });
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !ENV_STRIP.test(k))) as Record<string, string>;
     Object.assign(env, {
@@ -510,6 +511,7 @@ export class SessionManager {
         WORKBENCH_HOOK_TOKEN: this.cfg.token,
         WORKBENCH_PEER_TOKEN: peerToken,
         WORKBENCH_NODE: process.execPath,
+        ...(o.agent === 'pi' ? { WORKBENCH_PI_CWD: o.cwd, WORKBENCH_PI_PERMISSION: permissionMode } : {}),
         ...(collabDir ? { WORKBENCH_COLLAB_DIR: collabDir, WORKBENCH_PEERS_FILE: path.join(collabDir, 'PEERS.md') } : {}),
       });
     }
@@ -626,13 +628,15 @@ export class SessionManager {
   }
 
   hook(body: HookBody): false | { userTurn: boolean; intermediateStop?: boolean; systemInjected?: boolean } {
-    this.log({ kind: 'hook', ...body });
     const s = this.live.get(body.sessionId);
+    const p = (body.payload ?? {}) as Record<string, unknown>;
+    if (s?.info.agent === 'pi' && (p.cwd !== s.cwd || typeof p.session_id !== 'string'
+      || (body.event !== 'SessionStart' && s.info.nativeSessionId && p.session_id !== s.info.nativeSessionId))) return false;
+    this.log({ kind: 'hook', ...body });
     if (!s) {
       console.warn(`[hook] unknown session ${body.sessionId} (${body.event})`);
       return false;
     }
-    const p = (body.payload ?? {}) as Record<string, unknown>;
     const beforeStatus = s.info.status;
     const beforeNative = s.info.nativeSessionId;
     let changed = false;
@@ -664,6 +668,21 @@ export class SessionManager {
         return { userTurn: false, intermediateStop: true };
       }
       if (body.event !== 'RateLimits') s.subagentWait = false;
+    } else if (s.info.agent === 'pi') {
+      const id = typeof p.session_id === 'string' ? p.session_id : null;
+      const file = typeof p.transcript_path === 'string' ? p.transcript_path : undefined;
+      const leaf = typeof p.leaf_id === 'string' || p.leaf_id === null ? p.leaf_id : undefined;
+      const resumable = !!file && p.resumable === true;
+      changed = s.info.nativeSessionId !== id || s.info.transcriptPath !== file
+        || s.info.transcriptLeafId !== leaf || s.info.resumable !== resumable;
+      s.info.nativeSessionId = id;
+      s.info.transcriptPath = file;
+      s.info.transcriptLeafId = leaf;
+      s.info.resumable = resumable;
+      if (body.event === 'SessionStart') {
+        s.startupBlocked = false;
+        if (this.syncBlocked(s)) changed = true;
+      }
     } else {
       const nativeUpdate = nativeIdUpdate(s.info.nativeSessionId, body.event, p.session_id, p.source);
       if (nativeUpdate) {
@@ -677,7 +696,7 @@ export class SessionManager {
         changed = true;
       }
     }
-    if (!s.info.resumable && PROMPT_EVENTS.has(body.event)) {
+    if (s.info.agent !== 'pi' && !s.info.resumable && PROMPT_EVENTS.has(body.event)) {
       s.info.resumable = true;
       changed = true;
     }

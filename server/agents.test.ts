@@ -18,6 +18,13 @@ const build = (agent: 'claude' | 'codex' | 'agy' | 'fake', prompt: string, sessi
 const codexPrefix = codexLaunch().prefix.length;
 
 describe('buildLaunch', () => {
+  it('launches Pi natively with the Shoal extension, original session path and review-only model tools', () => {
+    const resume = path.resolve(stateDir, 'Pi session.jsonl');
+    const { args } = buildLaunch({ agent: 'pi', sessionId: 'shoal-pi', prompt: 'ignored on resume', resume, stateDir, readOnly: true });
+    expect(path.basename(args[1])).toBe('pi.ts');
+    expect(args).toEqual(['--extension', args[1], '--session', resume, '--no-extensions', '--no-mcp', '--tools', 'read,grep,find,ls']);
+  });
+
   it('codex hook args are byte-identical to the M0 probe format and never bypass trust', () => {
     const { args } = build('codex', 'do it');
     const hookToml = (ev: string) => `hooks.${ev}=[{hooks=[{type="command",command='${NODE} "${NOTIFY}" codex ${ev}',timeout=5}]}]`;

@@ -2,7 +2,7 @@ import { agentLabel, quotaKeyOf, quotaVendorOf } from '../../shared/protocol.ts'
 import type { AgentKind, CliToolInfo, QuotaInfo, QuotaWindow } from '../../shared/protocol.ts';
 
 // Built-in agents in header order.
-export const QUOTA_AGENTS: AgentKind[] = ['claude', 'codex', 'agy', 'fake'];
+export const QUOTA_AGENTS: AgentKind[] = ['claude', 'codex', 'agy', 'pi', 'fake'];
 
 // Built-in quota agents plus any enabled custom CLI that owns a distinct authoritative quotaKey (e.g. separate CODEX_HOME).
 export function quotaDisplayAgents(
