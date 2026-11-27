@@ -29,11 +29,12 @@ const sessions = new SessionManager({ port, token, stateDir });
 const store = createFileStore(path.join(stateDir, 'state.json'));
 sessions.restore(store.sessions());
 const usage = createUsage({ stateDir, source: store });
-const { server, mobile } = createApp({ port, token, store, sessions, stateDir, usage, onShutdown: () => shutdown() });
+const { server, mobile, refreshAgyQuota } = createApp({ port, token, store, sessions, stateDir, usage, onShutdown: () => shutdown() });
 
 server.listen(port, '127.0.0.1', () => {
   console.log(`Shoal on http://127.0.0.1:${port}`);
   console.log(`agents: ${enabledAgentsFrom(store.settings()).join(', ') || '(none)'}  state: ${stateDir}`);
+  void refreshAgyQuota();
   // Keeps the totals current even if nobody opens the stats tab, before the CLIs clean up old transcripts.
   setTimeout(() => usage.scan(), 1000).unref();
   setInterval(() => usage.scan(), 60_000).unref();

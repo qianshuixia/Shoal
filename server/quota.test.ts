@@ -114,10 +114,19 @@ describe('parseAgyQuota', () => {
     ]);
   });
 
-  it('handles bare "gemini" bucket key and untouched buckets that omit reset fields', () => {
+  it('handles bare "gemini" bucket key and untouched buckets with omitted or Unix-epoch reset fields', () => {
     const now = 1_794_570_000_000;
     expect(parseAgyQuota({ 'gemini-5h': { remaining_fraction: 1 } }, now)).toEqual([
-      { label: '5h', usedPercent: 0, resetsAt: now + 5 * 3_600_000, windowMinutes: 300, pool: 'gemini', poolLabel: 'Gemini', primary: true },
+      { label: '5h', usedPercent: 0, resetsAt: 0, unstarted: true, windowMinutes: 300, pool: 'gemini', poolLabel: 'Gemini', primary: true },
+    ]);
+    expect(parseAgyQuota({
+      'gemini-5h': { remaining_fraction: 0.98, reset_time: '2026-11-26T12:15:38Z' },
+      '3p-5h': { remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
+      '3p-weekly': { remaining_fraction: 1, reset_time: '1970-01-01T00:00:00Z' },
+    }, now)).toEqual([
+      { label: '5h', usedPercent: 2, resetsAt: Date.parse('2026-11-26T12:15:38Z'), windowMinutes: 300, pool: 'gemini', poolLabel: 'Gemini', primary: true },
+      { label: '5h', usedPercent: 0, resetsAt: 0, unstarted: true, windowMinutes: 300, pool: '3p', poolLabel: 'Claude & GPT 共享', primary: false },
+      { label: '7d', usedPercent: 0, resetsAt: 0, unstarted: true, windowMinutes: 10080, pool: '3p', poolLabel: 'Claude & GPT 共享', primary: false },
     ]);
     expect(parseAgyQuota({ gemini: { remaining_fraction: 0.75, reset_in_seconds: 1800 } }, now)).toEqual([
       { label: '配额', usedPercent: 25, resetsAt: now + 1_800_000, windowMinutes: 300, pool: 'gemini', poolLabel: 'Gemini', primary: true },
@@ -131,6 +140,7 @@ describe('parseAgyQuota', () => {
     expect(parseAgyQuota({ 'gemini-5h': {} })).toEqual([]);
     expect(parseAgyQuota({ 'gemini-5h': { remaining_fraction: 'bad', reset_time: '2026-11-13T22:28:10Z' } })).toEqual([]);
     expect(parseAgyQuota({ 'gemini-5h': { remaining_fraction: 0.5, reset_time: 'not-a-date' } })).toEqual([]);
+    expect(parseAgyQuota({ '3p-5h': { remaining_fraction: 0.5, reset_time: '1970-01-01T00:00:00Z' } })).toEqual([]);
   });
 });
 
@@ -229,7 +239,7 @@ describe('createQuotaStore', () => {
     });
   });
 
-  it('starts empty on a missing or corrupt file, drops malformed entries, and backfills windowMinutes', () => {
+  it('starts empty on a missing or corrupt file, drops malformed entries, and backfills windowMinutes and unstarted', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-quota-'));
     expect(createQuotaStore(path.join(dir, 'none.json')).all()).toEqual({});
     fs.writeFileSync(path.join(dir, 'bad.json'), '{oops');
@@ -237,10 +247,11 @@ describe('createQuotaStore', () => {
     fs.writeFileSync(path.join(dir, 'mixed.json'), JSON.stringify({
       claude: { windows: [{ label: '5h', usedPercent: 1, resetsAt: 1793447357000 }], at: 5 },
       codex: { windows: 'x', at: 1 },
-      agy: null,
+      agy: { windows: [{ label: '5h', usedPercent: 0, resetsAt: 0, pool: '3p', poolLabel: 'Claude & GPT 共享', primary: false }], at: 9 },
     }));
     expect(createQuotaStore(path.join(dir, 'mixed.json')).all()).toEqual({
       claude: { windows: [{ label: '5h', usedPercent: 1, resetsAt: 1793447357000, windowMinutes: 300 }], at: 5 },
+      agy: { windows: [{ label: '5h', usedPercent: 0, resetsAt: 0, unstarted: true, windowMinutes: 300, pool: '3p', poolLabel: 'Claude & GPT 共享', primary: false }], at: 9 },
     });
   });
 });

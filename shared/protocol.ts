@@ -436,7 +436,8 @@ export interface SessionInfo {
 export interface QuotaWindow {
   label: string; // '5h' / '7d', or generic ('60m', '2d')
   usedPercent: number; // 0-100
-  resetsAt: number; // ms epoch; a window whose reset has passed is stale
+  resetsAt: number; // ms epoch; 0 when unstarted (rolling timer not started yet), else stale once resetsAt <= now
+  unstarted?: boolean; // true when bucket is untouched (0% used) and starts ticking on first use
   windowMinutes?: number; // rolling window duration in minutes for time-pace calculation (300 = 5h, 10080 = 7d)
   pool?: string; // logical model pool id (e.g. 'gemini', '3p', 'claude', 'codex')
   poolLabel?: string; // human-readable pool name (e.g. 'Gemini', 'Claude & GPT 共享')
@@ -446,7 +447,7 @@ export interface QuotaInfo {
   windows: QuotaWindow[];
   at: number; // ms epoch when observed
   plan?: string; // optional subscription tier/account source (e.g. 'plus', 'pro', 'Google')
-  source?: 'statusline' | 'rollout' | 'transcript';
+  source?: 'statusline' | 'rollout' | 'transcript' | 'provider';
 }
 
 // Live prompt context window occupancy of one session (cached vs uncached vs remaining), derived from statusLine or transcripts.

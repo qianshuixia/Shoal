@@ -53,9 +53,19 @@ export function saveQuotaMode(mode: QuotaDisplayMode): void {
 
 const hm = (t: number) => new Date(t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
 
-// Windows whose reset is still ahead; an expired one says nothing about the current usage.
-export const liveWindows = (q: QuotaInfo | undefined, now: number): QuotaWindow[] =>
-  (q?.windows ?? []).filter(w => w.resetsAt > now);
+// Untouched rolling bucket whose timer starts on first call (e.g. Antigravity 3p pools reporting 1970-01-01T00:00:00Z).
+export const isUnstartedWindow = (w: QuotaWindow): boolean =>
+  w.unstarted === true || (w.resetsAt === 0 && w.usedPercent === 0);
+
+// Windows whose reset is still ahead, plus unstarted buckets when the snapshot itself is not completely expired.
+export const liveWindows = (q: QuotaInfo | undefined, now: number): QuotaWindow[] => {
+  const all = q?.windows ?? [];
+  if (!all.length) return [];
+  const hasTimed = all.some(w => !isUnstartedWindow(w));
+  const hasLiveTimed = all.some(w => !isUnstartedWindow(w) && w.resetsAt > now);
+  if (hasTimed && !hasLiveTimed) return [];
+  return all.filter(w => isUnstartedWindow(w) || w.resetsAt > now);
+};
 
 // Primary pool windows for compact topbar / pane pills (falls back to all when none is explicitly primary).
 export function primaryWindows(windows: QuotaWindow[]): QuotaWindow[] {
@@ -108,13 +118,14 @@ export function inferWindowMs(w: QuotaWindow): number | null {
   return n * 86_400_000;
 }
 
-export type QuotaPace = 'ahead' | 'steady' | 'fast' | 'depleted';
+export type QuotaPace = 'idle' | 'ahead' | 'steady' | 'fast' | 'depleted';
 export type QuotaTone = 'ok' | 'mid' | 'warn' | 'full';
 
 export interface WindowMetrics {
   usedPercent: number;
   leftPercent: number;
-  /** 0-100: how much of the rolling window duration has elapsed; null if duration unknown */
+  unstarted: boolean;
+  /** 0-100: how much of the rolling window duration has elapsed; null if duration unknown or unstarted */
   timeElapsedPct: number | null;
   /** 0-100: ideal remaining percent if consumed linearly across the window */
   idealLeftPct: number | null;
@@ -184,6 +195,21 @@ export function quotaTone(usedPercent: number): QuotaTone {
 export function windowMetrics(w: QuotaWindow, now: number): WindowMetrics {
   const usedPercent = Math.min(100, Math.max(0, w.usedPercent));
   const leftPercent = Math.max(0, 100 - usedPercent);
+  const unstarted = isUnstartedWindow(w);
+  if (unstarted) {
+    return {
+      usedPercent: 0,
+      leftPercent: 100,
+      unstarted: true,
+      timeElapsedPct: null,
+      idealLeftPct: null,
+      paceDelta: null,
+      pace: 'idle',
+      tone: 'ok',
+      resetRelative: '未开始计时',
+      resetClock: '首次调用后开始计时',
+    };
+  }
   const remMs = Math.max(0, w.resetsAt - now);
   const winMs = inferWindowMs(w);
   let timeElapsedPct: number | null = null;
@@ -204,6 +230,7 @@ export function windowMetrics(w: QuotaWindow, now: number): WindowMetrics {
   return {
     usedPercent,
     leftPercent,
+    unstarted: false,
     timeElapsedPct,
     idealLeftPct,
     paceDelta,
@@ -233,6 +260,7 @@ export function quotaTitle(
     const val = displayPercent(w, mode);
     const word = mode === 'remaining' ? '剩余' : '已用';
     const prefix = w.primary === false && w.poolLabel ? `[${w.poolLabel}] ` : '';
+    if (isUnstartedWindow(w)) return `${prefix}${windowName(w.label)}：${word} ${val}%，未使用（首次调用后开始计时）`;
     return `${prefix}${windowName(w.label)}：${word} ${val}%，${resetClock(w.resetsAt, now)} 重置（${remainingLong(w.resetsAt - now)}）`;
   };
   return [head, ...windows.map(fmtWin), `更新于 ${hm(q.at)}（点击查看详情）`].join('\n');
