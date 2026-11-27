@@ -10,10 +10,12 @@ import {
   buildCliTools,
   buildSafeProcessLaunch,
   delegatableAgentsFrom,
+  detectCustomCodex,
   effectivePermissionMode,
   enabledAgentsFrom,
   findExecutableWin,
   isCmdBatchPath,
+  resolveCustomCodexHomes,
   unwrapNpmCmdShim,
   validateCliPrefsPatch,
   validateCustomClis,
@@ -532,6 +534,268 @@ describe('HTTP integration: CLI scan, toggle, permission mode & parent-to-child 
       server.close();
       if (prevFake === undefined) delete process.env.WORKBENCH_FAKE_AGENT;
       else process.env.WORKBENCH_FAKE_AGENT = prevFake;
+    }
+  }, 20_000);
+
+  it('detects custom Codex CLIs (direct binary, npm shim, args, wrapper + distinct CODEX_HOME) without false positives', () => {
+    const dir = makeTmpDir();
+    const directBin = path.join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+    fs.writeFileSync(directBin, 'bin', { mode: 0o755 });
+
+    const fakeNode = path.join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
+    fs.writeFileSync(fakeNode, 'bin', { mode: 0o755 });
+
+    const workHome = path.join(dir, 'codex-work-home');
+    const wrapperBin = path.join(dir, process.platform === 'win32' ? 'work-cli.cmd' : 'work-cli.sh');
+    fs.writeFileSync(
+      wrapperBin,
+      process.platform === 'win32'
+        ? `@echo off\r\nset "CODEX_HOME=${workHome}"\r\ncall "${directBin}" %*\r\n`
+        : `#!/bin/sh\nexport CODEX_HOME="${workHome}"\nexec "${directBin}" "$@"\n`,
+      { mode: 0o755 },
+    );
+
+    // Contract: Windows .cmd wrapper setting CODEX_HOME or arbitrary `if defined ... cd` must NOT be unwrapped.
+    if (process.platform === 'win32') {
+      expect(unwrapNpmCmdShim(wrapperBin)).toBeNull();
+      const safeLaunch = buildSafeProcessLaunch(wrapperBin, [], 'win32');
+      expect(typeof safeLaunch.args).toBe('string');
+      expect(String(safeLaunch.args)).toContain(wrapperBin);
+
+      const ifCdCmd = path.join(dir, 'if-cd-codex.cmd');
+      fs.writeFileSync(ifCdCmd, `@echo off\r\nif defined USERPROFILE cd /d "${dir}"\r\ncall "${directBin}" %*\r\n`);
+      expect(unwrapNpmCmdShim(ifCdCmd)).toBeNull();
+    }
+
+    // Batch %~dp0 expansion + shell `exec ./bin/codex`, `exec env CODEX_HOME=...`, single-quote RHS & inherited export semantics
+    const dp0Cmd = path.join(dir, 'dp0-codex.cmd');
+    fs.writeFileSync(dp0Cmd, `@echo off\r\nset "CODEX_HOME=%~dp0account"\r\ncall "${directBin}" %*\r\n`);
+    const relSh = path.join(dir, 'rel-codex.sh');
+    fs.writeFileSync(relSh, '#!/bin/sh\nexec ./bin/codex "$@"\n', { mode: 0o755 });
+    const envSh = path.join(dir, 'env-codex.sh');
+    fs.writeFileSync(envSh, '#!/bin/sh\nexec env CODEX_HOME="$HOME/.codex-work" codex "$@"\n', { mode: 0o755 });
+    const singleQuoteSh = path.join(dir, 'sq-codex.sh');
+    fs.writeFileSync(singleQuoteSh, "#!/bin/sh\nexport CODEX_HOME='/var/$HOME/codex'\nexec codex \"$@\"\n", { mode: 0o755 });
+    const unexportedSh = path.join(dir, 'unexported-codex.sh');
+    fs.writeFileSync(unexportedSh, '#!/bin/sh\nCODEX_HOME="$HOME/.codex-local"\nexec codex "$@"\n', { mode: 0o755 });
+    const echoSh = path.join(dir, 'echo-only.sh');
+    fs.writeFileSync(echoSh, '#!/bin/sh\necho "codex"\n', { mode: 0o755 });
+    const echoCmd = path.join(dir, 'echo-only.cmd');
+    fs.writeFileSync(echoCmd, '@echo off\r\necho "codex"\r\n');
+
+    const otherBin = path.join(dir, process.platform === 'win32' ? 'decoder.exe' : 'decoder');
+    fs.writeFileSync(otherBin, 'bin', { mode: 0o755 });
+
+    const defaultHome = path.join(dir, 'default-codex-home');
+    const env = { platform: process.platform, env: { ...process.env, HOME: dir, USERPROFILE: dir, CODEX_HOME: defaultHome, PATH: '' }, home: dir };
+    const envWithoutCodexHome = { platform: process.platform, env: { HOME: dir, USERPROFILE: dir, PATH: '' }, home: dir };
+
+    expect(detectCustomCodex({ id: 'my-c', label: 'Custom Codex', command: directBin }, directBin, env)).toEqual({ isCodex: true });
+    expect(detectCustomCodex({ id: 'node-c', label: 'Node Codex', command: fakeNode, fullAccessArgs: ['D:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js'] }, fakeNode, env)).toEqual({ isCodex: true });
+    expect(detectCustomCodex({ id: 'npx-c', label: 'NPX Codex', command: 'npx', normalArgs: ['@openai/codex@latest'] }, null, env)).toEqual({ isCodex: true });
+    expect(detectCustomCodex({ id: 'work-c', label: 'Work CLI', command: wrapperBin }, wrapperBin, env)).toEqual({ isCodex: true, codexHome: workHome });
+    expect(detectCustomCodex({ id: 'dp0-c', label: 'DP0 CLI', command: dp0Cmd }, dp0Cmd, env)).toEqual({ isCodex: true, codexHome: path.join(dir, 'account') });
+    expect(detectCustomCodex({ id: 'rel-c', label: 'Rel CLI', command: relSh }, relSh, env)).toEqual({ isCodex: true });
+    expect(detectCustomCodex({ id: 'env-c', label: 'Env CLI', command: envSh }, envSh, env)).toEqual({ isCodex: true, codexHome: path.join(dir, '.codex-work') });
+    // Single-quoted RHS preserves literal `$HOME` instead of expanding it.
+    expect(detectCustomCodex({ id: 'sq-c', label: 'SQ CLI', command: singleQuoteSh }, singleQuoteSh, env)).toEqual({ isCodex: true, codexHome: path.normalize('/var/$HOME/codex') });
+    // POSIX inherited-export semantics: exported when CODEX_HOME is in env, local-only when absent from env.
+    expect(detectCustomCodex({ id: 'unexp-c', label: 'Unexp CLI', command: unexportedSh }, unexportedSh, env)).toEqual({ isCodex: true, codexHome: path.join(dir, '.codex-local') });
+    expect(detectCustomCodex({ id: 'unexp-c', label: 'Unexp CLI', command: unexportedSh }, unexportedSh, envWithoutCodexHome)).toEqual({ isCodex: true });
+
+    // False-positive guards: non-entry args (`node other.js codex`), non-runner (`rg codex`), and echo scripts must NEVER match.
+    expect(detectCustomCodex({ id: 'node-other', label: 'Node Other', command: fakeNode, normalArgs: ['other.js', 'codex'] }, fakeNode, env)).toEqual({ isCodex: false });
+    expect(detectCustomCodex({ id: 'rg-tool', label: 'RG', command: 'rg', normalArgs: ['codex'] }, null, env)).toEqual({ isCodex: false });
+    expect(detectCustomCodex({ id: 'echo-sh', label: 'Echo SH', command: echoSh }, echoSh, env)).toEqual({ isCodex: false });
+    expect(detectCustomCodex({ id: 'echo-cmd', label: 'Echo CMD', command: echoCmd }, echoCmd, env)).toEqual({ isCodex: false });
+    expect(detectCustomCodex({ id: 'decoder', label: 'Decoder', command: otherBin }, otherBin, env)).toEqual({ isCodex: false });
+
+    const settings: Settings = {
+      ...DEFAULT_SETTINGS,
+      cliPrefs: { codex: { enabled: false } },
+      customClis: [
+        { id: 'my-c', label: 'Custom Codex', command: directBin },
+        { id: 'work-c', label: 'Work CLI', command: wrapperBin },
+        { id: 'decoder', label: 'Decoder', command: otherBin },
+      ],
+    };
+    const tools = buildCliTools(settings, env);
+    const myTool = tools.find((t) => t.id === 'my-c')!;
+    const workTool = tools.find((t) => t.id === 'work-c')!;
+    const decTool = tools.find((t) => t.id === 'decoder')!;
+    expect(myTool.quotaAgent).toBe('codex');
+    expect(myTool.quotaKey).toBe('codex');
+    expect(myTool.capabilities).toContain('Codex 订阅额度');
+    expect(workTool.quotaAgent).toBe('codex');
+    expect(workTool.quotaKey).toBe('work-c');
+    expect(decTool.quotaAgent).toBeUndefined();
+    expect(decTool.quotaKey).toBeUndefined();
+
+    const homes = resolveCustomCodexHomes(settings, env);
+    expect(homes.hasDefaultCodex).toBe(true);
+    expect(homes.customHomes).toEqual([{ id: 'work-c', codexHome: workHome }]);
+
+    // Mobile snapshot redacts local path/command/args while keeping quotaAgent & quotaKey metadata.
+    const mob = sanitizeSnapshotForMobile({
+      projects: [], tasks: [], sessions: [], cards: [], agents: ['my-c', 'work-c'],
+      cliTools: [myTool, workTool], settings, git: {}, quota: {},
+    });
+    expect(mob.cliTools?.[0].path).toBeNull();
+    expect(mob.cliTools?.[0].command).toBe('');
+    expect(mob.cliTools?.[0].quotaAgent).toBe('codex');
+    expect(mob.cliTools?.[0].quotaKey).toBe('codex');
+    expect(mob.cliTools?.[1].quotaKey).toBe('work-c');
+  });
+
+  it('refreshes Codex subscription quota from disk for custom Codex CLIs even when built-in codex is disabled, ignores stale built-in transcripts, and prunes removed/disabled custom buckets', async () => {
+    const prevCodexHome = process.env.CODEX_HOME;
+    const stateDir = makeTmpDir();
+    const defaultCodexHome = makeTmpDir();
+    const workCodexHome = makeTmpDir();
+    process.env.CODEX_HOME = defaultCodexHome;
+
+    const pastReset = Math.floor((Date.now() - 3_600_000) / 1000);
+    const futureReset = Math.floor((Date.now() + 3_600_000) / 1000);
+    const writeRollout = (homeDir: string, used5h: number, plan: string, resetSec = futureReset, fileName = 'rollout-2026-11-25T16-00-00-abc.jsonl') => {
+      const sessDir = path.join(homeDir, 'sessions', '2026', '11', '25');
+      fs.mkdirSync(sessDir, { recursive: true });
+      const line = JSON.stringify({
+        timestamp: '2026-11-25T16:00:00Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: null,
+          rate_limits: {
+            limit_id: 'codex',
+            primary: { used_percent: used5h, window_minutes: 300, resets_at: resetSec },
+            secondary: { used_percent: 12, window_minutes: 10080, resets_at: resetSec + 86400 },
+            plan_type: plan,
+          },
+        },
+      });
+      const full = path.join(sessDir, fileName);
+      fs.writeFileSync(full, `${line}\n`);
+      return full;
+    };
+    // Transcript from a DIFFERENT old CODEX_HOME with a live weekly window and newer mtime must NOT override current default CODEX_HOME!
+    const foreignHome = makeTmpDir();
+    const foreignTranscript = writeRollout(foreignHome, 99, 'plus', futureReset, 'rollout-foreign.jsonl');
+    const futureTouch = new Date(Date.now() + 5_000);
+    fs.utimesSync(foreignTranscript, futureTouch, futureTouch);
+    writeRollout(defaultCodexHome, 25, 'plus');
+    writeRollout(workCodexHome, 60, 'pro');
+
+    const directBin = path.join(stateDir, process.platform === 'win32' ? 'codex.exe' : 'codex');
+    fs.writeFileSync(directBin, 'bin', { mode: 0o755 });
+    const wrapperBin = path.join(stateDir, process.platform === 'win32' ? 'codex-work.cmd' : 'codex-work.sh');
+    fs.writeFileSync(
+      wrapperBin,
+      process.platform === 'win32'
+        ? `@echo off\r\nset "CODEX_HOME=${workCodexHome}"\r\ncall "${directBin}" %*\r\n`
+        : `#!/bin/sh\nexport CODEX_HOME="${workCodexHome}"\nexec "${directBin}" "$@"\n`,
+      { mode: 0o755 },
+    );
+
+    const port = await new Promise<number>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const p = (probe.address() as net.AddressInfo).port;
+        probe.close(() => resolve(p));
+      });
+    });
+
+    const store = createMemoryStore();
+    // Seed an exited built-in codex session pointing to a foreign CODEX_HOME transcript with newer mtime: must NOT override default CODEX_HOME!
+    store.saveSession({
+      id: 'old-codex-sess',
+      taskId: 'old-task',
+      agent: 'codex',
+      status: 'exited',
+      statusSince: Date.now() - 10_000,
+      nativeSessionId: 'old-native',
+      transcriptPath: foreignTranscript,
+      startedAt: Date.now() - 20_000,
+      exitCode: 0,
+      cols: 120,
+      rows: 36,
+    });
+    const sessions = new SessionManager({ port, token: 'test-token', stateDir });
+    sessions.restore(store.sessions());
+    const usage = createUsage({ stateDir, source: store });
+    const { server, mobile } = createApp({
+      port, token: 'test-token', store, sessions, stateDir, usage, codexDiskQuota: true,
+    });
+    await new Promise<void>((r) => server.listen(port, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      const setRes = await fetch(`${base}/api/settings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliPrefs: { codex: { enabled: false } },
+          customClis: [
+            { id: 'my-codex', label: '自定义 Codex', command: directBin },
+            { id: 'codex-work', label: 'Codex 工作号', command: wrapperBin },
+          ],
+        }),
+      });
+      expect(setRes.status).toBe(200);
+
+      const snap = (await (await fetch(`${base}/api/state`)).json()) as Snapshot;
+      expect(snap.quota.codex?.plan).toBe('plus');
+      expect(snap.quota.codex?.windows[0].usedPercent).toBe(25);
+      expect(snap.quota['codex-work']?.plan).toBe('pro');
+      expect(snap.quota['codex-work']?.windows[0].usedPercent).toBe(60);
+
+      // Updating the rollout file and hitting /api/quota/refresh picks up fresh percentages immediately.
+      writeRollout(defaultCodexHome, 42, 'plus');
+      const refRes = await fetch(`${base}/api/quota/refresh`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(refRes.status).toBe(200);
+      const refBody = (await refRes.json()) as { quota: Snapshot['quota'] };
+      expect(refBody.quota.codex?.windows[0].usedPercent).toBe(42);
+
+      // Retargeting the same custom CLI id to an empty isolated CODEX_HOME must clear Account A's stale quota!
+      const emptyWorkHome = makeTmpDir();
+      fs.writeFileSync(
+        wrapperBin,
+        process.platform === 'win32'
+          ? `@echo off\r\nset "CODEX_HOME=${emptyWorkHome}"\r\ncall "${directBin}" %*\r\n`
+          : `#!/bin/sh\nexport CODEX_HOME="${emptyWorkHome}"\nexec "${directBin}" "$@"\n`,
+        { mode: 0o755 },
+      );
+      const bump = new Date(Date.now() + 2000);
+      fs.utimesSync(wrapperBin, bump, bump);
+      const retargetRes = await fetch(`${base}/api/quota/refresh`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+      expect(retargetRes.status).toBe(200);
+      const retargetBody = (await retargetRes.json()) as { quota: Snapshot['quota'] };
+      expect(retargetBody.quota['codex-work']).toBeUndefined();
+      expect(retargetBody.quota.codex?.windows[0].usedPercent).toBe(42);
+
+      // Disabling `codex-work` keeps state clean as well.
+      const disRes = await fetch(`${base}/api/settings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliPrefs: { 'codex-work': { enabled: false } } }),
+      });
+      expect(disRes.status).toBe(200);
+      const afterDis = (await (await fetch(`${base}/api/state`)).json()) as Snapshot;
+      expect(afterDis.quota['codex-work']).toBeUndefined();
+      expect(afterDis.quota.codex?.windows[0].usedPercent).toBe(42);
+    } finally {
+      await Promise.allSettled([mobile.close(), sessions.killAll()]);
+      server.close();
+      if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prevCodexHome;
     }
   }, 20_000);
 });

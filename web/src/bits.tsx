@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
-import type { AgentKind, QuotaInfo, QuotaWindow, SessionStatus, UsageCounts } from '../../shared/protocol.ts';
-import { usageTotal } from '../../shared/protocol.ts';
+import type { AgentKind, CliToolInfo, QuotaInfo, QuotaWindow, SessionStatus, UsageCounts } from '../../shared/protocol.ts';
+import { quotaVendorOf, usageTotal } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
 import { displayPercent, primaryWindows, QUOTA_WARN, quotaTitle, quotaTone, type QuotaDisplayMode } from './quota.ts';
 import { fmtPct, fmtTokens, hitRate, STATUS_LABEL, waitText } from './util.ts';
@@ -101,9 +101,10 @@ export function RingGauge({ percent, tone, size = 14 }: { percent: number; tone:
 const cacheTone = (r: number): RingTone => (r >= 0.7 ? 'ok' : r >= 0.4 ? 'mid' : 'warn');
 
 export function QuotaPill({
-  agent, quota, windows, now, compact = false, mode = 'remaining', onClick,
+  agent, cliTools, quota, windows, now, compact = false, mode = 'remaining', onClick,
 }: {
   agent: AgentKind;
+  cliTools?: CliToolInfo[];
   quota: QuotaInfo;
   windows: QuotaWindow[];
   now: number;
@@ -116,7 +117,7 @@ export function QuotaPill({
   const extra = windows.length - shown.length;
   const content = (
     <>
-      {!compact && <AgentIcon agent={agent} />}
+      {!compact && <AgentIcon agent={agent} fallbackAgent={quotaVendorOf(agent, cliTools)} />}
       {shown.map((w) => {
         const pctVal = displayPercent(w, mode);
         const ringPct = mode === 'remaining' ? 100 - w.usedPercent : w.usedPercent;
@@ -142,7 +143,7 @@ export function QuotaPill({
         className={`quota quota-trigger ${compact ? 'pane-quota' : ''}`}
         data-testid={prefix}
         data-agent={agent}
-        title={quotaTitle(agent, quota, windows, now, mode)}
+        title={quotaTitle(agent, quota, windows, now, mode, cliTools)}
         onMouseDown={(e) => e.preventDefault()}
         onClick={onClick}
       >
@@ -155,7 +156,7 @@ export function QuotaPill({
       className={`quota ${compact ? 'pane-quota' : ''}`}
       data-testid={prefix}
       data-agent={agent}
-      title={quotaTitle(agent, quota, windows, now, mode)}
+      title={quotaTitle(agent, quota, windows, now, mode, cliTools)}
     >
       {content}
     </span>

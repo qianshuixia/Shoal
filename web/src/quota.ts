@@ -1,8 +1,37 @@
-import { agentLabel } from '../../shared/protocol.ts';
-import type { AgentKind, QuotaInfo, QuotaWindow } from '../../shared/protocol.ts';
+import { agentLabel, quotaKeyOf, quotaVendorOf } from '../../shared/protocol.ts';
+import type { AgentKind, CliToolInfo, QuotaInfo, QuotaWindow } from '../../shared/protocol.ts';
 
-// Agents in header order.
+// Built-in agents in header order.
 export const QUOTA_AGENTS: AgentKind[] = ['claude', 'codex', 'agy', 'pi', 'fake'];
+
+// Built-in quota agents plus any enabled custom CLI that owns a distinct authoritative quotaKey (e.g. separate CODEX_HOME).
+export function quotaDisplayAgents(
+  _quota: Partial<Record<AgentKind, QuotaInfo>>,
+  cliTools?: readonly CliToolInfo[],
+): AgentKind[] {
+  const out: AgentKind[] = [...QUOTA_AGENTS];
+  const seen = new Set<string>(out);
+  for (const t of cliTools ?? []) {
+    if (t.source === 'custom' && t.enabled && t.usable && t.quotaKey && !seen.has(t.quotaKey)) {
+      seen.add(t.quotaKey);
+      out.push(t.quotaKey);
+    }
+  }
+  return out;
+}
+
+// Resolves the effective quota bucket for a session/task agent strictly from the server-provided authoritative quotaKey:
+// never falls back from an isolated custom account to the default account when the isolated account has no data yet.
+export function resolveQuotaForAgent(
+  agent: AgentKind,
+  quota: Partial<Record<AgentKind, QuotaInfo>>,
+  now: number,
+  cliTools?: readonly CliToolInfo[],
+): { key: AgentKind; quota?: QuotaInfo; windows: QuotaWindow[] } {
+  const key = quotaKeyOf(agent, cliTools);
+  const entry = quota[key];
+  return { key, quota: entry, windows: liveWindows(entry, now) };
+}
 export const QUOTA_WARN = 80; // usedPercent >= 80 (i.e. remaining <= 20) triggers warning styling
 
 export type QuotaDisplayMode = 'remaining' | 'used';
@@ -191,8 +220,15 @@ export function displayPercent(w: QuotaWindow, mode: QuotaDisplayMode): number {
 }
 
 // Multi-line tooltip of one agent's quota (reflects the selected remaining/used display mode).
-export function quotaTitle(agent: AgentKind, q: QuotaInfo, windows: QuotaWindow[], now: number, mode: QuotaDisplayMode = 'remaining'): string {
-  const head = `${agentLabel(agent)} 订阅额度${q.plan ? ` · ${q.plan}` : ''}`;
+export function quotaTitle(
+  agent: AgentKind,
+  q: QuotaInfo,
+  windows: QuotaWindow[],
+  now: number,
+  mode: QuotaDisplayMode = 'remaining',
+  cliTools?: readonly CliToolInfo[],
+): string {
+  const head = `${agentLabel(agent, cliTools)} 订阅额度${q.plan ? ` · ${q.plan}` : ''}`;
   const fmtWin = (w: QuotaWindow) => {
     const val = displayPercent(w, mode);
     const word = mode === 'remaining' ? '剩余' : '已用';
@@ -213,15 +249,19 @@ export function bestSwitchCandidate(
   availableAgents: readonly AgentKind[],
   currentAgent: AgentKind | undefined,
   now: number,
+  cliTools?: readonly CliToolInfo[],
 ): SwitchCandidate | null {
   if (!currentAgent) return null;
-  const curLive = primaryWindows(liveWindows(quota[currentAgent], now));
+  const cur = resolveQuotaForAgent(currentAgent, quota, now, cliTools);
+  const curLive = primaryWindows(cur.windows);
   const curMinLeft = curLive.length ? Math.min(...curLive.map(w => 100 - w.usedPercent)) : 100;
   if (curMinLeft > 20) return null;
   let best: SwitchCandidate | null = null;
   for (const a of availableAgents) {
     if (a === currentAgent) continue;
-    const ws = primaryWindows(liveWindows(quota[a], now));
+    const cand = resolveQuotaForAgent(a, quota, now, cliTools);
+    if (cand.key === cur.key) continue;
+    const ws = primaryWindows(cand.windows);
     if (!ws.length) continue;
     const minLeft = Math.round(Math.min(...ws.map(w => 100 - w.usedPercent)));
     if (minLeft > curMinLeft + 15 && (!best || minLeft > best.minLeftPercent)) {
@@ -231,7 +271,7 @@ export function bestSwitchCandidate(
   return best;
 }
 
-export function vendorPlanBadge(agent: AgentKind, q?: QuotaInfo): string {
+export function vendorPlanBadge(agent: AgentKind, q?: QuotaInfo, cliTools?: readonly CliToolInfo[]): string {
   if (q?.plan) {
     const p = q.plan.trim();
     if (p.toLowerCase() === 'plus') return 'Plus';
@@ -241,8 +281,9 @@ export function vendorPlanBadge(agent: AgentKind, q?: QuotaInfo): string {
     if (p.toLowerCase() === 'ultra') return 'Ultra';
     return p;
   }
-  if (agent === 'agy') return 'Google account';
-  if (agent === 'claude') return 'Claude 订阅';
-  if (agent === 'codex') return 'Codex 订阅';
+  const vendor = quotaVendorOf(agent, cliTools);
+  if (vendor === 'agy') return 'Google account';
+  if (vendor === 'claude') return 'Claude 订阅';
+  if (vendor === 'codex') return 'Codex 订阅';
   return '订阅';
 }

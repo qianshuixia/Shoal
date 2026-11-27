@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import type { MobileRouteVia, Snapshot } from '../../../shared/protocol.ts';
-import { agentLabel } from '../../../shared/protocol.ts';
+import { agentLabel, quotaVendorOf } from '../../../shared/protocol.ts';
 import { AgentIcon } from '../agentIcons.tsx';
-import { liveWindows, QUOTA_AGENTS, QUOTA_WARN, quotaTitle } from '../quota.ts';
+import { liveWindows, quotaDisplayAgents, QUOTA_WARN, quotaTitle } from '../quota.ts';
 import { needsList, reviewList, sortProjectTasks, STATUS_LABEL, waitText } from '../util.ts';
 import { setPrivacy, usePrivacy } from '../privacy.ts';
 import { ConfirmSheet } from './ConfirmSheet.tsx';
@@ -85,14 +85,14 @@ export function MobileHome({
   }, [state.tasks, sessionsById, needIds, reviewIds, now]);
 
   const quotaChips = useMemo(() => {
-    return QUOTA_AGENTS.flatMap((agent) => {
+    return quotaDisplayAgents(state.quota, state.cliTools).flatMap((agent) => {
       const q = state.quota[agent];
       const wins = liveWindows(q, now);
       if (!q || wins.length === 0) return [];
       const peak = Math.max(...wins.map((w) => w.usedPercent));
       return [{ agent, q, wins, peak }];
     });
-  }, [state.quota, now]);
+  }, [state.quota, state.cliTools, now]);
 
   const archivedTasks = useMemo(() => state.tasks.filter((t) => t.phase === 'archived'), [state.tasks]);
 
@@ -131,9 +131,9 @@ export function MobileHome({
               <div
                 key={agent}
                 className={`mob-quota-chip ${peak >= QUOTA_WARN ? 'is-warn' : ''}`}
-                title={quotaTitle(agent, q, wins, now)}
+                title={quotaTitle(agent, q, wins, now, 'remaining', state.cliTools)}
               >
-                <AgentIcon agent={agent} className="agent-icon" />
+                <AgentIcon agent={agent} fallbackAgent={quotaVendorOf(agent, state.cliTools)} className="agent-icon" />
                 <span>{agentLabel(agent, state.cliTools)}</span>
                 <strong>{Math.round(peak)}%</strong>
               </div>

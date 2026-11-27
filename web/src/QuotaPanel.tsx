@@ -1,11 +1,11 @@
 import { useEffect, useRef } from 'react';
 import type { AgentKind, CliToolInfo, GitInfo, Project, QuotaInfo, QuotaWindow, SessionContext, SessionInfo, Task, TaskMetrics } from '../../shared/protocol.ts';
-import { agentLabel } from '../../shared/protocol.ts';
+import { agentLabel, quotaKeyOf, quotaVendorOf } from '../../shared/protocol.ts';
 import { AgentIcon } from './agentIcons.tsx';
 import { RingGauge } from './bits.tsx';
 import {
-  QUOTA_AGENTS, QUOTA_WARN, bestSwitchCandidate, displayPercent, fmtRelativeAge,
-  liveWindows, primaryWindows, quotaTitle, quotaTone, secondaryWindows, shortWindowTitle, vendorPlanBadge,
+  QUOTA_WARN, bestSwitchCandidate, displayPercent, fmtRelativeAge,
+  liveWindows, primaryWindows, quotaDisplayAgents, quotaTitle, quotaTone, resolveQuotaForAgent, secondaryWindows, shortWindowTitle, vendorPlanBadge,
   windowMetrics, type QuotaDisplayMode, type QuotaPace,
 } from './quota.ts';
 import { fmtPct, fmtTokens, hitRate } from './util.ts';
@@ -98,20 +98,23 @@ export function SegmentedBar({
   );
 }
 
-const agentAccent = (agent: AgentKind): 'claude' | 'codex' | 'agy' | 'default' =>
-  agent === 'claude' ? 'claude' : agent === 'codex' ? 'codex' : agent === 'agy' ? 'agy' : 'default';
+const agentAccent = (agent: AgentKind, cliTools?: readonly CliToolInfo[]): 'claude' | 'codex' | 'agy' | 'default' => {
+  const vendor = quotaVendorOf(agent, cliTools);
+  return vendor === 'claude' ? 'claude' : vendor === 'codex' ? 'codex' : vendor === 'agy' ? 'agy' : 'default';
+};
 
 // L1 Topbar aggregated quota pill: keeps each agent compact & clickable to open the L2 floating QuotaPopover.
 export function TopQuotaBar({
-  quota, now, mode, open, onToggle,
+  quota, cliTools, now, mode, open, onToggle,
 }: {
   quota: Partial<Record<AgentKind, QuotaInfo>>;
+  cliTools?: CliToolInfo[];
   now: number;
   mode: QuotaDisplayMode;
   open: boolean;
   onToggle(): void;
 }) {
-  const items = QUOTA_AGENTS
+  const items = quotaDisplayAgents(quota, cliTools)
     .map((a) => {
       const q = quota[a];
       const all = liveWindows(q, now);
@@ -135,11 +138,11 @@ export function TopQuotaBar({
             data-agent={agent}
             aria-haspopup="dialog"
             aria-expanded={open}
-            title={quotaTitle(agent, q, all, now, mode)}
+            title={quotaTitle(agent, q, all, now, mode, cliTools)}
             onMouseDown={(e) => e.preventDefault()}
             onClick={onToggle}
           >
-            <AgentIcon agent={agent} />
+            <AgentIcon agent={agent} fallbackAgent={quotaVendorOf(agent, cliTools)} />
             {prim.map((w) => {
               const pctVal = displayPercent(w, mode);
               const ringPct = mode === 'remaining' ? 100 - w.usedPercent : w.usedPercent;
@@ -205,7 +208,7 @@ export function QuotaPopover({
     };
   }, [onClose]);
 
-  const sections = QUOTA_AGENTS
+  const sections = quotaDisplayAgents(quota, cliTools)
     .map((a) => {
       const q = quota[a];
       const ws = liveWindows(q, now);
@@ -213,7 +216,7 @@ export function QuotaPopover({
     })
     .filter((x): x is NonNullable<typeof x> => !!x);
 
-  const switchTip = bestSwitchCandidate(quota, agents, currentAgent, now);
+  const switchTip = bestSwitchCandidate(quota, agents, currentAgent, now, cliTools);
 
   return (
     <div className="quota-popover" ref={ref} data-testid="quota-popover" role="dialog" aria-label="订阅配额详情">
@@ -271,9 +274,9 @@ export function QuotaPopover({
           {sections.map(({ agent, quota: q, windows }) => (
             <div key={agent} className="qp-section" data-testid="qp-section" data-agent={agent}>
               <div className="qp-sec-head">
-                <AgentIcon agent={agent} />
+                <AgentIcon agent={agent} fallbackAgent={quotaVendorOf(agent, cliTools)} />
                 <span className="qp-sec-name">{agentLabel(agent, cliTools)}</span>
-                <span className="qp-sec-plan">{vendorPlanBadge(agent, q)}</span>
+                <span className="qp-sec-plan">{vendorPlanBadge(agent, q, cliTools)}</span>
                 <span className="qp-sec-age" title={`更新于 ${new Date(q.at).toLocaleTimeString('zh-CN', { hour12: false })}`}>
                   {fmtRelativeAge(q.at, now)}
                 </span>
@@ -295,7 +298,7 @@ export function QuotaPopover({
                         <strong>{val}%</strong>
                         <span className="qp-row-unit">{mode === 'remaining' ? '剩' : '用'}</span>
                       </span>
-                      <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(agent)} />
+                      <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(agent, cliTools)} />
                       <PaceGlyph pace={m.pace} delta={m.paceDelta} />
                       <span className="qp-row-reset" title={`${m.resetClock} 重置`}>{m.resetRelative}</span>
                     </div>
@@ -358,11 +361,12 @@ export function QuotaDashboard({
   onRefresh(): void;
   refreshing?: boolean;
 }) {
-  const listedAgents = QUOTA_AGENTS.filter((a) => {
+  const enabledQuotaKeys = new Set(agents.map((id) => quotaKeyOf(id, cliTools)));
+  const listedAgents = quotaDisplayAgents(quota, cliTools).filter((a) => {
     if (providerFilter !== 'all' && a !== providerFilter) return false;
     const hasData = liveWindows(quota[a], now).length > 0;
     if (a === 'fake') return hasData;
-    return hasData || (!compact && agents.includes(a));
+    return hasData || (!compact && enabledQuotaKeys.has(a));
   });
 
   const activeCount = listedAgents.filter((a) => liveWindows(quota[a], now).length > 0).length;
@@ -415,9 +419,9 @@ export function QuotaDashboard({
             return (
               <div key={agent} className="qd-provider" data-testid="qd-provider" data-agent={agent}>
                 <div className="qd-provider-head">
-                  <AgentIcon agent={agent} />
+                  <AgentIcon agent={agent} fallbackAgent={quotaVendorOf(agent, cliTools)} />
                   <span className="qd-provider-name">{agentLabel(agent, cliTools)}</span>
-                  <span className="qd-provider-plan">{vendorPlanBadge(agent, q)}</span>
+                  <span className="qd-provider-plan">{vendorPlanBadge(agent, q, cliTools)}</span>
                   {q && <span className="qd-provider-age">更新于 {fmtRelativeAge(q.at, now)}</span>}
                 </div>
                 {ws.length === 0 ? (
@@ -455,7 +459,7 @@ export function QuotaDashboard({
                               <span className={`qd-card-delta pace-${m.pace}`}>{deltaText}</span>
                             )}
                           </div>
-                          <PaceBar window={w} now={now} mode={mode} size="lg" accent={agentAccent(agent)} />
+                          <PaceBar window={w} now={now} mode={mode} size="lg" accent={agentAccent(agent, cliTools)} />
                           <div className="qd-card-foot">
                             <span className="qd-card-account">
                               <span className="qd-slot-badge">1</span>
@@ -635,12 +639,16 @@ export function InspectorOverview({
   onOpenStats(): void;
 }) {
   const activeAgent = task?.agent ?? session?.agent;
-  const activeQuota = activeAgent ? allQuota[activeAgent] : undefined;
-  const activeWindows = liveWindows(activeQuota, now);
+  const activeResolved = activeAgent ? resolveQuotaForAgent(activeAgent, allQuota, now, cliTools) : null;
+  const activeQuota = activeResolved?.quota;
+  const activeWindows = activeResolved?.windows ?? [];
+  const activeQuotaKey = activeResolved?.key;
   const primActive = primaryWindows(activeWindows);
   const secActive = secondaryWindows(activeWindows);
 
-  const otherAgents = QUOTA_AGENTS.filter(a => a !== activeAgent && liveWindows(allQuota[a], now).length > 0);
+  const otherAgents = quotaDisplayAgents(allQuota, cliTools).filter(
+    a => a !== activeAgent && a !== activeQuotaKey && liveWindows(allQuota[a], now).length > 0,
+  );
   const canCompact = !!session && session.status !== 'exited' && (activeAgent === 'claude' || activeAgent === 'agy' || activeAgent === 'codex');
 
   return (
@@ -679,11 +687,11 @@ export function InspectorOverview({
       {/* Active Provider Quota Card (20-cell segmented bars like T3 Code right rail) */}
       <div className="insp-card insp-quota-card" data-testid="insp-quota-card">
         <div className="insp-card-head">
-          {activeAgent && <AgentIcon agent={activeAgent} />}
+          {activeAgent && <AgentIcon agent={activeAgent} fallbackAgent={quotaVendorOf(activeAgent, cliTools)} />}
           <span className="insp-card-title">
             {activeAgent ? agentLabel(activeAgent, cliTools) : '订阅配额'}
           </span>
-          {activeAgent && <span className="insp-card-plan">{vendorPlanBadge(activeAgent, activeQuota)}</span>}
+          {activeAgent && <span className="insp-card-plan">{vendorPlanBadge(activeAgent, activeQuota, cliTools)}</span>}
           <button
             type="button"
             className={`icon-btn insp-quota-refresh ${refreshing ? 'is-spin' : ''}`}
@@ -734,7 +742,7 @@ export function InspectorOverview({
               return (
                 <div key={`${w.pool ?? 's'}-${w.label}-${idx}`} className="insp-mini-pool-row">
                   <span className="insp-mini-pool-name" title={shortWindowTitle(w)}>{shortWindowTitle(w)}</span>
-                  <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(activeAgent ?? '')} />
+                  <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(activeAgent ?? '', cliTools)} />
                   <span className="insp-mini-pool-pct">{val}%</span>
                 </div>
               );
@@ -757,10 +765,10 @@ export function InspectorOverview({
               return (
                 <div key={a} className="insp-mini-pool-row">
                   <span className="insp-mini-pool-agent">
-                    <AgentIcon agent={a} />
+                    <AgentIcon agent={a} fallbackAgent={quotaVendorOf(a, cliTools)} />
                     <span>{agentLabel(a, cliTools)} · {w.label}</span>
                   </span>
-                  <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(a)} />
+                  <PaceBar window={w} now={now} mode={mode} size="sm" accent={agentAccent(a, cliTools)} />
                   <span className="insp-mini-pool-pct">{val}%</span>
                 </div>
               );
